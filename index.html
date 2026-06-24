@@ -534,8 +534,15 @@ async function renderOrgTab(){
   <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
   <td class="td-dim">${tl.email}</td>
   <td class="td-dim">
-    AED ${(tl.monthlyTarget || 0).toLocaleString()}
-    <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${tl.targetSource === 'override' ? 'background:rgba(245,158,11,0.15);color:#f59e0b' : 'background:rgba(128,128,128,0.12);color:#888'}">${tl.targetSource === 'override' ? 'Override' : 'Auto'}</span>
+    ${(()=>{
+      const liveAuto = calculateTLTarget(tl.teamId, users);
+      const src = tl.targetSource || 'auto';
+      const display = src === 'override' ? (tl.monthlyTarget||0) : liveAuto;
+      const pillStyle = src === 'override'
+        ? 'background:rgba(245,158,11,0.15);color:#f59e0b'
+        : 'background:rgba(128,128,128,0.12);color:#888';
+      return `AED ${display.toLocaleString()} <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${pillStyle}">${src==='override'?'Override':'Auto'}</span>`;
+    })()}
   </td>
   <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
 </tr>` : ''}
@@ -703,14 +710,32 @@ function showAddUserModal(role, teams){
       const cred = await createUserWithEmailAndPassword(auth2, email, pw);
       const uid  = cred.user.uid;
       await signOut(auth2);
-      const bat  = writeBatch(db);
+
+      const isTL = role === 'team_lead';
+
+      // Seed autoTarget from existing agents if TL is assigned to a team at creation
+      let initAutoTarget = 0;
+      if(isTL && teamId){
+        const agSnap = await getDocs(query(
+          collection(db,'users'),
+          where('teamId','==',teamId),
+          where('role','==','agent'),
+          where('active','==',true)
+        ));
+        initAutoTarget = agSnap.docs.reduce((s,d) => s + (Number(d.data().monthlyTarget)||0), 0);
+      }
+
+      const bat = writeBatch(db);
       bat.set(doc(db,'users',uid),{
-        name, email, role, teamId:teamId||null,
-        monthlyTarget: Number(target)||0, targetSource:'manager',
+        name, email, role, teamId: teamId||null,
+        monthlyTarget: isTL ? initAutoTarget : (Number(target)||0),
+        ...(isTL
+          ? { autoTarget: initAutoTarget, targetSource: 'auto' }
+          : { targetSource: 'manager' }),
         active:true, createdBy:CU.uid, createdByName:CP.name,
         createdAt:now(), lastEditedBy:CP.name, lastEditedAt:now()
       });
-      if(teamId && role==='team_lead') bat.update(doc(db,'teams',teamId),{teamLeadId:uid});
+      if(teamId && isTL) bat.update(doc(db,'teams',teamId),{teamLeadId:uid});
       await bat.commit();
       closeModal(); toast(`${label} created. They can now sign in.`); renderOrgTab();
     } catch(e){
@@ -725,6 +750,10 @@ function showEditUserModal(userId, users, teams){
   const u = users.find(x=>x.id===userId); if(!u) return;
   const isAg = u.role==='agent';
   const isTL = u.role==='team_lead';
+
+  // Snapshot auto target at modal-open time using in-memory users
+  const freshAuto = isTL ? calculateTLTarget(u.teamId, users) : 0;
+
   modal(`Edit: ${u.name}`, `
     <div class="row2">
       <div class="field"><label>Full Name</label><input type="text" id="eu-name" value="${esc(u.name)}"></div>
@@ -736,6 +765,19 @@ function showEditUserModal(userId, users, teams){
       </select>
     </div>
     ${isAg ? `<div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="eu-target" value="${u.monthlyTarget||0}"></div>` : ''}
+    ${isTL ? `
+    <div class="field">
+      <label>Auto Target <span class="text-dim">(sum of team agents)</span></label>
+      <input type="number" id="eu-auto-target" value="${freshAuto}" disabled style="opacity:0.5;cursor:not-allowed">
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:12px;margin-bottom:4px">
+      <input type="checkbox" id="eu-override-chk" ${u.targetSource==='override'?'checked':''} style="width:auto;margin:0;cursor:pointer">
+      <label for="eu-override-chk" style="margin:0;cursor:pointer;font-size:13px">Override target manually</label>
+    </div>
+    <div class="field" id="eu-override-field" style="${u.targetSource!=='override'?'display:none':''}">
+      <label>Override Amount (AED)</label>
+      <input type="number" id="eu-override-val" value="${u.targetSource==='override'?(u.monthlyTarget||0):freshAuto}" placeholder="e.g. 150000">
+    </div>` : ''}
     <p id="eu-err" class="err"></p>
     <div class="flex gap-8 mt-12">
       <button class="btn btn-primary" id="eu-save">Save Changes</button>
@@ -743,20 +785,71 @@ function showEditUserModal(userId, users, teams){
     </div>
     <p class="text-dim text-xs mt-8">Last edited by ${u.lastEditedBy||'—'} · ${u.lastEditedAt ? fmtDate(u.lastEditedAt) : '—'}</p>`);
 
+  // Wire override checkbox → show/hide override amount field
+  if(isTL){
+    document.getElementById('eu-override-chk').onchange = function(){
+      document.getElementById('eu-override-field').style.display = this.checked ? '' : 'none';
+    };
+  }
+
   document.getElementById('eu-save').onclick = async () => {
-    const name = v('eu-name'), teamId = v('eu-team'), target = v('eu-target');
+    const name = v('eu-name'), teamId = v('eu-team');
     const err  = document.getElementById('eu-err');
     if(!name){ err.textContent='Name is required.'; return; }
+
+    // Validate override amount before disabling button
+    if(isTL && document.getElementById('eu-override-chk').checked && v('eu-override-val')===''){
+      err.textContent='Please enter an override amount.'; return;
+    }
+
     disable('eu-save','Saving…');
     try {
       const upd = {name, teamId:teamId||null, lastEditedBy:CP.name, lastEditedAt:now()};
-      if(isAg) { upd.monthlyTarget = Number(target)||0; upd.targetSource = 'manager'; }
+
+      if(isAg){
+        const target = v('eu-target');
+        upd.monthlyTarget = Number(target)||0;
+        upd.targetSource = 'manager';
+      }
+
+      if(isTL){
+        const newTeamId = teamId||null;
+        const newAutoTarget = calculateTLTarget(newTeamId, users);
+        const overrideChk = document.getElementById('eu-override-chk').checked;
+        const overrideVal = Number(v('eu-override-val'))||0;
+        upd.autoTarget = newAutoTarget;           // always keep reference current
+        upd.targetSource = overrideChk ? 'override' : 'auto';
+        upd.monthlyTarget = overrideChk ? overrideVal : newAutoTarget;
+      }
+
       const bat = writeBatch(db);
       bat.update(doc(db,'users',userId), upd);
-      if(isTL && teamId!==u.teamId){
-        if(u.teamId)  bat.update(doc(db,'teams',u.teamId),{teamLeadId:null});
-        if(teamId)    bat.update(doc(db,'teams',teamId),{teamLeadId:userId});
+
+      // TL: sync team assignment docs
+      if(isTL && (teamId||null) !== u.teamId){
+        if(u.teamId) bat.update(doc(db,'teams',u.teamId),{teamLeadId:null});
+        if(teamId)   bat.update(doc(db,'teams',teamId),{teamLeadId:userId});
       }
+
+      // Agent saved → cascade autoTarget update to affected TLs (batch, no extra reads)
+      if(isAg){
+        const oldTeamId = u.teamId||null;
+        const newTeamId = teamId||null;
+        const affected = new Set([oldTeamId, newTeamId].filter(Boolean));
+        for(const tid of affected){
+          const tl = users.find(x => x.role==='team_lead' && x.teamId===tid && x.active!==false);
+          if(!tl) continue;
+          // Recompute from snapshot: exclude this agent, add back with new target on new team
+          const tlAuto = users
+            .filter(x => x.role==='agent' && x.teamId===tid && x.id!==userId && x.active!==false)
+            .reduce((s,x) => s + (Number(x.monthlyTarget)||0), 0)
+            + (tid===newTeamId ? (Number(upd.monthlyTarget)||0) : 0);
+          const tlUpd = {autoTarget:tlAuto, lastEditedBy:CP.name, lastEditedAt:now()};
+          if(tl.targetSource !== 'override') tlUpd.monthlyTarget = tlAuto; // respect existing overrides
+          bat.update(doc(db,'users',tl.id), tlUpd);
+        }
+      }
+
       await bat.commit();
       closeModal(); toast('Profile updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('eu-save','Save Changes'); }
