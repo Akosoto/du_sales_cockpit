@@ -530,12 +530,15 @@ async function renderOrgTab(){
               <thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Target (AED/mo)</th><th></th></tr></thead>
               <tbody>
                 ${tl ? `<tr>
-                  <td><strong>${tl.name}</strong></td>
-                  <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
-                  <td class="td-dim">${tl.email}</td>
-                  <td class="td-dim">—</td>
-                  <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
-                </tr>` : ''}
+  <td><strong>${tl.name}</strong></td>
+  <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
+  <td class="td-dim">${tl.email}</td>
+  <td class="td-dim">
+    AED ${(tl.monthlyTarget || 0).toLocaleString()}
+    <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${tl.targetSource === 'override' ? 'background:rgba(245,158,11,0.15);color:#f59e0b' : 'background:rgba(128,128,128,0.12);color:#888'}">${tl.targetSource === 'override' ? 'Override' : 'Auto'}</span>
+  </td>
+  <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
+</tr>` : ''}
                 ${tas.map(a=>`<tr>
                   <td>${a.name}</td>
                   <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
@@ -660,6 +663,15 @@ function showEditTeamModal(teamId, teams, tls, ags){
       closeModal(); toast('Team updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('et-btn','Save Changes'); }
   };
+}
+
+// ── TL target helpers ────────────────────────────────────────────────────────
+
+function calculateTLTarget(teamId, users){
+  if(!teamId) return 0;
+  return users
+    .filter(u => u.role === 'agent' && u.teamId === teamId && u.active !== false)
+    .reduce((sum, u) => sum + (Number(u.monthlyTarget) || 0), 0);
 }
 
 // ─── ADD USER ───
