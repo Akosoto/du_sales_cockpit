@@ -513,13 +513,14 @@ async function renderOrgTab(){
     ${teams.length===0
       ? `<div class="card"><div class="empty"><div class="empty-icon">🏢</div><div class="empty-title">No teams yet</div><div class="empty-sub">Create a team to get started.</div></div></div>`
       : teams.map(t => {
-          const tl  = byId[t.teamLeadId];
-          const tas = ags.filter(a=>a.teamId===t.id);
+          const teamTLs       = tls.filter(tl => tl.teamId === t.id);
+          const tas           = ags.filter(a  => a.teamId  === t.id);
+          const unassignedAgs = tas.filter(a  => !a.tlId);
           return `<div class="card" id="tc-${t.id}">
             <div class="card-hdr">
               <div>
-                <div class="card-title">🏢 ${t.name}</div>
-                <div class="text-dim text-sm mt-8">Lead: ${tl?tl.name:'<em>Unassigned</em>'} &nbsp;·&nbsp; ${tas.length} agent${tas.length!==1?'s':''}</div>
+                <div class="card-title">🏢 ${esc(t.name)}</div>
+                <div class="text-dim text-sm mt-8">${teamTLs.length} TL${teamTLs.length!==1?'s':''} &nbsp;·&nbsp; ${tas.length} agent${tas.length!==1?'s':''}</div>
               </div>
               <div class="flex gap-8">
                 <button class="btn btn-ghost btn-sm" data-edit-team="${t.id}">Edit</button>
@@ -529,34 +530,47 @@ async function renderOrgTab(){
             <div class="tbl-wrap"><table>
               <thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Target (AED/mo)</th><th></th></tr></thead>
               <tbody>
-                ${tl ? `<tr>
-  <td><strong>${tl.name}</strong></td>
-  <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
-  <td class="td-dim">${tl.email}</td>
-  <td class="td-dim">
-    ${(()=>{
-      const liveAuto = calculateTLTarget(tl.teamId, users);
-      const src = tl.targetSource || 'auto';
-      const display = src === 'override' ? (tl.monthlyTarget||0) : liveAuto;
-      const pillStyle = src === 'override'
-        ? 'background:rgba(245,158,11,0.15);color:#f59e0b'
-        : 'background:rgba(128,128,128,0.12);color:#888';
-      return `AED ${display.toLocaleString()} <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${pillStyle}">${src==='override'?'Override':'Auto'}</span>`;
-    })()}
-  </td>
-  <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
-</tr>` : ''}
-                ${tas.map(a=>`<tr>
-                  <td>${a.name}</td>
-                  <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
-                  <td class="td-dim">${a.email}</td>
-                  <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
-                  <td class="flex gap-8">
-                    <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
-                    <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
-                  </td>
-                </tr>`).join('')}
-                ${!tl && tas.length===0 ? '<tr><td colspan="5" class="td-dim" style="text-align:center">No members assigned yet</td></tr>' : ''}
+                ${teamTLs.length===0 && tas.length===0 ? '<tr><td colspan="5" class="td-dim" style="text-align:center">No members assigned yet</td></tr>' : ''}
+                ${teamTLs.map(tl => {
+                  const tlAgents  = tas.filter(a => a.tlId === tl.id);
+                  const liveAuto  = calculateTLTarget(tl.id, users);
+                  const src       = tl.targetSource || 'auto';
+                  const display   = src === 'override' ? (tl.monthlyTarget||0) : liveAuto;
+                  const pillStyle = src === 'override'
+                    ? 'background:rgba(245,158,11,0.15);color:#f59e0b'
+                    : 'background:rgba(128,128,128,0.12);color:#888';
+                  return `<tr style="background:rgba(124,58,237,0.05)">
+                    <td><strong>${esc(tl.name)}</strong></td>
+                    <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
+                    <td class="td-dim">${esc(tl.email)}</td>
+                    <td class="td-dim">AED ${display.toLocaleString()} <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${pillStyle}">${src==='override'?'Override':'Auto'}</span></td>
+                    <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
+                  </tr>
+                  ${tlAgents.map(a=>`<tr>
+                    <td style="padding-left:28px"><span style="color:var(--t2);margin-right:4px">↳</span>${esc(a.name)}</td>
+                    <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
+                    <td class="td-dim">${esc(a.email)}</td>
+                    <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
+                    <td class="flex gap-8">
+                      <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
+                      <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
+                    </td>
+                  </tr>`).join('')}`;
+                }).join('')}
+                ${unassignedAgs.length > 0 ? `
+                  <tr style="background:rgba(245,158,11,0.05)">
+                    <td colspan="5" class="td-dim text-xs" style="padding:5px 12px;font-style:italic">⚠ Unassigned Agents (no TL)</td>
+                  </tr>
+                  ${unassignedAgs.map(a=>`<tr>
+                    <td style="padding-left:28px">${esc(a.name)}</td>
+                    <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
+                    <td class="td-dim">${esc(a.email)}</td>
+                    <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
+                    <td class="flex gap-8">
+                      <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
+                      <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
+                    </td>
+                  </tr>`).join('')}` : ''}
               </tbody>
             </table></div>
           </div>`;
@@ -572,9 +586,9 @@ async function renderOrgTab(){
           <thead><tr><th>Name</th><th>Role</th><th>Email</th><th></th></tr></thead>
           <tbody>
             ${unassigned.map(u=>`<tr>
-              <td>${u.name}</td>
+              <td>${esc(u.name)}</td>
               <td><span class="role-pill ${u.role}" style="font-size:10px">${u.role==='team_lead'?'Team Lead':'Agent'}</span></td>
-              <td class="td-dim">${u.email}</td>
+              <td class="td-dim">${esc(u.email)}</td>
               <td class="flex gap-8">
                 <button class="btn btn-ghost btn-xs" data-edit-user="${u.id}">Edit</button>
                 <button class="btn btn-danger btn-xs" data-del-user="${u.id}">Remove</button>
@@ -588,8 +602,8 @@ async function renderOrgTab(){
 
   // Button events
   ct.querySelector('#btn-add-team')?.addEventListener('click', () => showAddTeamModal(teams, tls));
-  ct.querySelector('#btn-add-tl')?.addEventListener('click',   () => showAddUserModal('team_lead', teams));
-  ct.querySelector('#btn-add-ag')?.addEventListener('click',   () => showAddUserModal('agent', teams));
+  ct.querySelector('#btn-add-tl')?.addEventListener('click',   () => showAddUserModal('team_lead', teams, users));
+  ct.querySelector('#btn-add-ag')?.addEventListener('click',   () => showAddUserModal('agent', teams, users));
   ct.querySelector('#btn-seed')?.addEventListener('click',     () => seedLeads());
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
@@ -620,24 +634,18 @@ async function renderOrgTab(){
 
 // ─── ADD TEAM ───
 function showAddTeamModal(teams, tls){
-  const available = tls.filter(tl=>!tl.teamId);
   modal('Create New Team', `
     <div class="field"><label>Team Name</label><input type="text" id="at-name" placeholder="e.g. Dubai SME Team"></div>
-    <div class="field"><label>Assign Team Lead <span class="text-dim">(optional)</span></label>
-      <select id="at-tl"><option value="">— Assign later —</option>
-        ${available.map(tl=>`<option value="${tl.id}">${tl.name}</option>`).join('')}
-      </select>
-    </div>
+    <p class="text-dim text-xs" style="margin-bottom:14px">To assign Team Leads, edit each TL's profile and set their Team field to this team.</p>
     <p id="at-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="at-btn">Create Team</button>`);
   document.getElementById('at-btn').onclick = async () => {
-    const name = v('at-name'), tlId = v('at-tl');
+    const name = v('at-name');
     const err  = document.getElementById('at-err');
     if(!name){ err.textContent='Team name is required.'; return; }
     disable('at-btn','Creating…');
     try {
-      const ref = await addDoc(collection(db,'teams'),{name, teamLeadId:tlId||null, createdBy:CU.uid, createdAt:now()});
-      if(tlId) await updateDoc(doc(db,'users',tlId),{teamId:ref.id, lastEditedBy:CP.name, lastEditedAt:now()});
+      await addDoc(collection(db,'teams'),{name, teamLeadId:null, createdBy:CU.uid, createdAt:now()});
       closeModal(); toast('Team created.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('at-btn','Create Team'); }
   };
@@ -645,28 +653,19 @@ function showAddTeamModal(teams, tls){
 
 // ─── EDIT TEAM ───
 function showEditTeamModal(teamId, teams, tls, ags){
-  const t  = teams.find(x=>x.id===teamId); if(!t) return;
-  const available = tls.filter(tl => !tl.teamId || tl.id===t.teamLeadId);
-  modal(`Edit Team: ${t.name}`, `
+  const t = teams.find(x=>x.id===teamId); if(!t) return;
+  modal(`Edit Team: ${esc(t.name)}`, `
     <div class="field"><label>Team Name</label><input type="text" id="et-name" value="${esc(t.name)}"></div>
-    <div class="field"><label>Team Lead</label>
-      <select id="et-tl"><option value="">— None —</option>
-        ${available.map(tl=>`<option value="${tl.id}" ${tl.id===t.teamLeadId?'selected':''}>${tl.name}</option>`).join('')}
-      </select>
-    </div>
+    <p class="text-dim text-xs" style="margin-bottom:14px">To reassign Team Leads, edit the TL's profile and change their Team field.</p>
     <p id="et-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="et-btn">Save Changes</button>`);
   document.getElementById('et-btn').onclick = async () => {
-    const name = v('et-name'), tlId = v('et-tl');
+    const name = v('et-name');
     const err  = document.getElementById('et-err');
     if(!name){ err.textContent='Name required.'; return; }
     disable('et-btn','Saving…');
     try {
-      const bat = writeBatch(db);
-      bat.update(doc(db,'teams',teamId),{name, teamLeadId:tlId||null});
-      if(t.teamLeadId && t.teamLeadId!==tlId) bat.update(doc(db,'users',t.teamLeadId),{teamId:null});
-      if(tlId && tlId!==t.teamLeadId)         bat.update(doc(db,'users',tlId),{teamId:teamId});
-      await bat.commit();
+      await updateDoc(doc(db,'teams',teamId),{name});
       closeModal(); toast('Team updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('et-btn','Save Changes'); }
   };
@@ -674,16 +673,17 @@ function showEditTeamModal(teamId, teams, tls, ags){
 
 // ── TL target helpers ────────────────────────────────────────────────────────
 
-function calculateTLTarget(teamId, users){
-  if(!teamId) return 0;
+function calculateTLTarget(tlId, users){
+  if(!tlId) return 0;
   return users
-    .filter(u => u.role === 'agent' && u.teamId === teamId && u.active !== false)
+    .filter(u => u.role === 'agent' && u.tlId === tlId && u.active !== false)
     .reduce((sum, u) => sum + (Number(u.monthlyTarget) || 0), 0);
 }
 
 // ─── ADD USER ───
-function showAddUserModal(role, teams){
-  const label = role==='team_lead' ? 'Team Lead' : 'Sales Agent';
+function showAddUserModal(role, teams, users=[]){
+  const label   = role==='team_lead' ? 'Team Lead' : 'Sales Agent';
+  const isAgent = role === 'agent';
   modal(`Add ${label}`, `
     <div class="row2">
       <div class="field"><label>Full Name</label><input type="text" id="au-name" placeholder="Jane Smith"></div>
@@ -692,17 +692,37 @@ function showAddUserModal(role, teams){
     <div class="field"><label>Temporary Password <span class="text-dim">(min 8 chars)</span></label><input type="password" id="au-pw" placeholder="••••••••"></div>
     <div class="field"><label>Assign to Team <span class="text-dim">(optional)</span></label>
       <select id="au-team"><option value="">— Assign later —</option>
-        ${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}
+        ${teams.map(t=>`<option value="${t.id}">${esc(t.name)}</option>`).join('')}
       </select>
     </div>
-    ${role==='agent' ? `<div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="au-target" placeholder="e.g. 50000"></div>` : ''}
+    ${isAgent ? `
+    <div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="au-target" placeholder="e.g. 50000"></div>
+    <div class="field" id="au-tl-wrap" style="display:none">
+      <label>Assign to Team Lead <span class="text-dim">(optional)</span></label>
+      <select id="au-tl"><option value="">— Unassigned —</option></select>
+    </div>` : ''}
     <p id="au-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="au-btn">Create ${label}</button>
     <p class="text-dim text-xs mt-8">They log in with this email + temp password and can change their password from settings.</p>`);
+
+  // Agent only: repopulate TL dropdown when team changes
+  if(isAgent){
+    document.getElementById('au-team').onchange = function(){
+      const tid    = this.value;
+      const tlSel  = document.getElementById('au-tl');
+      const tlWrap = document.getElementById('au-tl-wrap');
+      if(!tid){ tlWrap.style.display='none'; tlSel.innerHTML='<option value="">— Unassigned —</option>'; return; }
+      const teamTLs = users.filter(u=>u.role==='team_lead'&&u.teamId===tid&&u.active!==false);
+      tlSel.innerHTML = '<option value="">— Unassigned —</option>' +
+        teamTLs.map(tl=>`<option value="${tl.id}">${esc(tl.name)}</option>`).join('');
+      tlWrap.style.display = teamTLs.length ? '' : 'none';
+    };
+  }
+
   document.getElementById('au-btn').onclick = async () => {
-    const name  = v('au-name'), email = v('au-email'), pw = v('au-pw');
+    const name   = v('au-name'), email = v('au-email'), pw = v('au-pw');
     const teamId = v('au-team'), target = v('au-target');
-    const err = document.getElementById('au-err');
+    const err    = document.getElementById('au-err');
     if(!name||!email||!pw){ err.textContent='Name, email and password are required.'; return; }
     if(pw.length<8){ err.textContent='Password must be at least 8 characters.'; return; }
     disable('au-btn',`Creating ${label}…`);
@@ -712,30 +732,18 @@ function showAddUserModal(role, teams){
       await signOut(auth2);
 
       const isTL = role === 'team_lead';
-
-      // Seed autoTarget from existing agents if TL is assigned to a team at creation
-      let initAutoTarget = 0;
-      if(isTL && teamId){
-        const agSnap = await getDocs(query(
-          collection(db,'users'),
-          where('teamId','==',teamId),
-          where('role','==','agent'),
-          where('active','==',true)
-        ));
-        initAutoTarget = agSnap.docs.reduce((s,d) => s + (Number(d.data().monthlyTarget)||0), 0);
-      }
+      // New TL has no agents assigned yet (tlId = new uid, never existed before)
 
       const bat = writeBatch(db);
       bat.set(doc(db,'users',uid),{
         name, email, role, teamId: teamId||null,
-        monthlyTarget: isTL ? initAutoTarget : (Number(target)||0),
+        monthlyTarget: isTL ? 0 : (Number(target)||0),
         ...(isTL
-          ? { autoTarget: initAutoTarget, targetSource: 'auto' }
-          : { targetSource: 'manager' }),
+          ? { autoTarget: 0, targetSource: 'auto' }
+          : { targetSource: 'manager', tlId: v('au-tl')||null }),
         active:true, createdBy:CU.uid, createdByName:CP.name,
         createdAt:now(), lastEditedBy:CP.name, lastEditedAt:now()
       });
-      if(teamId && isTL) bat.update(doc(db,'teams',teamId),{teamLeadId:uid});
       await bat.commit();
       closeModal(); toast(`${label} created. They can now sign in.`); renderOrgTab();
     } catch(e){
@@ -747,27 +755,36 @@ function showAddUserModal(role, teams){
 
 // ─── EDIT USER ───
 function showEditUserModal(userId, users, teams){
-  const u = users.find(x=>x.id===userId); if(!u) return;
+  const u    = users.find(x=>x.id===userId); if(!u) return;
   const isAg = u.role==='agent';
   const isTL = u.role==='team_lead';
 
-  // Snapshot auto target at modal-open time using in-memory users
-  const freshAuto = isTL ? calculateTLTarget(u.teamId, users) : 0;
+  // Model B: TL target is sum of agents where agent.tlId === tl.id
+  const freshAuto  = isTL ? calculateTLTarget(u.id, users) : 0;
+  const initTLs    = isAg ? users.filter(x=>x.role==='team_lead'&&x.teamId===u.teamId&&x.active!==false) : [];
 
-  modal(`Edit: ${u.name}`, `
+  modal(`Edit: ${esc(u.name)}`, `
     <div class="row2">
       <div class="field"><label>Full Name</label><input type="text" id="eu-name" value="${esc(u.name)}"></div>
       <div class="field"><label>Email</label><input type="email" id="eu-email" value="${esc(u.email)}" disabled><p class="hint">Email cannot be changed after creation.</p></div>
     </div>
     <div class="field"><label>Team</label>
       <select id="eu-team"><option value="">— Unassigned —</option>
-        ${teams.map(t=>`<option value="${t.id}" ${t.id===u.teamId?'selected':''}>${t.name}</option>`).join('')}
+        ${teams.map(t=>`<option value="${t.id}" ${t.id===u.teamId?'selected':''}>${esc(t.name)}</option>`).join('')}
       </select>
     </div>
-    ${isAg ? `<div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="eu-target" value="${u.monthlyTarget||0}"></div>` : ''}
+    ${isAg ? `
+    <div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="eu-target" value="${u.monthlyTarget||0}"></div>
+    <div class="field" id="eu-tl-wrap" ${!u.teamId?'style="display:none"':''}>
+      <label>Team Lead <span class="text-dim">(optional)</span></label>
+      <select id="eu-tl">
+        <option value="">— Unassigned —</option>
+        ${initTLs.map(tl=>`<option value="${tl.id}" ${tl.id===u.tlId?'selected':''}>${esc(tl.name)}</option>`).join('')}
+      </select>
+    </div>` : ''}
     ${isTL ? `
     <div class="field">
-      <label>Auto Target <span class="text-dim">(sum of team agents)</span></label>
+      <label>Auto Target <span class="text-dim">(sum of assigned agents)</span></label>
       <input type="number" id="eu-auto-target" value="${freshAuto}" disabled style="opacity:0.5;cursor:not-allowed">
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-top:12px;margin-bottom:4px">
@@ -792,12 +809,25 @@ function showEditUserModal(userId, users, teams){
     };
   }
 
+  // Agent: repopulate TL dropdown when team changes
+  if(isAg){
+    document.getElementById('eu-team').onchange = function(){
+      const tid    = this.value;
+      const tlSel  = document.getElementById('eu-tl');
+      const tlWrap = document.getElementById('eu-tl-wrap');
+      if(!tid){ tlWrap.style.display='none'; tlSel.innerHTML='<option value="">— Unassigned —</option>'; return; }
+      const teamTLs = users.filter(x=>x.role==='team_lead'&&x.teamId===tid&&x.active!==false);
+      tlSel.innerHTML = '<option value="">— Unassigned —</option>' +
+        teamTLs.map(tl=>`<option value="${tl.id}">${esc(tl.name)}</option>`).join('');
+      tlWrap.style.display = '';
+    };
+  }
+
   document.getElementById('eu-save').onclick = async () => {
-    const name = v('eu-name'), teamId = v('eu-team');
-    const err  = document.getElementById('eu-err');
+    const name   = v('eu-name'), teamId = v('eu-team');
+    const err    = document.getElementById('eu-err');
     if(!name){ err.textContent='Name is required.'; return; }
 
-    // Validate override amount before disabling button
     if(isTL && document.getElementById('eu-override-chk').checked && v('eu-override-val')===''){
       err.textContent='Please enter an override amount.'; return;
     }
@@ -807,45 +837,40 @@ function showEditUserModal(userId, users, teams){
       const upd = {name, teamId:teamId||null, lastEditedBy:CP.name, lastEditedAt:now()};
 
       if(isAg){
-        const target = v('eu-target');
-        upd.monthlyTarget = Number(target)||0;
-        upd.targetSource = 'manager';
+        const newTlId      = v('eu-tl')||null;
+        upd.monthlyTarget  = Number(v('eu-target'))||0;
+        upd.targetSource   = 'manager';
+        upd.tlId           = newTlId;
       }
 
       if(isTL){
-        const newTeamId = teamId||null;
-        const newAutoTarget = calculateTLTarget(newTeamId, users);
-        const overrideChk = document.getElementById('eu-override-chk').checked;
-        const overrideVal = Number(v('eu-override-val'))||0;
-        upd.autoTarget = newAutoTarget;           // always keep reference current
-        upd.targetSource = overrideChk ? 'override' : 'auto';
+        // Model B: TL's agents are those where agent.tlId === tl.id — team move doesn't change this
+        const newAutoTarget = calculateTLTarget(u.id, users);
+        const overrideChk   = document.getElementById('eu-override-chk').checked;
+        const overrideVal   = Number(v('eu-override-val'))||0;
+        upd.autoTarget    = newAutoTarget;
+        upd.targetSource  = overrideChk ? 'override' : 'auto';
         upd.monthlyTarget = overrideChk ? overrideVal : newAutoTarget;
       }
 
       const bat = writeBatch(db);
       bat.update(doc(db,'users',userId), upd);
 
-      // TL: sync team assignment docs
-      if(isTL && (teamId||null) !== u.teamId){
-        if(u.teamId) bat.update(doc(db,'teams',u.teamId),{teamLeadId:null});
-        if(teamId)   bat.update(doc(db,'teams',teamId),{teamLeadId:userId});
-      }
-
-      // Agent saved → cascade autoTarget update to affected TLs (batch, no extra reads)
+      // Agent saved → cascade autoTarget to old TL and new TL
       if(isAg){
-        const oldTeamId = u.teamId||null;
-        const newTeamId = teamId||null;
-        const affected = new Set([oldTeamId, newTeamId].filter(Boolean));
-        for(const tid of affected){
-          const tl = users.find(x => x.role==='team_lead' && x.teamId===tid && x.active!==false);
+        const oldTlId  = u.tlId||null;
+        const newTlId  = upd.tlId;
+        const affected = new Set([oldTlId, newTlId].filter(Boolean));
+        for(const tlIdAffected of affected){
+          const tl = users.find(x => x.id===tlIdAffected && x.active!==false);
           if(!tl) continue;
-          // Recompute from snapshot: exclude this agent, add back with new target on new team
+          // Recompute from snapshot: exclude this agent, add back with new target on new TL
           const tlAuto = users
-            .filter(x => x.role==='agent' && x.teamId===tid && x.id!==userId && x.active!==false)
+            .filter(x => x.role==='agent' && x.tlId===tlIdAffected && x.id!==userId && x.active!==false)
             .reduce((s,x) => s + (Number(x.monthlyTarget)||0), 0)
-            + (tid===newTeamId ? (Number(upd.monthlyTarget)||0) : 0);
+            + (tlIdAffected===newTlId ? (Number(upd.monthlyTarget)||0) : 0);
           const tlUpd = {autoTarget:tlAuto, lastEditedBy:CP.name, lastEditedAt:now()};
-          if(tl.targetSource !== 'override') tlUpd.monthlyTarget = tlAuto; // respect existing overrides
+          if(tl.targetSource !== 'override') tlUpd.monthlyTarget = tlAuto;
           bat.update(doc(db,'users',tl.id), tlUpd);
         }
       }
