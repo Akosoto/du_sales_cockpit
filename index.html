@@ -1018,7 +1018,7 @@ async function renderPipelineTab(){
         <th>Stage</th><th>City</th><th>Follow-up</th><th>Updated</th><th></th></tr></thead>
       <tbody>
         ${f.map(l=>`<tr>
-          <td class="td-company">${esc(l.company||'—')}</td>
+          <td class="td-company">${esc(l.company||'—')}${l.assignedTo===CU.uid?'<span style="font-size:10px;font-weight:700;background:rgba(16,185,129,.2);color:#34d399;padding:2px 8px;border-radius:10px;margin-left:6px;vertical-align:middle">📌 Mine</span>':''}</td>
           <td class="td-dim">${esc(l.contact||'—')}</td>
           <td class="td-dim">${l.phone?`<a href="tel:${l.phone}">${l.phone}</a>`:'—'}</td>
           ${role!=='agent'?`<td class="td-dim">${esc(byId[l.assignedTo]?.name||'—')}</td>`:''}
@@ -1065,7 +1065,7 @@ function showLeadModal(lead, byId, agents){
       <div class="info-item"><div class="lbl">Industry</div><div class="val">${esc(lead.industry||'—')}</div></div>
       <div class="info-item"><div class="lbl">City</div><div class="val">${esc(lead.city||'—')}</div></div>
     </div>
-    ${showAssign ? `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'—')}</div></div>` : ''}
+    ${showAssign ? `<div class="field mb-12"><label>Assigned To</label><select id="ls-assign">${agents.map(a=>`<option value="${a.id}"${a.id===lead.assignedTo?' selected':''}>${esc(a.name)}</option>`).join('')}${!agents.find(a=>a.id===lead.assignedTo)&&byId[lead.assignedTo]?`<option value="${lead.assignedTo}" selected>${esc(byId[lead.assignedTo].name)} (current)</option>`:''}</select></div>` : `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'—')}</div></div>`}
     <div class="divider"></div>
     <div class="row2">
       <div class="field"><label>Stage</label>
@@ -1077,7 +1077,7 @@ function showLeadModal(lead, byId, agents){
       <div class="field"><label>Deal Value (AED)</label><input type="number" id="ls-dv" value="${lead.dealValue||0}" placeholder="0"></div>
     </div>
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
-    ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ This lead was created by the manager. Stage and notes can be updated freely. Full edit/delete requires manager approval (coming in Phase 2).</div>` : ''}
+    ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment and deletion are manager-only.</div>` : ''}
     <p class="text-dim text-xs mt-8">Last edited by <strong>${esc(lead.lastEditedBy||'—')}</strong> · ${lead.lastEditedAt?fmtDate(lead.lastEditedAt):'—'}</p>
     <p id="lm-err" class="err"></p>
     <div class="flex gap-8 mt-12">
@@ -1093,10 +1093,12 @@ function showLeadModal(lead, byId, agents){
   document.getElementById('lm-save').onclick = async () => {
     const stage = v('ls-stage'), fu = v('ls-fu'), notes = v('ls-notes');
     const dv    = v('ls-dv') || lead.dealValue || 0;
+    const newAssignTo = showAssign ? (v('ls-assign')||lead.assignedTo) : lead.assignedTo;
     disable('lm-save','Saving…');
     try {
       await updateDoc(doc(db,'leads',lead.id),{
         stage, followup:fu, notes, dealValue:Number(dv),
+        assignedTo:newAssignTo,
         lastEditedBy:CP.name, lastEditedAt:now()
       });
       closeModal(); toast('Lead saved.'); renderPipelineTab();
@@ -1134,8 +1136,10 @@ function showAddLeadModal(agents, byId){
         <select id="nl-st">${STAGES.filter(s=>s!=='Won'&&s!=='Lost').map(s=>`<option>${s}</option>`).join('')}</select>
       </div>
       ${role!=='agent' ? `<div class="field"><label>Assign To</label>
-        <select id="nl-ag"><option value="${CU.uid}">— Me —</option>
-          ${agents.map(a=>`<option value="${a.id}">${a.name}</option>`).join('')}
+        <select id="nl-ag">
+          ${role==='manager' ? `<option value="${CU.uid}">— Me (Manager) —</option>` : ''}
+          ${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+          ${role==='team_lead'&&!agents.length ? `<option value="">No agents in your sub-group</option>` : ''}
         </select>
       </div>` : ''}
     </div>
@@ -1146,8 +1150,9 @@ function showAddLeadModal(agents, byId){
     const co = v('nl-co');
     const err = document.getElementById('nl-err');
     if(!co){ err.textContent='Company name is required.'; return; }
+    const assignTo = role==='agent' ? CU.uid : (v('nl-ag')||'');
+    if(role==='team_lead' && !assignTo){ err.textContent='No agents in your sub-group yet. Ask your manager to assign agents first.'; return; }
     disable('nl-btn','Adding…');
-    const assignTo = role!=='agent' ? (v('nl-ag')||CU.uid) : CU.uid;
     try {
       await addDoc(collection(db,'leads'),{
         company:co, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
