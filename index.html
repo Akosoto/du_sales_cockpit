@@ -614,7 +614,11 @@ async function renderOrgTab(){
       async () => {
         const ms = await getDocs(query(collection(db,'users'), where('teamId','==',b.dataset.delTeam)));
         const bat = writeBatch(db);
-        ms.docs.forEach(d => bat.update(doc(db,'users',d.id),{teamId:null}));
+        ms.docs.forEach(d => {
+          const fields = {teamId:null};
+          if(d.data().role==='agent') fields.tlId = null;
+          bat.update(doc(db,'users',d.id), fields);
+        });
         bat.delete(doc(db,'teams',b.dataset.delTeam));
         await bat.commit();
         closeModal(); toast('Team deleted.','info'); renderOrgTab();
@@ -626,7 +630,12 @@ async function renderOrgTab(){
     confirmModal(`Remove "${u?.name}"?`,
       'Their leads will remain but become unassigned from this member. Their login will be deactivated.',
       async () => {
-        await updateDoc(doc(db,'users',b.dataset.delUser),{active:false,teamId:null,lastEditedBy:CP.name,lastEditedAt:now()});
+        await updateDoc(doc(db,'users',b.dataset.delUser),{active:false,teamId:null,tlId:null,lastEditedBy:CP.name,lastEditedAt:now()});
+        if(u?.tlId){
+          const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==b.dataset.delUser);
+          const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
+          await updateDoc(doc(db,'users',u.tlId),{autoTarget:newAuto});
+        }
         closeModal(); toast('Member removed.','info'); renderOrgTab();
       });
   }));
@@ -1163,7 +1172,7 @@ async function renderTeamTab(){
 
   const [tSnap, agSnap, lSnap] = await Promise.all([
     getDoc(doc(db,'teams',CP.teamId)),
-    getDocs(query(collection(db,'users'),where('teamId','==',CP.teamId),where('role','==','agent'))),
+    getDocs(query(collection(db,'users'),where('tlId','==',CU.uid),where('role','==','agent'))),
     getDocs(collection(db,'leads'))
   ]);
 
