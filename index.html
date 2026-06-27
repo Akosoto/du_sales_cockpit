@@ -1053,7 +1053,9 @@ function showLeadModal(lead, byId, agents){
   const role      = CP.role;
   const isLocked  = lead.ownerLocked;
   const ownLead   = lead.createdBy === CU.uid;
-  const canDelete = role==='manager' || (!isLocked && (role==='team_lead' || ownLead));
+  const canDelete = role==='manager'
+    || (role==='team_lead' && !isLocked && lead.teamId===CP.teamId)
+    || (role==='agent'     && !isLocked && ownLead);
   const showAssign = role==='manager' || role==='team_lead';
 
   modal(`${esc(lead.company||'Lead')}`, `
@@ -1096,16 +1098,42 @@ function showLeadModal(lead, byId, agents){
     const newAssignTo = showAssign ? (v('ls-assign')||lead.assignedTo) : lead.assignedTo;
     disable('lm-save','Saving…');
     try {
-      await updateDoc(doc(db,'leads',lead.id),{
+      // Build change summary against lead snapshot
+      const changes = [];
+      if(stage !== lead.stage)                     changes.push(`Stage: ${lead.stage} → ${stage}`);
+      if(newAssignTo !== lead.assignedTo)          changes.push(`Assigned to: ${byId[newAssignTo]?.name||newAssignTo}`);
+      if(notes !== (lead.notes||''))               changes.push('Notes updated');
+      if(fu !== (lead.followup||''))               changes.push(`Follow-up: ${fu||'cleared'}`);
+      if(Number(dv) !== Number(lead.dealValue||0)) changes.push(`Deal value: AED ${Number(dv).toLocaleString()}`);
+      const changeSummary = changes.length ? changes.join('; ') : 'No changes';
+
+      // Build update payload
+      const update = {
         stage, followup:fu, notes, dealValue:Number(dv),
         assignedTo:newAssignTo,
-        lastEditedBy:CP.name, lastEditedAt:now()
-      });
+        lastEditedBy:CP.name, lastEditedAt:now(),
+        history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:changeSummary }]
+      };
+
+      // Re-resolve teamId only if assignee changed
+      if(newAssignTo !== lead.assignedTo){
+        const aSnap = await getDoc(doc(db,'users',newAssignTo));
+        update.teamId = aSnap.exists() ? (aSnap.data().teamId||'') : '';
+      }
+
+      await updateDoc(doc(db,'leads',lead.id), update);
       closeModal(); toast('Lead saved.'); renderPipelineTab();
     } catch(e){ document.getElementById('lm-err').textContent=e.message; enable('lm-save','Save Changes'); }
   };
 
   document.getElementById('lm-del')?.addEventListener('click',()=>{
+    // Runtime guards — enforce delete rules at point of action
+    if(role==='team_lead' && (lead.ownerLocked || lead.teamId!==CP.teamId)){
+      toast('You can only delete unowned leads within your own team.','err'); return;
+    }
+    if(role==='agent' && (lead.ownerLocked || lead.createdBy!==CU.uid)){
+      toast('You can only delete leads you created.','err'); return;
+    }
     confirmModal(`Delete lead for ${esc(lead.company)}?`,
       'This cannot be undone.',
       async () => {
@@ -1154,14 +1182,22 @@ function showAddLeadModal(agents, byId){
     if(role==='team_lead' && !assignTo){ err.textContent='No agents in your sub-group yet. Ask your manager to assign agents first.'; return; }
     disable('nl-btn','Adding…');
     try {
+      // Resolve teamId from assignee's user doc (skip for manager self-assign)
+      let leadTeamId = '';
+      if(assignTo && assignTo !== CU.uid){
+        const aSnap = await getDoc(doc(db,'users',assignTo));
+        if(aSnap.exists()) leadTeamId = aSnap.data().teamId || '';
+      }
       await addDoc(collection(db,'leads'),{
         company:co, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
         industry:v('nl-ind'), city:v('nl-cy'), stage:v('nl-st')||'New',
         assignedTo:assignTo, assignedBy:CU.uid,
+        teamId:leadTeamId,
         createdBy:CU.uid, createdByRole:CP.role,
         ownerLocked: CP.role==='manager',
         dealValue:0, notes:'', followup:'',
-        lastEditedBy:CP.name, lastEditedAt:now()
+        lastEditedBy:CP.name, lastEditedAt:now(),
+        history:[{ ts:now(), actorId:CU.uid, actorName:CP.name, change:'Lead created' }]
       });
       closeModal(); toast('Lead added.'); renderPipelineTab();
     } catch(e){ err.textContent=e.message; enable('nl-btn','Add Lead'); }
