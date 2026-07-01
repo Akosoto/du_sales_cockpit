@@ -800,11 +800,25 @@ async function renderOrgTab(){
     confirmModal(`Remove "${u?.name}"?`,
       'Their leads will remain but become unassigned from this member. Their login will be deactivated.',
       async () => {
-        await updateDoc(doc(db,'users',b.dataset.delUser),{active:false,teamId:null,tlId:null,lastEditedBy:CP.name,lastEditedAt:now()});
+        const delId = b.dataset.delUser;
+        await updateDoc(doc(db,'users',delId),{active:false,teamId:null,tlId:null,lastEditedBy:CP.name,lastEditedAt:now()});
         if(u?.tlId){
-          const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==b.dataset.delUser);
+          const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
           const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
           await updateDoc(doc(db,'users',u.tlId),{autoTarget:newAuto});
+        }
+        // Unassign their leads so they don't silently vanish from team pipeline views
+        const orphSnap = await getDocs(query(collection(db,'leads'),where('assignedTo','==',delId)));
+        if(!orphSnap.empty){
+          const bat2 = writeBatch(db);
+          orphSnap.docs.forEach(ld => {
+            bat2.update(ld.ref, {
+              assignedTo:'', tlId:'',
+              lastEditedBy:CP.name, lastEditedAt:now(),
+              history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u?.name||'member'} removed from team` }]
+            });
+          });
+          await bat2.commit();
         }
         closeModal(); toast('Member removed.','info'); renderOrgTab();
       });
@@ -1355,10 +1369,10 @@ async function renderPipelineTab(){
     leads = (await getDocs(query(collection(db,'leads'),where('assignedTo','==',CU.uid)))).docs.map(d=>({id:d.id,...d.data()}));
   }
 
-  // Available agents for assignment dropdown
+  // Available agents for assignment dropdown — TL scoped to own sub-group only (Model B)
   let agents = [];
   if(role==='manager')   agents = Object.values(byId).filter(u=>u.role==='agent'&&u.active!==false);
-  if(role==='team_lead') agents = Object.values(byId).filter(u=>u.role==='agent'&&u.teamId===CP.teamId&&u.active!==false);
+  if(role==='team_lead') agents = Object.values(byId).filter(u=>u.role==='agent'&&u.tlId===CU.uid&&u.active!==false);
 
   // Filter option lists
   let teamsForFilter = [];
@@ -1367,9 +1381,7 @@ async function renderPipelineTab(){
     teamsForFilter = tSnap.docs.map(d=>({id:d.id,...d.data()}));
   }
   const tlsForFilter    = role==='manager' ? Object.values(byId).filter(u=>u.role==='team_lead'&&u.active!==false) : [];
-  const agentsForFilter = role==='team_lead'
-    ? Object.values(byId).filter(u=>u.role==='agent'&&u.tlId===CU.uid&&u.active!==false)
-    : agents;
+  const agentsForFilter = agents;
 
   let stageF='', searchF='';
   let teamFs=[], tlFs=[], agentFs=[];
@@ -1471,7 +1483,7 @@ function showLeadModal(lead, byId, agents){
       <div class="info-item"><div class="lbl">Industry</div><div class="val">${esc(lead.industry||'—')}</div></div>
       <div class="info-item"><div class="lbl">City</div><div class="val">${esc(lead.city||'—')}</div></div>
     </div>
-    ${showAssign ? `<div class="field mb-12"><label>Assigned To</label><select id="ls-assign">${agents.map(a=>`<option value="${a.id}"${a.id===lead.assignedTo?' selected':''}>${esc(a.name)}</option>`).join('')}${!agents.find(a=>a.id===lead.assignedTo)&&byId[lead.assignedTo]?`<option value="${lead.assignedTo}" selected>${esc(byId[lead.assignedTo].name)} (current)</option>`:''}</select></div>` : `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'—')}</div></div>`}
+    ${showAssign ? `<div class="field mb-12"><label>Assigned To</label><select id="ls-assign">${!lead.assignedTo?`<option value="" selected>— Unassigned —</option>`:''}${agents.map(a=>`<option value="${a.id}"${a.id===lead.assignedTo?' selected':''}>${esc(a.name)}</option>`).join('')}${lead.assignedTo&&!agents.find(a=>a.id===lead.assignedTo)&&byId[lead.assignedTo]?`<option value="${lead.assignedTo}" selected>${esc(byId[lead.assignedTo].name)} (current)</option>`:''}</select></div>` : `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'— Unassigned —')}</div></div>`}
     <div class="divider"></div>
     <div class="row2">
       <div class="field"><label>Stage</label>
