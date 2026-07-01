@@ -509,7 +509,7 @@ function showApp(){
 function getTabs(){
   const r = CP.role;
   if(r==='manager')   return [['org','🏢 Org & Teams'],['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
-  if(r==='team_lead') return [['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['team','👥 My Team'],['scripts','📞 Scripts'],['products','📦 Products']];
+  if(r==='team_lead') return [['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
   return [['dashboard','📊 Dashboard'],['pipeline','📋 My Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
 }
 
@@ -1126,8 +1126,9 @@ async function renderDashboardTab(){
   const ct = document.getElementById('content');
   const role = CP.role;
 
-  // Fetch leads + agent users in parallel
-  let leads = [], agentUsers = [];
+  // Fetch all data in parallel
+  let leads = [], agentUsers = [], byId = {}, teamName = '';
+
   const leadsP = (async () => {
     if(role === 'manager'){
       const s = await getDocs(collection(db,'leads'));
@@ -1140,14 +1141,26 @@ async function renderDashboardTab(){
       s.forEach(d => leads.push({id:d.id,...d.data()}));
     }
   })();
-  const usersP = role !== 'agent' ? (async () => {
+
+  const allUsersP = (async () => {
+    const s = await getDocs(collection(db,'users'));
+    s.forEach(d => { byId[d.id] = {id:d.id,...d.data()}; });
+  })();
+
+  const agentUsersP = role !== 'agent' ? (async () => {
     const q = role === 'manager'
       ? query(collection(db,'users'), where('role','==','agent'))
       : query(collection(db,'users'), where('tlId','==',CU.uid));
     const s = await getDocs(q);
     s.forEach(d => agentUsers.push({id:d.id,...d.data()}));
   })() : Promise.resolve();
-  await Promise.all([leadsP, usersP]);
+
+  const teamP = role === 'team_lead' && CP.teamId ? (async () => {
+    const s = await getDoc(doc(db,'teams',CP.teamId));
+    if(s.exists()) teamName = s.data().name || '';
+  })() : Promise.resolve();
+
+  await Promise.all([leadsP, allUsersP, agentUsersP, teamP]);
 
   // KPI computations (all-time)
   const closedL   = leads.filter(l => l.stage === 'Closed');
@@ -1251,7 +1264,8 @@ async function renderDashboardTab(){
   }
 
   ct.innerHTML = `<div style="padding:24px;max-width:1100px">
-    <h2 style="font-size:1.25rem;font-weight:700;margin:0 0 20px">📊 Dashboard</h2>
+    <h2 style="font-size:1.25rem;font-weight:700;margin:0 0 4px">📊 Dashboard</h2>
+    ${role==='team_lead'&&teamName ? `<p style="font-size:13px;color:var(--t2);margin:0 0 18px">Team: <strong style="color:var(--t1)">${esc(teamName)}</strong></p>` : '<div style="margin-bottom:18px"></div>'}
 
     <div class="kpi-grid">
       <div class="kpi-card"><div class="kpi-val">${leads.length}</div><div class="kpi-lbl">Total Leads</div></div>
@@ -1260,6 +1274,7 @@ async function renderDashboardTab(){
       <div class="kpi-card"><div class="kpi-val" style="color:var(--red)">${lostL.length}</div><div class="kpi-lbl">Lost</div></div>
       <div class="kpi-card"><div class="kpi-val" style="color:var(--amber)">${winRate}%</div><div class="kpi-lbl">Win Rate</div></div>
       <div class="kpi-card"><div class="kpi-val" style="color:var(--green);font-size:1.15rem">AED ${Number(closedVal).toLocaleString()}</div><div class="kpi-lbl">Closed Value</div></div>
+      ${role==='team_lead' ? `<div class="kpi-card"><div class="kpi-val">${agentUsers.length}</div><div class="kpi-lbl">Agents</div></div>` : ''}
     </div>
 
     <div class="section-card" style="margin-bottom:20px">
@@ -1310,7 +1325,7 @@ async function renderDashboardTab(){
 
   ct.querySelectorAll('.fu-row').forEach(row => {
     const lead = leads.find(l => l.id === row.dataset.lid);
-    if(lead) row.addEventListener('click', () => showLeadModal(lead));
+    if(lead) row.addEventListener('click', () => showLeadModal(lead, byId, agentUsers));
   });
 }
 
@@ -1490,7 +1505,7 @@ function showLeadModal(lead, byId, agents){
       // Build change summary against lead snapshot
       const changes = [];
       if(stage !== lead.stage)                     changes.push(`Stage: ${lead.stage} → ${stage}`);
-      if(newAssignTo !== lead.assignedTo)          changes.push(`Assigned to: ${byId[newAssignTo]?.name||newAssignTo}`);
+      if(newAssignTo !== lead.assignedTo)          changes.push(`Assigned: ${byId[lead.assignedTo]?.name||'—'} → ${byId[newAssignTo]?.name||newAssignTo}`);
       if(notes !== (lead.notes||''))               changes.push('Notes updated');
       if(fu !== (lead.followup||''))               changes.push(`Follow-up: ${fu||'cleared'}`);
       if(Number(dv) !== Number(lead.dealValue||0)) changes.push(`Deal value: AED ${Number(dv).toLocaleString()}`);
@@ -2806,7 +2821,7 @@ function buildMsFilter(wrapId, labelText, opts){
   return `<div class="ms-wrap" id="${wrapId}">
     <button class="ms-btn" id="${wrapId}-btn" type="button">${labelText}: <span id="${wrapId}-lbl">All</span> ▾</button>
     <div class="ms-dd" id="${wrapId}-dd">
-      ${opts.map(o=>`<label class="ms-item"><input type="checkbox" value="${esc(o.id)}"> ${esc(o.name)}</label>`).join('')}
+      ${opts.map(o=>`<div class="ms-item"><input type="checkbox" value="${esc(o.id)}"> ${esc(o.name)}</div>`).join('')}
     </div>
   </div>`;
 }
@@ -2816,15 +2831,19 @@ function wireMsFilter(wrapId, arr, onchange){
   const dd  = document.getElementById(`${wrapId}-dd`);
   if(!btn||!dd) return;
   btn.addEventListener('click', e => { e.stopPropagation(); dd.classList.toggle('open'); });
-  dd.querySelectorAll('input[type=checkbox]').forEach(cb => {
-    cb.addEventListener('change', () => {
-      arr.length = 0;
-      dd.querySelectorAll('input[type=checkbox]:checked').forEach(c => arr.push(c.value));
-      const lbl = document.getElementById(`${wrapId}-lbl`);
-      if(lbl) lbl.textContent = arr.length ? `${arr.length} sel.` : 'All';
-      btn.classList.toggle('has-sel', arr.length > 0);
-      onchange();
-    });
+  dd.addEventListener('click', e => {
+    e.stopPropagation();
+    const item = e.target.closest('.ms-item');
+    if(!item) return;
+    const cb = item.querySelector('input[type=checkbox]');
+    if(!cb) return;
+    if(e.target !== cb) cb.checked = !cb.checked;
+    arr.length = 0;
+    dd.querySelectorAll('input[type=checkbox]:checked').forEach(c => arr.push(c.value));
+    const lbl = document.getElementById(`${wrapId}-lbl`);
+    if(lbl) lbl.textContent = arr.length ? `${arr.length} sel.` : 'All';
+    btn.classList.toggle('has-sel', arr.length > 0);
+    onchange();
   });
 }
 
