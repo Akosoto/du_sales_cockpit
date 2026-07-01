@@ -216,6 +216,28 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .pr-sub-waiver{color:#93c5fd;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.35)}
 .pr-sub-row{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;margin-bottom:8px}
 .pr-sub-row:last-child{margin-bottom:0}
+
+/* ── MULTI-SELECT DROPDOWN ───────────────────────── */
+.ms-wrap{position:relative;display:inline-block}
+.ms-btn{display:inline-flex;align-items:center;gap:5px;padding:5px 11px;font-size:12px;font-weight:500;border:1px solid var(--border);border-radius:var(--r);background:var(--bg2);color:var(--t2);cursor:pointer;white-space:nowrap;transition:all .15s}
+.ms-btn:hover{border-color:var(--purple2);color:var(--t1)}
+.ms-btn.has-sel{border-color:var(--purple);color:var(--purple2);background:rgba(124,58,237,.08)}
+.ms-dd{position:absolute;top:calc(100% + 4px);left:0;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r);min-width:190px;z-index:300;max-height:230px;overflow-y:auto;box-shadow:var(--sh);display:none}
+.ms-dd.open{display:block}
+.ms-item{display:flex;align-items:center;gap:9px;padding:7px 12px;cursor:pointer;font-size:12.5px;color:var(--t1);user-select:none}
+.ms-item:hover{background:var(--bg3)}
+.ms-item input[type=checkbox]{accent-color:var(--purple);width:13px;height:13px;flex-shrink:0;cursor:pointer}
+.adv-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;padding:9px 13px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r)}
+.adv-filters-lbl{font-size:11px;color:var(--t2);text-transform:uppercase;letter-spacing:.05em;margin-right:2px;white-space:nowrap}
+
+/* ── PERFORMANCE ACCORDION ───────────────────────── */
+.perf-section{border-top:1px solid var(--border);padding:14px 0 4px}
+.perf-stat-row{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:4px}
+.perf-stat .pv{font-size:1.15rem;font-weight:700;line-height:1.2}
+.perf-stat .pl{font-size:10px;color:var(--t2);text-transform:uppercase;letter-spacing:.04em;margin-top:2px}
+.perf-inline{background:var(--bg2);border-radius:var(--r);padding:10px 14px}
+.perf-inline .perf-stat-row{gap:16px}
+.perf-inline .pv{font-size:1rem}
 </style>
 </head>
 <body>
@@ -307,8 +329,8 @@ const SEED_EMAILS = {
   'agent1@shauntech.app':   { role:'agent',     name:'Agent 1'        },
   'agent2@shauntech.app':   { role:'agent',     name:'Agent 2'        },
 };
-const STAGES = ['New','Contacted','Interested','Proposal Sent','Won','Lost'];
-const SP = { 'New':'sp-new','Contacted':'sp-contacted','Interested':'sp-interested','Proposal Sent':'sp-proposal','Won':'sp-won','Lost':'sp-lost' };
+const STAGES = ['New','Contacted','Interested','Proposal Sent','Closed','Lost'];
+const SP = { 'New':'sp-new','Contacted':'sp-contacted','Interested':'sp-interested','Proposal Sent':'sp-proposal','Closed':'sp-won','Lost':'sp-lost' };
 function stagePill(s){ return `<span class="sp ${SP[s]||''}">${s}</span>`; }
 
 // ════════════════════════════════════════════════════
@@ -351,6 +373,10 @@ function closeModal(){
 }
 document.getElementById('m-close').onclick = closeModal;
 document.getElementById('modal').onclick = e => { if(e.target.id==='modal') closeModal(); };
+document.addEventListener('click', e => {
+  if(!e.target.closest('.ms-wrap'))
+    document.querySelectorAll('.ms-dd.open').forEach(d=>d.classList.remove('open'));
+});
 
 // helper: quick confirm
 function confirmModal(title, msg, onYes, danger=true){
@@ -531,6 +557,27 @@ async function renderOrgTab(){
   const byId  = {}; users.forEach(u=>byId[u.id]=u);
   const teamById = {}; teams.forEach(t=>teamById[t.id]=t);
   const leadsSeeded = lSnap.size > 0;
+  const allLeads = lSnap.docs.map(d=>({id:d.id,...d.data()}));
+
+  function perfStats(uids){
+    const l = allLeads.filter(x=>uids.includes(x.assignedTo));
+    const won  = l.filter(x=>x.stage==='Closed').length;
+    const lost = l.filter(x=>x.stage==='Lost').length;
+    const open = l.filter(x=>!['Closed','Lost'].includes(x.stage)).length;
+    const val  = l.filter(x=>x.stage==='Closed').reduce((s,x)=>s+(Number(x.dealValue)||0),0);
+    const rate = l.length ? Math.round(won/l.length*100) : 0;
+    return {total:l.length,won,lost,open,val,rate};
+  }
+  function perfHtml(st){
+    return `<div class="perf-stat-row">
+      <div class="perf-stat"><div class="pv">${st.total}</div><div class="pl">Total</div></div>
+      <div class="perf-stat"><div class="pv">${st.open}</div><div class="pl">Open</div></div>
+      <div class="perf-stat"><div class="pv" style="color:var(--green)">${st.won}</div><div class="pl">Closed</div></div>
+      <div class="perf-stat"><div class="pv" style="color:var(--red)">${st.lost}</div><div class="pl">Lost</div></div>
+      <div class="perf-stat"><div class="pv" style="color:var(--amber)">${st.rate}%</div><div class="pl">Win Rate</div></div>
+      ${st.val?`<div class="perf-stat"><div class="pv" style="font-size:.88rem;color:var(--green)">AED ${Number(st.val).toLocaleString()}</div><div class="pl">Closed Value</div></div>`:''}
+    </div>`;
+  }
 
   ct.innerHTML = `
     <div class="pg-hdr">
@@ -568,6 +615,7 @@ async function renderOrgTab(){
                 <div class="text-dim text-sm mt-8">${teamTLs.length} TL${teamTLs.length!==1?'s':''} &nbsp;·&nbsp; ${tas.length} agent${tas.length!==1?'s':''}</div>
               </div>
               <div class="flex gap-8">
+                <button class="btn btn-ghost btn-sm" data-perf-team="${t.id}">📊 Stats</button>
                 <button class="btn btn-ghost btn-sm" data-edit-team="${t.id}">Edit</button>
                 <button class="btn btn-danger btn-sm" data-del-team="${t.id}">Delete</button>
               </div>
@@ -584,40 +632,74 @@ async function renderOrgTab(){
                   const pillStyle = src === 'override'
                     ? 'background:rgba(245,158,11,0.15);color:#f59e0b'
                     : 'background:rgba(128,128,128,0.12);color:#888';
+                  const tlSt = perfStats(tlAgents.map(a=>a.id));
                   return `<tr style="background:rgba(124,58,237,0.05)">
                     <td><strong>${esc(tl.name)}</strong></td>
                     <td><span class="role-pill team_lead" style="font-size:10px">Team Lead</span></td>
                     <td class="td-dim">${esc(tl.email)}</td>
                     <td class="td-dim">AED ${display.toLocaleString()} <span style="font-size:9px;padding:1px 6px;border-radius:10px;margin-left:4px;${pillStyle}">${src==='override'?'Override':'Auto'}</span></td>
-                    <td class="flex gap-8"><button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button></td>
+                    <td class="flex gap-8">
+                      <button class="btn btn-ghost btn-xs" data-perf-user="${tl.id}">📊</button>
+                      <button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button>
+                    </td>
                   </tr>
-                  ${tlAgents.map(a=>`<tr>
+                  <tr id="perf-user-${tl.id}" style="display:none"><td colspan="5" style="padding:0 0 4px"><div class="perf-inline">
+                    <div class="text-dim text-xs" style="margin-bottom:8px">Sub-group: ${tlAgents.length} agent${tlAgents.length!==1?'s':''}</div>
+                    ${perfHtml(tlSt)}
+                  </div></td></tr>
+                  ${tlAgents.map(a=>{
+                    const aSt = perfStats([a.id]);
+                    return `<tr>
                     <td style="padding-left:28px"><span style="color:var(--t2);margin-right:4px">↳</span>${esc(a.name)}</td>
                     <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
                     <td class="td-dim">${esc(a.email)}</td>
                     <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
                     <td class="flex gap-8">
+                      <button class="btn btn-ghost btn-xs" data-perf-user="${a.id}">📊</button>
                       <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
                       <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
                     </td>
-                  </tr>`).join('')}`;
+                  </tr>
+                  <tr id="perf-user-${a.id}" style="display:none"><td colspan="5" style="padding:0 0 4px 28px"><div class="perf-inline">
+                    ${perfHtml(aSt)}
+                  </div></td></tr>`;
+                  }).join('')}`;
                 }).join('')}
                 ${unassignedAgs.length > 0 ? `
                   <tr style="background:rgba(245,158,11,0.05)">
                     <td colspan="5" class="td-dim text-xs" style="padding:5px 12px;font-style:italic">⚠ Unassigned Agents (no TL)</td>
                   </tr>
-                  ${unassignedAgs.map(a=>`<tr>
+                  ${unassignedAgs.map(a=>{
+                    const aSt = perfStats([a.id]);
+                    return `<tr>
                     <td style="padding-left:28px">${esc(a.name)}</td>
                     <td><span class="role-pill agent" style="font-size:10px">Agent</span></td>
                     <td class="td-dim">${esc(a.email)}</td>
                     <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
                     <td class="flex gap-8">
+                      <button class="btn btn-ghost btn-xs" data-perf-user="${a.id}">📊</button>
                       <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
                       <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
                     </td>
-                  </tr>`).join('')}` : ''}
+                  </tr>
+                  <tr id="perf-user-${a.id}" style="display:none"><td colspan="5" style="padding:0 0 4px 28px"><div class="perf-inline">
+                    ${perfHtml(aSt)}
+                  </div></td></tr>`;
+                  }).join('')}` : ''}
               </tbody>
             </table></div>
+            <div class="perf-section" id="perf-team-${t.id}" style="display:none">
+              ${perfHtml(perfStats(tas.map(a=>a.id)))}
+              ${tas.length > 0 ? `<div class="tbl-wrap mt-12"><table>
+                <thead><tr><th>Agent</th><th>Total</th><th>Open</th><th>Closed</th><th>Lost</th><th>Win Rate</th><th>AED Closed</th></tr></thead>
+                <tbody>${tas.map(a=>{const st=perfStats([a.id]);return `<tr>
+                  <td>${esc(a.name)}</td><td>${st.total}</td><td>${st.open}</td>
+                  <td class="text-ok">${st.won}</td><td class="text-err">${st.lost}</td>
+                  <td>${st.rate}%</td>
+                  <td class="td-dim">${st.val?'AED '+Number(st.val).toLocaleString():'—'}</td>
+                </tr>`;}).join('')}</tbody>
+              </table></div>` : '<p class="text-dim text-xs mt-8">No agents in this team yet.</p>'}
+            </div>
           </div>`;
         }).join('')
     }
@@ -668,6 +750,20 @@ async function renderOrgTab(){
         await bat.commit();
         closeModal(); toast('Team deleted.','info'); renderOrgTab();
       });
+  }));
+  ct.querySelectorAll('[data-perf-team]').forEach(b => b.addEventListener('click', () => {
+    const el = document.getElementById(`perf-team-${b.dataset.perfTeam}`);
+    if(!el) return;
+    const open = el.style.display !== 'none';
+    el.style.display = open ? 'none' : '';
+    b.textContent = open ? '📊 Stats' : '▲ Hide Stats';
+  }));
+  ct.querySelectorAll('[data-perf-user]').forEach(b => b.addEventListener('click', () => {
+    const el = document.getElementById(`perf-user-${b.dataset.perfUser}`);
+    if(!el) return;
+    const open = el.style.display !== 'none';
+    el.style.display = open ? 'none' : '';
+    b.textContent = open ? '📊' : '▲';
   }));
   ct.querySelectorAll('[data-edit-user]').forEach(b => b.addEventListener('click', () => showEditUserModal(b.dataset.editUser, users, teams)));
   ct.querySelectorAll('[data-del-user]').forEach(b  => b.addEventListener('click', () => {
@@ -1025,12 +1121,27 @@ async function renderPipelineTab(){
   if(role==='manager')   agents = Object.values(byId).filter(u=>u.role==='agent'&&u.active!==false);
   if(role==='team_lead') agents = Object.values(byId).filter(u=>u.role==='agent'&&u.teamId===CP.teamId&&u.active!==false);
 
+  // Filter option lists
+  let teamsForFilter = [];
+  if(role==='manager'){
+    const tSnap = await getDocs(collection(db,'teams'));
+    teamsForFilter = tSnap.docs.map(d=>({id:d.id,...d.data()}));
+  }
+  const tlsForFilter    = role==='manager' ? Object.values(byId).filter(u=>u.role==='team_lead'&&u.active!==false) : [];
+  const agentsForFilter = role==='team_lead'
+    ? Object.values(byId).filter(u=>u.role==='agent'&&u.tlId===CU.uid&&u.active!==false)
+    : agents;
+
   let stageF='', searchF='';
+  let teamFs=[], tlFs=[], agentFs=[];
 
   function filtered(){
     let r = leads;
-    if(stageF)  r = r.filter(l=>l.stage===stageF);
+    if(stageF)       r = r.filter(l=>l.stage===stageF);
     if(searchF){ const q=searchF.toLowerCase(); r=r.filter(l=>(l.company||'').toLowerCase().includes(q)||(l.contact||'').toLowerCase().includes(q)||(l.email||'').toLowerCase().includes(q)||(l.phone||'').includes(q)); }
+    if(teamFs.length)  r = r.filter(l=>teamFs.includes(l.teamId));
+    if(tlFs.length)    r = r.filter(l=>tlFs.includes(l.tlId));
+    if(agentFs.length) r = r.filter(l=>agentFs.includes(l.assignedTo));
     return r;
   }
 
@@ -1047,6 +1158,12 @@ async function renderPipelineTab(){
         <button class="btn btn-primary btn-sm" id="btn-add-lead">+ Add Lead</button>
       </div>
     </div>
+    ${role!=='agent' ? `<div class="adv-filters" id="adv-filters">
+      <span class="adv-filters-lbl">Filter by</span>
+      ${role==='manager' ? buildMsFilter('ms-tm','Team',teamsForFilter) : ''}
+      ${role==='manager' ? buildMsFilter('ms-tl','TL',tlsForFilter) : ''}
+      ${agentsForFilter.length ? buildMsFilter('ms-ag','Agent',agentsForFilter) : ''}
+    </div>` : ''}
     <div class="filters" id="filters">
       <button class="filter-btn active" data-s="">All <span class="filter-count">${leads.length}</span></button>
       ${STAGES.map(s=>`<button class="filter-btn" data-s="${s}">${s} <span class="filter-count">${sCounts[s]}</span></button>`).join('')}
@@ -1091,6 +1208,9 @@ async function renderPipelineTab(){
     renderList();
   }));
   document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId));
+  wireMsFilter('ms-tm', teamFs,  renderList);
+  wireMsFilter('ms-tl', tlFs,    renderList);
+  wireMsFilter('ms-ag', agentFs, renderList);
 }
 
 // ─── LEAD MODAL ───
@@ -1120,7 +1240,7 @@ function showLeadModal(lead, byId, agents){
       </div>
       <div class="field"><label>Follow-up Date</label><input type="date" id="ls-fu" value="${lead.followup||''}"></div>
     </div>
-    <div id="ls-dv-wrap" style="${lead.stage==='Won'?'':'display:none'}">
+    <div id="ls-dv-wrap" style="${lead.stage==='Closed'?'':'display:none'}">
       <div class="field"><label>Deal Value (AED)</label><input type="number" id="ls-dv" value="${lead.dealValue||0}" placeholder="0"></div>
     </div>
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
@@ -1134,7 +1254,7 @@ function showLeadModal(lead, byId, agents){
 
   // Show deal value when Won
   document.getElementById('ls-stage').addEventListener('change', function(){
-    document.getElementById('ls-dv-wrap').style.display = this.value==='Won' ? '' : 'none';
+    document.getElementById('ls-dv-wrap').style.display = this.value==='Closed' ? '' : 'none';
   });
 
   document.getElementById('lm-save').onclick = async () => {
@@ -1207,7 +1327,7 @@ function showAddLeadModal(agents, byId){
     </div>
     <div class="row2">
       <div class="field"><label>Stage</label>
-        <select id="nl-st">${STAGES.filter(s=>s!=='Won'&&s!=='Lost').map(s=>`<option>${s}</option>`).join('')}</select>
+        <select id="nl-st">${STAGES.filter(s=>s!=='Closed'&&s!=='Lost').map(s=>`<option>${s}</option>`).join('')}</select>
       </div>
       ${role!=='agent' ? `<div class="field"><label>Assign To</label>
         <select id="nl-ag">
@@ -1229,16 +1349,16 @@ function showAddLeadModal(agents, byId){
     disable('nl-btn','Adding…');
     try {
       // Resolve teamId from assignee's user doc (skip for manager self-assign)
-      let leadTeamId = '';
+      let leadTeamId = '', leadTlId = '';
       if(assignTo && assignTo !== CU.uid){
         const aSnap = await getDoc(doc(db,'users',assignTo));
-        if(aSnap.exists()) leadTeamId = aSnap.data().teamId || '';
+        if(aSnap.exists()){ leadTeamId = aSnap.data().teamId||''; leadTlId = aSnap.data().tlId||''; }
       }
       await addDoc(collection(db,'leads'),{
         company:co, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
         industry:v('nl-ind'), city:v('nl-cy'), stage:v('nl-st')||'New',
         assignedTo:assignTo, assignedBy:CU.uid,
-        teamId:leadTeamId,
+        teamId:leadTeamId, tlId:leadTlId,
         createdBy:CU.uid, createdByRole:CP.role,
         ownerLocked: CP.role==='manager',
         dealValue:0, notes:'', followup:'',
@@ -2410,9 +2530,9 @@ async function renderTeamTab(){
   const agIds = new Set(agents.map(a=>a.id));
   const teamLeads = allLeads.filter(l=>agIds.has(l.assignedTo));
 
-  const won = teamLeads.filter(l=>l.stage==='Won').length;
+  const won = teamLeads.filter(l=>l.stage==='Closed').length;
   const lost = teamLeads.filter(l=>l.stage==='Lost').length;
-  const active = teamLeads.filter(l=>!['Won','Lost'].includes(l.stage)).length;
+  const active = teamLeads.filter(l=>!['Closed','Lost'].includes(l.stage)).length;
 
   ct.innerHTML = `
     <div class="pg-hdr">
@@ -2421,21 +2541,22 @@ async function renderTeamTab(){
     <div class="stats-row">
       <div class="stat"><div class="stat-val">${agents.length}</div><div class="stat-lbl">Agents</div></div>
       <div class="stat"><div class="stat-val">${teamLeads.length}</div><div class="stat-lbl">Total Leads</div></div>
-      <div class="stat"><div class="stat-val" style="color:var(--green)">${won}</div><div class="stat-lbl">Won</div></div>
+      <div class="stat"><div class="stat-val" style="color:var(--green)">${won}</div><div class="stat-lbl">Closed</div></div>
       <div class="stat"><div class="stat-val">${active}</div><div class="stat-lbl">In Progress</div></div>
       <div class="stat"><div class="stat-val" style="color:var(--red)">${lost}</div><div class="stat-lbl">Lost</div></div>
     </div>
     <div class="card">
       <div class="card-hdr"><div class="card-title">Agent Performance</div></div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th>Agent</th><th>Email</th><th>Total</th><th>In Progress</th><th>Won</th><th>Lost</th><th>Target (AED/mo)</th></tr></thead>
+        <thead><tr><th>Agent</th><th>Email</th><th>Total</th><th>In Progress</th><th>Closed</th><th>Lost</th><th>Win Rate</th><th>Target (AED/mo)</th></tr></thead>
         <tbody>
-          ${agents.length===0 ? '<tr><td colspan="7" class="td-dim" style="text-align:center">No agents assigned yet</td></tr>' :
+          ${agents.length===0 ? '<tr><td colspan="8" class="td-dim" style="text-align:center">No agents assigned yet</td></tr>' :
             agents.map(a=>{
               const al = teamLeads.filter(l=>l.assignedTo===a.id);
-              const aw = al.filter(l=>l.stage==='Won').length;
+              const aw = al.filter(l=>l.stage==='Closed').length;
               const al2 = al.filter(l=>l.stage==='Lost').length;
-              const ai = al.filter(l=>!['Won','Lost'].includes(l.stage)).length;
+              const ai = al.filter(l=>!['Closed','Lost'].includes(l.stage)).length;
+              const rate = al.length ? Math.round(aw/al.length*100) : 0;
               return `<tr>
                 <td><strong>${esc(a.name)}</strong></td>
                 <td class="td-dim">${esc(a.email)}</td>
@@ -2443,6 +2564,7 @@ async function renderTeamTab(){
                 <td>${ai}</td>
                 <td class="text-ok">${aw}</td>
                 <td class="text-err">${al2}</td>
+                <td class="td-dim">${rate}%</td>
                 <td class="td-dim">${a.monthlyTarget?'AED '+Number(a.monthlyTarget).toLocaleString():'—'}</td>
               </tr>`;
             }).join('')
@@ -2450,6 +2572,36 @@ async function renderTeamTab(){
         </tbody>
       </table></div>
     </div>`;
+}
+
+// ════════════════════════════════════════════════════
+// MULTI-SELECT FILTER HELPERS
+// ════════════════════════════════════════════════════
+function buildMsFilter(wrapId, labelText, opts){
+  if(!opts.length) return '';
+  return `<div class="ms-wrap" id="${wrapId}">
+    <button class="ms-btn" id="${wrapId}-btn" type="button">${labelText}: <span id="${wrapId}-lbl">All</span> ▾</button>
+    <div class="ms-dd" id="${wrapId}-dd">
+      ${opts.map(o=>`<label class="ms-item"><input type="checkbox" value="${esc(o.id)}"> ${esc(o.name)}</label>`).join('')}
+    </div>
+  </div>`;
+}
+
+function wireMsFilter(wrapId, arr, onchange){
+  const btn = document.getElementById(`${wrapId}-btn`);
+  const dd  = document.getElementById(`${wrapId}-dd`);
+  if(!btn||!dd) return;
+  btn.addEventListener('click', e => { e.stopPropagation(); dd.classList.toggle('open'); });
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      arr.length = 0;
+      dd.querySelectorAll('input[type=checkbox]:checked').forEach(c => arr.push(c.value));
+      const lbl = document.getElementById(`${wrapId}-lbl`);
+      if(lbl) lbl.textContent = arr.length ? `${arr.length} sel.` : 'All';
+      btn.classList.toggle('has-sel', arr.length > 0);
+      onchange();
+    });
+  });
 }
 
 // ════════════════════════════════════════════════════
