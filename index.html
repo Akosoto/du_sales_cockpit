@@ -229,6 +229,9 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .ms-item input[type=checkbox]{accent-color:var(--purple);width:13px;height:13px;flex-shrink:0;cursor:pointer}
 .adv-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;padding:9px 13px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r)}
 .adv-filters-lbl{font-size:11px;color:var(--t2);text-transform:uppercase;letter-spacing:.05em;margin-right:2px;white-space:nowrap}
+.bulk-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;padding:9px 13px;background:rgba(124,58,237,.1);border:1px solid var(--purple);border-radius:var(--r)}
+.bulk-bar select{padding:6px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--t1);font-size:12.5px}
+.lead-chk{accent-color:var(--purple);width:14px;height:14px;cursor:pointer}
 
 /* ── PERFORMANCE ACCORDION ───────────────────────── */
 .perf-section{border-top:1px solid var(--border);padding:14px 0 4px}
@@ -1469,6 +1472,15 @@ async function renderPipelineTab(){
   if(role==='manager')   agents = Object.values(byId).filter(u=>u.role==='agent'&&u.active!==false);
   if(role==='team_lead') agents = Object.values(byId).filter(u=>u.role==='agent'&&u.tlId===CU.uid&&u.active!==false);
 
+  // Bulk-assign eligibility — TL can only reassign leads already in their own
+  // sub-group (or unowned); a lead in another TL's sub-group would fail the
+  // Firestore rule and fail the whole batch, so keep it out of the picker entirely.
+  function bulkEligible(l){
+    if(role==='agent') return false;
+    if(role==='team_lead') return l.tlId===CU.uid || !l.tlId;
+    return true; // manager
+  }
+
   // Filter option lists
   let teamsForFilter = [];
   if(role==='manager'){
@@ -1480,6 +1492,7 @@ async function renderPipelineTab(){
 
   let stageF='', searchF='';
   let teamFs=[], tlFs=[], agentFs=[];
+  const selected = new Set();
 
   function filtered(){
     let r = leads;
@@ -1532,18 +1545,64 @@ async function renderPipelineTab(){
       <button class="filter-btn active" data-s="">All <span class="filter-count">${leads.length}</span></button>
       ${STAGES.map(s=>`<button class="filter-btn" data-s="${s}">${s} <span class="filter-count">${sCounts[s]}</span></button>`).join('')}
     </div>
+    <div id="bulk-bar-wrap"></div>
     <div id="lead-list"></div>`;
+
+  function renderBulkBar(){
+    const wrap = document.getElementById('bulk-bar-wrap');
+    if(role==='agent' || !selected.size){ wrap.innerHTML=''; return; }
+    wrap.innerHTML = `<div class="bulk-bar">
+      <strong>${selected.size} selected</strong>
+      <select id="bulk-assign-sel">
+        <option value="">Assign to…</option>
+        ${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+      </select>
+      <button class="btn btn-primary btn-sm" id="bulk-assign-btn">Assign</button>
+      <button class="btn btn-ghost btn-sm" id="bulk-clear-btn">Clear selection</button>
+    </div>`;
+    document.getElementById('bulk-clear-btn').addEventListener('click', () => { selected.clear(); renderList(); });
+    document.getElementById('bulk-assign-btn').addEventListener('click', async () => {
+      const targetId = v('bulk-assign-sel');
+      if(!targetId){ toast('Pick an agent to assign to first.','err'); return; }
+      const target = byId[targetId];
+      const ids = [...selected];
+      disable('bulk-assign-btn','Assigning…');
+      try {
+        const CHUNK = 400;
+        for(let i=0;i<ids.length;i+=CHUNK){
+          const bat = writeBatch(db);
+          ids.slice(i,i+CHUNK).forEach(id=>{
+            const lead = leads.find(l=>l.id===id); if(!lead) return;
+            bat.update(doc(db,'leads',id), {
+              assignedTo: targetId,
+              teamId: target.teamId||'', tlId: target.tlId||'',
+              lastEditedBy: CP.name, lastEditedAt: now(),
+              history: [...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Assigned: ${byId[lead.assignedTo]?.name||'—'} → ${target.name} (bulk)` }]
+            });
+          });
+          await bat.commit();
+        }
+        toast(`${ids.length} lead${ids.length!==1?'s':''} assigned to ${target.name}.`);
+        selected.clear();
+        renderPipelineTab();
+      } catch(e){ toast('Error: '+e.message,'err'); enable('bulk-assign-btn','Assign'); }
+    });
+  }
 
   function renderList(){
     const f = filtered();
     document.getElementById('lead-cnt').textContent = `${f.length} lead${f.length!==1?'s':''}`;
     const el = document.getElementById('lead-list');
+    renderBulkBar();
     if(!f.length){ el.innerHTML=`<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">No leads found</div><div class="empty-sub">Try adjusting your search or filter.</div></div>`; return; }
+    const canBulk = role !== 'agent' && agents.length > 0;
+    const eligible = canBulk ? f.filter(bulkEligible) : [];
     el.innerHTML = `<div class="tbl-wrap"><table>
-      <thead><tr><th>Company</th><th>Contact</th><th>Phone</th>${role!=='agent'?'<th>Agent</th>':''}
+      <thead><tr>${canBulk?`<th><input type="checkbox" id="chk-all" class="lead-chk"></th>`:''}<th>Company</th><th>Contact</th><th>Phone</th>${role!=='agent'?'<th>Agent</th>':''}
         <th>Stage</th><th>City</th><th>Follow-up</th><th>Updated</th><th></th></tr></thead>
       <tbody>
         ${f.map(l=>`<tr>
+          ${canBulk?(bulkEligible(l)?`<td><input type="checkbox" class="lead-chk" data-chk="${l.id}"${selected.has(l.id)?' checked':''}></td>`:'<td></td>'):''}
           <td class="td-company">${esc(l.company||'—')}${l.assignedTo===CU.uid?'<span style="font-size:10px;font-weight:700;background:rgba(16,185,129,.2);color:#34d399;padding:2px 8px;border-radius:10px;margin-left:6px;vertical-align:middle">📌 Mine</span>':''}</td>
           <td class="td-dim">${esc(l.contact||'—')}</td>
           <td class="td-dim">${l.phone?`<a href="tel:${l.phone}">${l.phone}</a>`:'—'}</td>
@@ -1560,21 +1619,36 @@ async function renderPipelineTab(){
       const lead = leads.find(x=>x.id===b.dataset.lid);
       if(lead) showLeadModal(lead, byId, agents);
     }));
+    if(canBulk && eligible.length){
+      const chkAll = document.getElementById('chk-all');
+      chkAll.checked = eligible.every(l=>selected.has(l.id));
+      chkAll.addEventListener('change', () => {
+        eligible.forEach(l => chkAll.checked ? selected.add(l.id) : selected.delete(l.id));
+        renderList();
+      });
+      el.querySelectorAll('[data-chk]').forEach(cb=>cb.addEventListener('change', () => {
+        cb.checked ? selected.add(cb.dataset.chk) : selected.delete(cb.dataset.chk);
+        renderBulkBar();
+        chkAll.checked = eligible.every(l=>selected.has(l.id));
+      }));
+    }
   }
 
   renderList();
 
   ct.getElementById = id => ct.querySelector('#'+id); // scoped
-  document.getElementById('srch').addEventListener('input', e=>{ searchF=e.target.value; renderList(); });
+  document.getElementById('srch').addEventListener('input', e=>{ searchF=e.target.value; selected.clear(); renderList(); });
   document.querySelectorAll('[data-s]').forEach(b=>b.addEventListener('click',()=>{
     stageF=b.dataset.s;
     document.querySelectorAll('[data-s]').forEach(x=>x.classList.toggle('active',x===b));
+    selected.clear();
     renderList();
   }));
   document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId));
-  wireMsFilter('ms-tm', teamFs,  renderList);
-  wireMsFilter('ms-tl', tlFs,    renderList);
-  wireMsFilter('ms-ag', agentFs, renderList);
+  const clearSelAndRender = () => { selected.clear(); renderList(); };
+  wireMsFilter('ms-tm', teamFs,  clearSelAndRender);
+  wireMsFilter('ms-tl', tlFs,    clearSelAndRender);
+  wireMsFilter('ms-ag', agentFs, clearSelAndRender);
 
   document.querySelectorAll('[data-approve-del]').forEach(b=>b.addEventListener('click',()=>{
     const l = leads.find(x=>x.id===b.dataset.approveDel); if(!l) return;
