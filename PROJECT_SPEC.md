@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign shipped; companies/permissions/backend-dept next)**
+**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign + module split shipped; companies/permissions/backend-dept next)**
 
 ---
 
@@ -9,8 +9,29 @@ A Firebase-backed B2B sales management web app for Shaun Technologies Trading LL
 
 **Live URL:** https://akosoto.github.io/du_sales_cockpit
 **Firebase project:** `du-sales-cockpit`
-**Stack:** Single `index.html` — vanilla JS ES modules, Firebase Auth, Firestore, no build step
+**Stack:** `index.html` (shell: HTML + CSS only) + `js/*.js` ES modules, Firebase Auth, Firestore, no build step
 **Repo:** https://github.com/Akosoto/du_sales_cockpit (branch `main`, GitHub Pages deploys from `main` / root)
+
+### File structure (as of the Phase 5 module split)
+```
+index.html          — HTML shell + all CSS, loads js/main.js as the sole entry script
+js/state.js          — Firebase init (db/auth/auth2), SEED_EMAILS, STAGES, SP, mutable CU/CP/TAB
+                        (exported as live bindings; only state.js's own setUser()/setTab() may
+                        reassign them — every other module just imports and reads)
+js/helpers.js         — v, esc, now, fmtDate, disable, enable, toast, modal, closeModal,
+                        confirmModal, stagePill, calculateTLTarget, buildMsFilter, wireMsFilter
+js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routing, change-password
+js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData
+js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
+js/dashboard.js       — Dashboard tab
+js/scripts.js         — Scripts tab, channels, approval workflow
+js/products.js        — Products tab, seed catalog, discounts, waivers
+js/main.js            — getTabs/renderNav/switchTab — the only place that imports every
+                        render*Tab function and routes between them
+```
+Dropped as confirmed-dead code during the split (verified via grep for call sites before removal): `renderTeamTab()` and its `switchTab` branch (orphaned once "My Team" was merged into the Dashboard), `renderPlaceholder()` (never called), and a `ct.getElementById` monkey-patch in the Pipeline tab (assigned, never read).
+
+**Local testing:** `.claude/simple-server.ps1` is a dependency-free static file server (uses .NET's `HttpListener`, no Node/Python required) for local module testing before pushing — Chrome's module loader rejects `file://` origins, so a local HTTP server is required to test ES module changes before they go live. Run via the Preview tool's `static-server` config in `.claude/launch.json`.
 
 ---
 
