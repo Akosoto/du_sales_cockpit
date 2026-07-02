@@ -252,6 +252,8 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .fu-row:hover td{background:rgba(255,255,255,.04)!important}
 .act-log{display:flex;flex-direction:column}
 .act-item{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.act-item.act-hidden{display:none}
+.act-log.expanded .act-item.act-hidden{display:flex}
 .act-item:last-child{border-bottom:none}
 .act-dot{width:8px;height:8px;border-radius:50%;background:var(--purple);flex-shrink:0;margin-top:5px}
 .act-content{flex:1;min-width:0}
@@ -967,6 +969,12 @@ function showEditUserModal(userId, users, teams){
   const initTLs    = isAg ? users.filter(x=>x.role==='team_lead'&&x.teamId===u.teamId&&x.active!==false) : [];
 
   modal(`Edit: ${esc(u.name)}`, `
+    ${u.active===false ? `<div class="locked-note" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="eu-reactivate-chk" checked style="width:auto;margin:0;cursor:pointer">
+        <label for="eu-reactivate-chk" style="margin:0;cursor:pointer">⚠ This member is deactivated (removed). <strong>Reactivate on save</strong> — otherwise they'll stay invisible in team lists and assignment dropdowns even after being reassigned a team.</label>
+      </div>
+    </div>` : ''}
     <div class="row2">
       <div class="field"><label>Full Name</label><input type="text" id="eu-name" value="${esc(u.name)}"></div>
       <div class="field"><label>Email</label><input type="email" id="eu-email" value="${esc(u.email)}" disabled><p class="hint">Email cannot be changed after creation.</p></div>
@@ -1038,6 +1046,9 @@ function showEditUserModal(userId, users, teams){
     disable('eu-save','Saving…');
     try {
       const upd = {name, teamId:teamId||null, lastEditedBy:CP.name, lastEditedAt:now()};
+      if(u.active===false){
+        upd.active = !!document.getElementById('eu-reactivate-chk')?.checked;
+      }
 
       if(isAg){
         const newTlId      = v('eu-tl')||null;
@@ -1329,6 +1340,14 @@ async function renderDashboardTab(){
       ${role==='team_lead' ? `<div class="kpi-card"><div class="kpi-val">${agentUsers.length}</div><div class="kpi-lbl">Agents</div></div>` : ''}
     </div>
 
+    ${role !== 'agent' ? `<div class="section-card" style="margin-bottom:20px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:12px">👥 Agent Performance</div>
+      <div style="overflow-x:auto"><table class="data-table">
+        <thead><tr><th>Agent</th><th>Total</th><th>Open</th><th style="color:var(--green)">Closed</th><th style="color:var(--red)">Lost</th><th>Win Rate</th><th>Target</th><th>This Month</th></tr></thead>
+        <tbody>${agentRows}</tbody>
+      </table></div>
+    </div>` : ''}
+
     <div class="section-card" style="margin-bottom:20px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
         <span style="font-weight:600;font-size:14px">This Month's Target</span>
@@ -1356,28 +1375,27 @@ async function renderDashboardTab(){
       </div>
       <div class="section-card" style="overflow:hidden">
         <div style="font-weight:700;font-size:14px;margin-bottom:10px">🕐 Recent Activity</div>
-        ${recentActs.length ? `<div class="act-log">${recentActs.map(a=>`<div class="act-item">
+        ${recentActs.length ? `<div class="act-log" id="act-log">${recentActs.map((a,i)=>`<div class="act-item${i>=10?' act-hidden':''}">
           <div class="act-dot"></div>
           <div class="act-content">
             <div><span class="act-who">${esc(a.actorName||'')}</span> <span class="act-change">${esc(a.change||'')}</span> <span class="act-company">· ${esc(a.company||'')}</span></div>
             <div class="act-time">${fmtDate(a.ts)}</div>
           </div>
-        </div>`).join('')}</div>` : `<p style="color:var(--t2);font-size:13px">No activity yet.</p>`}
+        </div>`).join('')}</div>${recentActs.length>10?`<button class="btn btn-ghost btn-sm mt-8" id="act-toggle">Show More (${recentActs.length-10})</button>`:''}` : `<p style="color:var(--t2);font-size:13px">No activity yet.</p>`}
       </div>
     </div>
-
-    ${role !== 'agent' ? `<div class="section-card">
-      <div style="font-weight:700;font-size:14px;margin-bottom:12px">👥 Agent Performance</div>
-      <div style="overflow-x:auto"><table class="data-table">
-        <thead><tr><th>Agent</th><th>Total</th><th>Open</th><th style="color:var(--green)">Closed</th><th style="color:var(--red)">Lost</th><th>Win Rate</th><th>Target</th><th>This Month</th></tr></thead>
-        <tbody>${agentRows}</tbody>
-      </table></div>
-    </div>` : ''}
   </div>`;
 
   ct.querySelectorAll('.fu-row').forEach(row => {
     const lead = leads.find(l => l.id === row.dataset.lid);
     if(lead) row.addEventListener('click', () => showLeadModal(lead, byId, agentUsers));
+  });
+
+  document.getElementById('act-toggle')?.addEventListener('click', () => {
+    const log = document.getElementById('act-log');
+    const btn = document.getElementById('act-toggle');
+    const expanded = log.classList.toggle('expanded');
+    btn.textContent = expanded ? 'Show Less' : `Show More (${recentActs.length-10})`;
   });
 }
 
