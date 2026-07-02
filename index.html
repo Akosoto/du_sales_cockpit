@@ -681,6 +681,7 @@ async function renderOrgTab(){
                     <td class="flex gap-8">
                       <button class="btn btn-ghost btn-xs" data-perf-user="${tl.id}">📊</button>
                       <button class="btn btn-ghost btn-xs" data-edit-user="${tl.id}">Edit</button>
+                      <button class="btn btn-danger btn-xs" data-hard-del-user="${tl.id}">Delete</button>
                     </td>
                   </tr>
                   <tr id="perf-user-${tl.id}" style="display:none"><td colspan="5" style="padding:0 0 4px"><div class="perf-inline">
@@ -698,6 +699,7 @@ async function renderOrgTab(){
                       <button class="btn btn-ghost btn-xs" data-perf-user="${a.id}">📊</button>
                       <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
                       <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
+                      <button class="btn btn-danger btn-xs" data-hard-del-user="${a.id}">Delete</button>
                     </td>
                   </tr>
                   <tr id="perf-user-${a.id}" style="display:none"><td colspan="5" style="padding:0 0 4px 28px"><div class="perf-inline">
@@ -720,6 +722,7 @@ async function renderOrgTab(){
                       <button class="btn btn-ghost btn-xs" data-perf-user="${a.id}">📊</button>
                       <button class="btn btn-ghost btn-xs" data-edit-user="${a.id}">Edit</button>
                       <button class="btn btn-danger btn-xs" data-del-user="${a.id}">Remove</button>
+                      <button class="btn btn-danger btn-xs" data-hard-del-user="${a.id}">Delete</button>
                     </td>
                   </tr>
                   <tr id="perf-user-${a.id}" style="display:none"><td colspan="5" style="padding:0 0 4px 28px"><div class="perf-inline">
@@ -759,6 +762,7 @@ async function renderOrgTab(){
               <td class="flex gap-8">
                 <button class="btn btn-ghost btn-xs" data-edit-user="${u.id}">Edit</button>
                 <button class="btn btn-danger btn-xs" data-del-user="${u.id}">Remove</button>
+                <button class="btn btn-danger btn-xs" data-hard-del-user="${u.id}">Delete</button>
               </td>
             </tr>`).join('')}
           </tbody>
@@ -834,6 +838,41 @@ async function renderOrgTab(){
         }
         closeModal(); toast('Member removed.','info'); renderOrgTab();
       });
+  }));
+
+  ct.querySelectorAll('[data-hard-del-user]').forEach(b => b.addEventListener('click', () => {
+    const u = byId[b.dataset.hardDelUser]; if(!u) return;
+    const isTL = u.role === 'team_lead';
+    const warnMsg = isTL
+      ? 'This cannot be undone. Their agents will become unassigned (no TL) but stay in the team. The login will stop working immediately.'
+      : 'This cannot be undone. Their leads will become unassigned. The login will stop working immediately.';
+    confirmModal(`Permanently delete "${esc(u.name)}"?`, warnMsg, async () => {
+      const delId = u.id;
+      const bat = writeBatch(db);
+
+      if(isTL){
+        const orphanedAgents = users.filter(x => x.role==='agent' && x.tlId===delId);
+        orphanedAgents.forEach(a => bat.update(doc(db,'users',a.id), {tlId:null}));
+        const tlLeadsSnap = await getDocs(query(collection(db,'leads'), where('tlId','==',delId)));
+        tlLeadsSnap.docs.forEach(ld => bat.update(ld.ref, {tlId:''}));
+      } else {
+        if(u.tlId){
+          const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
+          const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
+          bat.update(doc(db,'users',u.tlId), {autoTarget:newAuto});
+        }
+        const orphSnap = await getDocs(query(collection(db,'leads'), where('assignedTo','==',delId)));
+        orphSnap.docs.forEach(ld => bat.update(ld.ref, {
+          assignedTo:'', tlId:'',
+          lastEditedBy:CP.name, lastEditedAt:now(),
+          history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${esc(u.name)} deleted` }]
+        }));
+      }
+
+      bat.delete(doc(db,'users',delId));
+      await bat.commit();
+      closeModal(); toast(`${isTL?'Team Lead':'Agent'} deleted.`,'info'); renderOrgTab();
+    }, true);
   }));
 }
 
