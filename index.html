@@ -252,6 +252,8 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .fu-row:hover td{background:rgba(255,255,255,.04)!important}
 .act-log{display:flex;flex-direction:column}
 .act-item{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.act-item.act-hidden{display:none}
+.act-log.expanded .act-item.act-hidden{display:flex}
 .act-item:last-child{border-bottom:none}
 .act-dot{width:8px;height:8px;border-radius:50%;background:var(--purple);flex-shrink:0;margin-top:5px}
 .act-content{flex:1;min-width:0}
@@ -967,6 +969,12 @@ function showEditUserModal(userId, users, teams){
   const initTLs    = isAg ? users.filter(x=>x.role==='team_lead'&&x.teamId===u.teamId&&x.active!==false) : [];
 
   modal(`Edit: ${esc(u.name)}`, `
+    ${u.active===false ? `<div class="locked-note" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="eu-reactivate-chk" checked style="width:auto;margin:0;cursor:pointer">
+        <label for="eu-reactivate-chk" style="margin:0;cursor:pointer">⚠ This member is deactivated (removed). <strong>Reactivate on save</strong> — otherwise they'll stay invisible in team lists and assignment dropdowns even after being reassigned a team.</label>
+      </div>
+    </div>` : ''}
     <div class="row2">
       <div class="field"><label>Full Name</label><input type="text" id="eu-name" value="${esc(u.name)}"></div>
       <div class="field"><label>Email</label><input type="email" id="eu-email" value="${esc(u.email)}" disabled><p class="hint">Email cannot be changed after creation.</p></div>
@@ -1038,6 +1046,9 @@ function showEditUserModal(userId, users, teams){
     disable('eu-save','Saving…');
     try {
       const upd = {name, teamId:teamId||null, lastEditedBy:CP.name, lastEditedAt:now()};
+      if(u.active===false){
+        upd.active = !!document.getElementById('eu-reactivate-chk')?.checked;
+      }
 
       if(isAg){
         const newTlId      = v('eu-tl')||null;
@@ -1329,6 +1340,14 @@ async function renderDashboardTab(){
       ${role==='team_lead' ? `<div class="kpi-card"><div class="kpi-val">${agentUsers.length}</div><div class="kpi-lbl">Agents</div></div>` : ''}
     </div>
 
+    ${role !== 'agent' ? `<div class="section-card" style="margin-bottom:20px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:12px">👥 Agent Performance</div>
+      <div style="overflow-x:auto"><table class="data-table">
+        <thead><tr><th>Agent</th><th>Total</th><th>Open</th><th style="color:var(--green)">Closed</th><th style="color:var(--red)">Lost</th><th>Win Rate</th><th>Target</th><th>This Month</th></tr></thead>
+        <tbody>${agentRows}</tbody>
+      </table></div>
+    </div>` : ''}
+
     <div class="section-card" style="margin-bottom:20px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
         <span style="font-weight:600;font-size:14px">This Month's Target</span>
@@ -1356,28 +1375,27 @@ async function renderDashboardTab(){
       </div>
       <div class="section-card" style="overflow:hidden">
         <div style="font-weight:700;font-size:14px;margin-bottom:10px">🕐 Recent Activity</div>
-        ${recentActs.length ? `<div class="act-log">${recentActs.map(a=>`<div class="act-item">
+        ${recentActs.length ? `<div class="act-log" id="act-log">${recentActs.map((a,i)=>`<div class="act-item${i>=10?' act-hidden':''}">
           <div class="act-dot"></div>
           <div class="act-content">
             <div><span class="act-who">${esc(a.actorName||'')}</span> <span class="act-change">${esc(a.change||'')}</span> <span class="act-company">· ${esc(a.company||'')}</span></div>
             <div class="act-time">${fmtDate(a.ts)}</div>
           </div>
-        </div>`).join('')}</div>` : `<p style="color:var(--t2);font-size:13px">No activity yet.</p>`}
+        </div>`).join('')}</div>${recentActs.length>10?`<button class="btn btn-ghost btn-sm mt-8" id="act-toggle">Show More (${recentActs.length-10})</button>`:''}` : `<p style="color:var(--t2);font-size:13px">No activity yet.</p>`}
       </div>
     </div>
-
-    ${role !== 'agent' ? `<div class="section-card">
-      <div style="font-weight:700;font-size:14px;margin-bottom:12px">👥 Agent Performance</div>
-      <div style="overflow-x:auto"><table class="data-table">
-        <thead><tr><th>Agent</th><th>Total</th><th>Open</th><th style="color:var(--green)">Closed</th><th style="color:var(--red)">Lost</th><th>Win Rate</th><th>Target</th><th>This Month</th></tr></thead>
-        <tbody>${agentRows}</tbody>
-      </table></div>
-    </div>` : ''}
   </div>`;
 
   ct.querySelectorAll('.fu-row').forEach(row => {
     const lead = leads.find(l => l.id === row.dataset.lid);
     if(lead) row.addEventListener('click', () => showLeadModal(lead, byId, agentUsers));
+  });
+
+  document.getElementById('act-toggle')?.addEventListener('click', () => {
+    const log = document.getElementById('act-log');
+    const btn = document.getElementById('act-toggle');
+    const expanded = log.classList.toggle('expanded');
+    btn.textContent = expanded ? 'Show Less' : `Show More (${recentActs.length-10})`;
   });
 }
 
@@ -1435,6 +1453,7 @@ async function renderPipelineTab(){
   }
 
   const sCounts = {}; STAGES.forEach(s=>sCounts[s]=leads.filter(l=>l.stage===s).length);
+  const pendingDeletes = role==='manager' ? leads.filter(l=>l.deleteRequest) : [];
 
   ct.innerHTML = `
     <div class="pg-hdr">
@@ -1447,6 +1466,23 @@ async function renderPipelineTab(){
         <button class="btn btn-primary btn-sm" id="btn-add-lead">+ Add Lead</button>
       </div>
     </div>
+    ${pendingDeletes.length ? `<div class="seed-banner" id="del-req-banner" style="flex-direction:column;align-items:stretch">
+      <p>🗑 <strong>${pendingDeletes.length} deletion request${pendingDeletes.length!==1?'s':''}</strong> awaiting your approval.</p>
+      <div class="tbl-wrap" style="margin-top:10px"><table>
+        <thead><tr><th>Company</th><th>Requested By</th><th>Date</th><th></th></tr></thead>
+        <tbody>
+          ${pendingDeletes.map(l=>`<tr>
+            <td class="td-company">${esc(l.company||'—')}</td>
+            <td class="td-dim">${esc(l.deleteRequest.requestedByName||'—')}</td>
+            <td class="td-dim text-sm">${fmtDate(l.deleteRequest.requestedAt)}</td>
+            <td class="flex gap-8">
+              <button class="btn btn-danger btn-xs" data-approve-del="${l.id}">✅ Approve</button>
+              <button class="btn btn-ghost btn-xs" data-reject-del="${l.id}">✖ Reject</button>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>
+    </div>` : ''}
     ${role!=='agent' ? `<div class="adv-filters" id="adv-filters">
       <span class="adv-filters-lbl">Filter by</span>
       ${role==='manager' ? buildMsFilter('ms-tm','Team',teamsForFilter) : ''}
@@ -1500,6 +1536,22 @@ async function renderPipelineTab(){
   wireMsFilter('ms-tm', teamFs,  renderList);
   wireMsFilter('ms-tl', tlFs,    renderList);
   wireMsFilter('ms-ag', agentFs, renderList);
+
+  document.querySelectorAll('[data-approve-del]').forEach(b=>b.addEventListener('click',()=>{
+    const l = leads.find(x=>x.id===b.dataset.approveDel); if(!l) return;
+    confirmModal(`Approve deletion for ${esc(l.company)}?`, 'This cannot be undone.', async () => {
+      await deleteDoc(doc(db,'leads',l.id));
+      toast('Lead deleted.','info'); renderPipelineTab();
+    });
+  }));
+  document.querySelectorAll('[data-reject-del]').forEach(b=>b.addEventListener('click', async () => {
+    const l = leads.find(x=>x.id===b.dataset.rejectDel); if(!l) return;
+    await updateDoc(doc(db,'leads',l.id), {
+      deleteRequest:null,
+      history:[...(l.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request rejected' }]
+    });
+    toast('Deletion request rejected.','info'); renderPipelineTab();
+  }));
 }
 
 // ─── LEAD MODAL ───
@@ -1507,9 +1559,12 @@ function showLeadModal(lead, byId, agents){
   const role      = CP.role;
   const isLocked  = lead.ownerLocked;
   const ownLead   = lead.createdBy === CU.uid;
-  const canDelete = role==='manager'
+  const canDeleteDirect = role==='manager'
     || (role==='team_lead' && !isLocked && lead.teamId===CP.teamId)
     || (role==='agent'     && !isLocked && ownLead);
+  const canRequestDelete   = role==='team_lead' && isLocked && lead.teamId===CP.teamId;
+  const hasPendingDeleteReq = !!lead.deleteRequest;
+  const isMyDeleteRequest  = hasPendingDeleteReq && lead.deleteRequest.requestedBy===CU.uid;
   const showAssign = role==='manager' || role==='team_lead';
 
   modal(`${esc(lead.company||'Lead')}`, `
@@ -1533,12 +1588,16 @@ function showLeadModal(lead, byId, agents){
       <div class="field"><label>Deal Value (AED)</label><input type="number" id="ls-dv" value="${lead.dealValue||0}" placeholder="0"></div>
     </div>
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
-    ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment and deletion are manager-only.</div>` : ''}
+    ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment is manager-only; deletion requires manager approval.</div>` : ''}
+    ${hasPendingDeleteReq ? `<div class="locked-note" style="background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:var(--red)">🗑 Deletion requested by <strong>${esc(lead.deleteRequest.requestedByName||'—')}</strong> on ${fmtDate(lead.deleteRequest.requestedAt)} — pending manager approval.</div>` : ''}
     <p class="text-dim text-xs mt-8">Last edited by <strong>${esc(lead.lastEditedBy||'—')}</strong> · ${lead.lastEditedAt?fmtDate(lead.lastEditedAt):'—'}</p>
     <p id="lm-err" class="err"></p>
-    <div class="flex gap-8 mt-12">
+    <div class="flex gap-8 mt-12" style="flex-wrap:wrap">
       <button class="btn btn-primary" id="lm-save">Save Changes</button>
-      ${canDelete ? `<button class="btn btn-danger btn-sm" id="lm-del">Delete Lead</button>` : ''}
+      ${canDeleteDirect ? `<button class="btn btn-danger btn-sm" id="lm-del">Delete Lead</button>` : ''}
+      ${canRequestDelete && !hasPendingDeleteReq ? `<button class="btn btn-ghost btn-sm" id="lm-reqdel" style="border-color:var(--amber);color:var(--amber)">🔒 Request Deletion</button>` : ''}
+      ${canRequestDelete && hasPendingDeleteReq && isMyDeleteRequest ? `<button class="btn btn-ghost btn-sm" id="lm-withdraw-del">Withdraw Delete Request</button>` : ''}
+      ${role==='manager' && hasPendingDeleteReq ? `<button class="btn btn-danger btn-sm" id="lm-approve-del">✅ Approve Deletion</button><button class="btn btn-ghost btn-sm" id="lm-reject-del">✖ Reject Request</button>` : ''}
     </div>`,true);
 
   // Show deal value when Won
@@ -1595,6 +1654,43 @@ function showLeadModal(lead, byId, agents){
         await deleteDoc(doc(db,'leads',lead.id));
         closeModal(); toast('Lead deleted.','info'); renderPipelineTab();
       });
+  });
+
+  document.getElementById('lm-reqdel')?.addEventListener('click',()=>{
+    confirmModal(`Request deletion for ${esc(lead.company)}?`,
+      'This lead was created by your manager. A deletion request will be sent for approval — the lead stays active until approved.',
+      async () => {
+        await updateDoc(doc(db,'leads',lead.id), {
+          deleteRequest: { requestedBy:CU.uid, requestedByName:CP.name, requestedAt:now() },
+          history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion requested — pending manager approval' }]
+        });
+        closeModal(); toast('Deletion request sent to manager.','info'); renderPipelineTab();
+      });
+  });
+
+  document.getElementById('lm-withdraw-del')?.addEventListener('click', async () => {
+    await updateDoc(doc(db,'leads',lead.id), {
+      deleteRequest:null,
+      history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request withdrawn' }]
+    });
+    closeModal(); toast('Deletion request withdrawn.','info'); renderPipelineTab();
+  });
+
+  document.getElementById('lm-approve-del')?.addEventListener('click',()=>{
+    confirmModal(`Approve deletion for ${esc(lead.company)}?`,
+      'This cannot be undone.',
+      async () => {
+        await deleteDoc(doc(db,'leads',lead.id));
+        closeModal(); toast('Lead deleted.','info'); renderPipelineTab();
+      });
+  });
+
+  document.getElementById('lm-reject-del')?.addEventListener('click', async () => {
+    await updateDoc(doc(db,'leads',lead.id), {
+      deleteRequest:null,
+      history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request rejected' }]
+    });
+    closeModal(); toast('Deletion request rejected.','info'); renderPipelineTab();
   });
 }
 
