@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign + module split shipped; companies/permissions/backend-dept next)**
+**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign, module split, companies collection + picker, permission-grant scaffolding shipped; backend-dept next)**
 
 ---
 
@@ -21,8 +21,15 @@ js/state.js          — Firebase init (db/auth/auth2), SEED_EMAILS, STAGES, SP,
 js/helpers.js         — v, esc, now, fmtDate, disable, enable, toast, modal, closeModal,
                         confirmModal, stagePill, calculateTLTarget, buildMsFilter, wireMsFilter
 js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routing, change-password
-js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData
+js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData,
+                        Companies card (list/edit/backfill), permission-checklist wiring
 js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
+                        (add-lead includes the company search/fuzzy-match picker)
+js/companies.js       — normalizeCompanyName, findFuzzyMatch, fetchCompanies,
+                        findOrCreateCompany, backfillCompanies — the one shared
+                        implementation used by both the lead picker and the backfill
+js/permissions.js     — PERMISSIONS catalog, hasPermission(), searchable checklist
+                        HTML/wiring for Edit Team/Edit User modals
 js/dashboard.js       — Dashboard tab
 js/scripts.js         — Scripts tab, channels, approval workflow
 js/products.js        — Products tab, seed catalog, discounts, waivers
@@ -59,7 +66,9 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   autoTarget,                      // TL only — sum of assigned agents' targets
   targetSource: 'auto' | 'override' | 'manager',
   active: true | false,            // false = deactivated (soft-removed), still exists but locked out
-  permissions: string[]            // PLANNED — individual permission grants, e.g. ['editCompanies']
+  permissions: string[]            // individual permission grants, e.g. ['edit_companies'] — see
+                                    // Permission System section. Schema + grant UI shipped; not
+                                    // yet consumed by any Firestore rule or non-manager UI.
 }
 ```
 
@@ -69,7 +78,7 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   name,
   teamLeadId: null,                // legacy field, kept for compatibility
   createdBy, createdAt,
-  permissions: string[]            // PLANNED — team-wide permission grants
+  permissions: string[]            // team-wide permission grants — same caveat as users.permissions
 }
 ```
 
@@ -77,7 +86,9 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
 ```
 {
   company, contact, phone, email, industry, city,
-  companyId,                       // PLANNED — link to companies collection (Phase 5)
+  companyId,                       // link to companies collection — required on new leads via the
+                                    // Add Lead picker (js/leads.js showAddLeadModal); existing leads
+                                    // backfilled via the Org tab's "Backfill Companies" button
   stage,                           // Pipeline stage
   assignedTo, assignedBy,
   teamId,                          // team of the assigned agent (empty string if unassigned)
@@ -148,8 +159,33 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
 | Ultimate | 200 / 400 / 600 / 800 Mbps / 1 Gbps |
 | Mobile | BMP 100 Nat, BMP 200 Nat, BMP 100 Nat+Intl, BMP 200 Nat+Intl, BMP 325, BMP 600, BMP 900 |
 
-### `companies` — PLANNED, not yet built
-See `PHASE5_SPEC_AND_HANDOFF.md` for full schema, migration plan, and Firestore rules proposal. Blocking prerequisite for the backend-department/submissions/reports/document-expiry work.
+### `companies`
+```
+{
+  name,                            // display name
+  normalizedName,                  // lowercase, diacritics/punctuation stripped, whitespace
+                                    // collapsed — the dedup key (see normalizeCompanyName())
+  industry, city,
+  hasDuAccount: boolean,           // drives whether a future submission skips Account Creation
+  createdBy, createdAt,
+  mergedInto: null | companyId,    // soft-merge marker — not yet used, merge UI not built (v1
+                                    // cut per PHASE5_SPEC_AND_HANDOFF.md section 3/4)
+  lastEditedBy, lastEditedAt
+}
+```
+- Dedup key is `normalizedName` equality (exact), not the fuzzy check — fuzzy match
+  (Levenshtein, `js/companies.js`) is only a "did you mean X?" nudge on entry, shown inline
+  in the Add Lead modal, not a hard block.
+- One-time backfill (`backfillCompanies()`, triggered by the manager-only "🏢 Backfill
+  Companies" button in the Org tab when any lead has `company` set but no `companyId`) groups
+  existing leads by `normalizedName`, creates one company doc per unique group, writes
+  `companyId` back onto each lead. Safe to re-run — skips names that already resolve to an
+  existing company.
+- Manager-only "Companies" card in the Org tab lists all companies (name, industry, city,
+  du Account, linked lead count) with an Edit action (industry/city/hasDuAccount). No merge
+  tool yet — deliberately deferred, per spec, until duplicate volume is visible in practice.
+- Blocking prerequisite for the backend-department/submissions/reports/document-expiry work —
+  see `PHASE5_SPEC_AND_HANDOFF.md`.
 
 ---
 
@@ -196,6 +232,8 @@ Live `STAGES` constant: `New, Contacted, Interested, Proposal Sent, Closed, Lost
 | Delete Team Lead (hard) | Permanently deletes the TL's Firestore profile. Their remaining agents drop to "Unassigned Agents (no TL)" within the same team (kept, not removed from team) — their `tlId` is cleared. Any lead with `tlId` pointing at the deleted TL also gets `tlId` cleared. |
 | Delete Agent (hard) | Permanently deletes the agent's Firestore profile. Their former TL's `autoTarget` recalculates. Their leads become unassigned, same as the soft-remove flow. |
 | Delete Team | Existing — members become unassigned, leads untouched. |
+| Backfill Companies | Manager-only button, shown whenever any lead has `company` set but no `companyId`. Groups those leads by `normalizedName`, creates one `companies` doc per unique group, writes `companyId` back onto each lead. Safe to re-run. |
+| Edit Company | Manager-only, from the Companies card. Edits `industry`/`city`/`hasDuAccount`. No merge tool yet. |
 
 **Hard-delete caveat:** this deletes the Firestore profile only, not the underlying Firebase Auth login (client SDK cannot delete other users' Auth accounts — needs Admin SDK/Cloud Functions, not part of this stack). In practice this is a full lockout: `ensureProfile()` returns null for a missing profile and the app immediately signs the user back out with "Account not set up. Contact your manager." **Exception:** the 4 seed demo accounts (`manager@`, `teamlead1@`, `agent1@`, `agent2@shauntech.app`) auto-recreate their profile on next login via `SEED_EMAILS` fallback — this only affects those 4 literal addresses, not real accounts created via "+ New Agent"/"+ New Team Lead".
 
@@ -226,6 +264,35 @@ All product writes are Manager-only, enforced server-side.
 
 ---
 
+## Permission-Grant System (scaffolding, shipped — not yet wired to a capability)
+
+General mechanism so future non-manager capabilities can be granted without hardcoding role/team
+checks: a manager grants a permission to a whole **team** (Edit Team modal) or to an individual
+**team_lead/agent** (Edit User modal), stored as `permissions: string[]` on that doc. Both modals
+render a searchable checklist (`js/permissions.js`: `permissionChecklistHtml`,
+`wirePermissionSearch`, `getSelectedPermissions`) sourced from one catalog, `PERMISSIONS`.
+
+```js
+export function hasPermission(perm, profile, team){
+  if(profile.role === 'manager') return true;
+  if((profile.permissions||[]).includes(perm)) return true;
+  if(team && (team.permissions||[]).includes(perm)) return true;
+  return false;
+}
+```
+User-level grant wins; falls back to the user's team-level grant. Manager always passes.
+
+**Currently defined permissions:** `edit_companies` — only one so far. Checking it in the UI
+**does not unlock anything yet**: the `companies` Firestore rule is still manager-only-write, and
+the Companies card/Edit-Company UI only renders on the manager-only Org tab. To actually activate
+a permission, both of these need to change together:
+1. Extend the relevant Firestore rule to also allow `hasPermission(...)`, not just `role()=='manager'`.
+2. Expose the corresponding UI somewhere a non-manager can reach it.
+Add new capabilities by extending the `PERMISSIONS` array in `js/permissions.js` — nothing else
+in that file needs to change.
+
+---
+
 ## Dashboard Tab (all roles)
 
 - KPI cards (Total/Open/Closed/Lost/Win Rate/Closed Value), Agent Performance table (manager/TL, positioned right after KPIs), This Month's Target progress bar, 6-month Monthly Performance History table, Follow-ups (overdue/today/this-week), Recent Activity feed.
@@ -252,6 +319,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 |---|---|---|
 | `users` | Any auth | Self or manager (create/update); manager-only (delete) |
 | `teams` | Any auth | Manager only |
+| `companies` | Any auth | Create: any auth, must set `createdBy == request.auth.uid` (same pattern as `leads`/`scripts`); update/delete: manager only |
 | `leads` | Any auth | Manager unrestricted; TL within own `teamId` for general edits, blocked from `ownerLocked`/`createdBy`/`createdByRole`/`teamId`; **`tlId` reassignment additionally gated** — a TL may only change `tlId` if the lead is currently unowned or already theirs, and the result must land back in their own sub-group; Agent own assigned leads, blocked from admin fields; delete guards on `ownerLocked` |
 | `channels` | Any auth | Create: any auth (seed guard); update/delete: manager only |
 | `scripts` | Any auth | Manager unrestricted; TL own scripts direct, manager scripts suggest-only via `pendingApproval` (`affectedKeys().hasOnly(['pendingApproval'])`) |
@@ -260,7 +328,8 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 **Key implementation notes:**
 - `role()` helper does a `get()` on `users/{auth.uid}` — cached within a single rule evaluation, so calling it multiple times across helper functions doesn't multiply read cost.
 - `deleteRequest` field is intentionally **not** in the TL update rule's blocked-fields list — a TL writing a delete request, or a manager clearing one, needs no rule changes beyond what already exists.
-- `companyId` (planned) will similarly need no new `leads` rule — it's not an admin-locked field.
+- `companyId` needed no new `leads` rule — it's not an admin-locked field.
+- The `companies` rule was handed to Ashok as a full-file paste-in for the Firebase Console (rules aren't version-controlled in this repo — Console is the source of truth) — confirm it's been published before relying on non-manager company creation working in production.
 
 ---
 
@@ -313,7 +382,10 @@ Role-scoped lead queries, "Mine" badge, assignment enforcement, `teamId`/`histor
 - **TL delete-approval workflow** — request/withdraw/approve/reject for manager-locked leads
 - **Permanent delete** — Team Lead and Agent hard-delete with correct cascades, added alongside existing soft-remove
 - **Bulk-assign leads** — multi-select checkboxes + single-action reassignment in the Pipeline tab, sub-group-scoped for TL
-- **Next up:** `companies` collection + migration (see `PHASE5_SPEC_AND_HANDOFF.md`), reusable team/user permission-grant system (starting with `editCompanies`), splitting `index.html` into ES modules, then backend-department/submissions workflow (gated on companies being confirmed solid in production) and reports (pending a business definition of "projection")
+- **ES module split** — `index.html`'s single inline script became 9 `js/*.js` modules (see File Structure above); no behavior change, verified via a full local live-Firestore pass before pushing
+- **Companies collection** — `js/companies.js` (normalize/dedup/fuzzy-match/find-or-create/backfill), manager-only Companies card + Backfill button in the Org tab, and a searchable company picker (with inline "did you mean X?" fuzzy nudge) in the Add Lead modal. Verified live: backfill turned 115 seeded leads into 113 unique company docs with zero console errors.
+- **Permission-grant scaffolding** — `js/permissions.js` catalog + `hasPermission()` + searchable checklist UI in Edit Team/Edit User. `edit_companies` defined but not yet wired to a rule or non-manager UI (see Permission-Grant System section above) — deliberately shipped as reusable infrastructure ahead of its first real consumer.
+- **Next up:** backend-department/submissions workflow (`teams.department`, `users.department`, `submissions` collection — gated on the companies phase being confirmed solid in production, per Ashok's explicit hold) and reports (pending a business definition of "projection")
 
 ---
 

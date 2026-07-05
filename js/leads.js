@@ -4,6 +4,7 @@ import {
   collection, query, where, getDocs, writeBatch
 } from './state.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
+import { fetchCompanies, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -15,6 +16,11 @@ export async function renderPipelineTab(){
   // Load users
   const uSnap  = await getDocs(collection(db,'users'));
   const byId   = {}; uSnap.docs.forEach(d=>byId[d.id]={id:d.id,...d.data()});
+
+  // Load companies once for the Add Lead picker — fetched here (not inside
+  // the modal) so opening Add Lead is instant, matching the existing
+  // agents/byId pattern already used for this tab.
+  const companies = await fetchCompanies();
 
   // Load leads scoped by role
   let leads = [];
@@ -207,7 +213,7 @@ export async function renderPipelineTab(){
     selected.clear();
     renderList();
   }));
-  document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId));
+  document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId, companies));
   const clearSelAndRender = () => { selected.clear(); renderList(); };
   wireMsFilter('ms-tm', teamFs,  clearSelAndRender);
   wireMsFilter('ms-tl', tlFs,    clearSelAndRender);
@@ -371,12 +377,28 @@ export function showLeadModal(lead, byId, agents){
 }
 
 // ─── ADD LEAD MODAL ───
-function showAddLeadModal(agents, byId){
+function showAddLeadModal(agents, byId, companies){
   const role = CP.role;
+  let selectedCompanyId = '';
+  let fuzzyAcknowledged = false;
+
   modal('Add New Lead', `
     <div class="row2">
-      <div class="field"><label>Company Name *</label><input type="text" id="nl-co" placeholder="Company Ltd"></div>
+      <div class="field">
+        <label>Company Name *</label>
+        <div class="ms-wrap" style="width:100%">
+          <input type="text" id="nl-co" placeholder="Start typing to search or add new…" autocomplete="off" style="width:100%">
+          <div class="ms-dd" id="nl-co-dd" style="width:100%"></div>
+        </div>
+      </div>
       <div class="field"><label>Contact Name</label><input type="text" id="nl-ct" placeholder="John Doe"></div>
+    </div>
+    <div id="nl-co-fuzzy" style="display:none" class="locked-note mb-12">
+      ⚠ Did you mean <strong id="nl-co-fuzzy-name"></strong>?
+      <div class="flex gap-8 mt-8">
+        <button type="button" class="btn btn-ghost btn-xs" id="nl-co-use-existing">Use this company</button>
+        <button type="button" class="btn btn-ghost btn-xs" id="nl-co-create-new">No, create new</button>
+      </div>
     </div>
     <div class="row2">
       <div class="field"><label>Phone</label><input type="text" id="nl-ph" placeholder="+971 50 000 0000"></div>
@@ -401,14 +423,68 @@ function showAddLeadModal(agents, byId){
     <p id="nl-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="nl-btn">Add Lead</button>`);
 
+  // Company search dropdown — same visual/behavior pattern as the existing
+  // multi-select filters (.ms-wrap/.ms-dd), so the global click-outside-closes
+  // handler in helpers.js already applies with no extra wiring.
+  const coInput = document.getElementById('nl-co');
+  const coDd    = document.getElementById('nl-co-dd');
+  const fuzzyBox = document.getElementById('nl-co-fuzzy');
+  coInput.addEventListener('input', () => {
+    selectedCompanyId = ''; fuzzyAcknowledged = false;
+    fuzzyBox.style.display = 'none';
+    const q = coInput.value.trim().toLowerCase();
+    if(!q){ coDd.classList.remove('open'); coDd.innerHTML=''; return; }
+    const matches = companies.filter(c => c.name.toLowerCase().includes(q)).slice(0,8);
+    if(!matches.length){ coDd.classList.remove('open'); coDd.innerHTML=''; return; }
+    coDd.innerHTML = matches.map(c=>`<div class="ms-item" data-cid="${c.id}">${esc(c.name)}${c.industry?` <span class="text-dim text-xs">· ${esc(c.industry)}</span>`:''}</div>`).join('');
+    coDd.classList.add('open');
+  });
+  coDd.addEventListener('click', e => {
+    const item = e.target.closest('[data-cid]'); if(!item) return;
+    const c = companies.find(x=>x.id===item.dataset.cid); if(!c) return;
+    coInput.value = c.name; selectedCompanyId = c.id;
+    coDd.classList.remove('open'); coDd.innerHTML='';
+    fuzzyBox.style.display = 'none';
+  });
+
   document.getElementById('nl-btn').onclick = async () => {
     const co = v('nl-co');
     const err = document.getElementById('nl-err');
     if(!co){ err.textContent='Company name is required.'; return; }
     const assignTo = role==='agent' ? CU.uid : (v('nl-ag')||'');
     if(role==='team_lead' && !assignTo){ err.textContent='No agents in your sub-group yet. Ask your manager to assign agents first.'; return; }
+
+    // Resolve companyId: explicit picker selection wins; otherwise check for an
+    // exact normalizedName match (typed the existing name without clicking it);
+    // otherwise nudge with a fuzzy "did you mean" before creating genuinely new.
+    let companyId = selectedCompanyId;
+    if(!companyId){
+      const norm = normalizeCompanyName(co);
+      const exact = companies.find(c => c.normalizedName === norm);
+      if(exact){ companyId = exact.id; }
+      else if(!fuzzyAcknowledged){
+        const fuzzy = findFuzzyMatch(co, companies);
+        if(fuzzy){
+          document.getElementById('nl-co-fuzzy-name').textContent = fuzzy.name;
+          fuzzyBox.style.display = '';
+          document.getElementById('nl-co-use-existing').onclick = () => {
+            coInput.value = fuzzy.name; selectedCompanyId = fuzzy.id;
+            fuzzyBox.style.display = 'none';
+          };
+          document.getElementById('nl-co-create-new').onclick = () => {
+            fuzzyAcknowledged = true;
+            fuzzyBox.style.display = 'none';
+          };
+          return;
+        }
+      }
+    }
+
     disable('nl-btn','Adding…');
     try {
+      if(!companyId){
+        companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy')}, companies);
+      }
       // Resolve teamId from assignee's user doc (skip for manager self-assign)
       let leadTeamId = '', leadTlId = '';
       if(assignTo && assignTo !== CU.uid){
@@ -416,7 +492,7 @@ function showAddLeadModal(agents, byId){
         if(aSnap.exists()){ leadTeamId = aSnap.data().teamId||''; leadTlId = aSnap.data().tlId||''; }
       }
       await addDoc(collection(db,'leads'),{
-        company:co, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
+        company:co, companyId, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
         industry:v('nl-ind'), city:v('nl-cy'), stage:v('nl-st')||'New',
         assignedTo:assignTo, assignedBy:CU.uid,
         teamId:leadTeamId, tlId:leadTlId,

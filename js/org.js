@@ -5,6 +5,8 @@ import {
   createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from './state.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
+import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
+import { fetchCompanies, backfillCompanies } from './companies.js';
 
 // ════════════════════════════════════════════════════
 // SEED LEAD DATA  (115 leads split 58 agent1 / 57 agent2)
@@ -19,10 +21,11 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 // ════════════════════════════════════════════════════
 export async function renderOrgTab(){
   const ct = document.getElementById('content');
-  const [tSnap, uSnap, lSnap] = await Promise.all([
+  const [tSnap, uSnap, lSnap, companies] = await Promise.all([
     getDocs(collection(db,'teams')),
     getDocs(collection(db,'users')),
-    getDocs(collection(db,'leads'))
+    getDocs(collection(db,'leads')),
+    fetchCompanies()
   ]);
   const teams = tSnap.docs.map(d=>({id:d.id,...d.data()}));
   const users = uSnap.docs.map(d=>({id:d.id,...d.data()}));
@@ -36,6 +39,13 @@ export async function renderOrgTab(){
   // TL Firestore security rule (resource.data.teamId must match), locking TLs
   // out of editing/deleting them. Most commonly the original seeded leads.
   const needsRepair = allLeads.filter(l => l.assignedTo && byId[l.assignedTo] && !l.teamId);
+  // Leads that predate the companies collection (have a company string but no
+  // companyId link) — same backfill gap as needsRepair above, just for the
+  // company entity instead of team data.
+  const needsCompanyBackfill = allLeads.filter(l => l.company && !l.companyId);
+  const companyById = {}; companies.forEach(c=>companyById[c.id]=c);
+  const companyLeadCount = {};
+  allLeads.forEach(l => { if(l.companyId) companyLeadCount[l.companyId] = (companyLeadCount[l.companyId]||0)+1; });
 
   function perfStats(uids){
     const l = allLeads.filter(x=>uids.includes(x.assignedTo));
@@ -75,6 +85,11 @@ export async function renderOrgTab(){
     ${needsRepair.length ? `<div class="seed-banner">
       <p><strong>${needsRepair.length} lead${needsRepair.length!==1?'s':''}</strong> ${needsRepair.length!==1?'are':'is'} missing team data and currently invisible/uneditable to Team Leads (Firestore permission rule blocks them). This backfills teamId/tlId from each lead's assigned agent — safe, non-destructive.</p>
       <button class="btn btn-primary btn-sm" id="btn-repair">🔧 Repair Lead Data (${needsRepair.length})</button>
+    </div>` : ''}
+
+    ${needsCompanyBackfill.length ? `<div class="seed-banner">
+      <p><strong>${needsCompanyBackfill.length} lead${needsCompanyBackfill.length!==1?'s':''}</strong> ${needsCompanyBackfill.length!==1?'predate':'predates'} the Companies collection and ${needsCompanyBackfill.length!==1?'have':'has'} no linked company record. This groups them by matching company name, creates one company per unique name, and links each lead — safe to re-run.</p>
+      <button class="btn btn-primary btn-sm" id="btn-backfill-companies">🏢 Backfill Companies (${needsCompanyBackfill.length})</button>
     </div>` : ''}
 
     <div class="stats-row">
@@ -191,6 +206,27 @@ export async function renderOrgTab(){
     }
     </div>
 
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">🏢 Companies <span class="text-dim text-sm">(${companies.length})</span></div>
+      </div>
+      ${companies.length===0
+        ? `<div class="empty"><div class="empty-icon">🏢</div><div class="empty-title">No companies yet</div><div class="empty-sub">Companies are created automatically as leads are added, or via the backfill above.</div></div>`
+        : `<div class="tbl-wrap"><table>
+            <thead><tr><th>Name</th><th>Industry</th><th>City</th><th>du Account</th><th>Leads</th><th></th></tr></thead>
+            <tbody>
+              ${companies.filter(c=>!c.mergedInto).map(c => `<tr>
+                <td><strong>${esc(c.name)}</strong></td>
+                <td class="td-dim">${esc(c.industry||'—')}</td>
+                <td class="td-dim">${esc(c.city||'—')}</td>
+                <td>${c.hasDuAccount ? '<span class="text-ok">Yes</span>' : '<span class="text-dim">No</span>'}</td>
+                <td class="td-dim">${companyLeadCount[c.id]||0}</td>
+                <td><button class="btn btn-ghost btn-xs" data-edit-company="${c.id}">Edit</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table></div>`}
+    </div>
+
     ${(()=>{
       const unassigned = [...tls,...ags].filter(u=>!u.teamId);
       if(!unassigned.length) return '';
@@ -220,6 +256,8 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-add-ag')?.addEventListener('click',   () => showAddUserModal('agent', teams, users));
   ct.querySelector('#btn-seed')?.addEventListener('click',     () => seedLeads());
   ct.querySelector('#btn-repair')?.addEventListener('click',   () => repairLeadTeamData(needsRepair, byId));
+  ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
+  ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
   ct.querySelectorAll('[data-del-team]').forEach(b  => b.addEventListener('click', () => {
@@ -332,7 +370,7 @@ function showAddTeamModal(teams, tls){
     if(!name){ err.textContent='Team name is required.'; return; }
     disable('at-btn','Creating…');
     try {
-      await addDoc(collection(db,'teams'),{name, teamLeadId:null, createdBy:CU.uid, createdAt:now()});
+      await addDoc(collection(db,'teams'),{name, teamLeadId:null, permissions:[], createdBy:CU.uid, createdAt:now()});
       closeModal(); toast('Team created.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('at-btn','Create Team'); }
   };
@@ -344,15 +382,18 @@ function showEditTeamModal(teamId, teams, tls, ags){
   modal(`Edit Team: ${esc(t.name)}`, `
     <div class="field"><label>Team Name</label><input type="text" id="et-name" value="${esc(t.name)}"></div>
     <p class="text-dim text-xs" style="margin-bottom:14px">To reassign Team Leads, edit the TL's profile and change their Team field.</p>
+    ${permissionChecklistHtml('et-perm', t.permissions||[])}
+    <p class="text-dim text-xs" style="margin-bottom:14px">Granted here apply to every member of this team. Individual members can also be granted permissions directly on their own profile.</p>
     <p id="et-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="et-btn">Save Changes</button>`);
+  wirePermissionSearch('et-perm');
   document.getElementById('et-btn').onclick = async () => {
     const name = v('et-name');
     const err  = document.getElementById('et-err');
     if(!name){ err.textContent='Name required.'; return; }
     disable('et-btn','Saving…');
     try {
-      await updateDoc(doc(db,'teams',teamId),{name});
+      await updateDoc(doc(db,'teams',teamId),{name, permissions:getSelectedPermissions('et-perm')});
       closeModal(); toast('Team updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('et-btn','Save Changes'); }
   };
@@ -414,7 +455,7 @@ function showAddUserModal(role, teams, users=[]){
 
       const bat = writeBatch(db);
       bat.set(doc(db,'users',uid),{
-        name, email, role, teamId: teamId||null,
+        name, email, role, teamId: teamId||null, permissions:[],
         monthlyTarget: isTL ? 0 : (Number(target)||0),
         ...(isTL
           ? { autoTarget: 0, targetSource: 'auto' }
@@ -479,12 +520,16 @@ function showEditUserModal(userId, users, teams){
       <label>Override Amount (AED)</label>
       <input type="number" id="eu-override-val" value="${u.targetSource==='override'?(u.monthlyTarget||0):freshAuto}" placeholder="e.g. 150000">
     </div>` : ''}
+    ${permissionChecklistHtml('eu-perm', u.permissions||[])}
+    <p class="text-dim text-xs" style="margin-bottom:14px">Granted here apply to this member only, in addition to anything granted to their whole team.</p>
     <p id="eu-err" class="err"></p>
     <div class="flex gap-8 mt-12">
       <button class="btn btn-primary" id="eu-save">Save Changes</button>
       <button class="btn btn-ghost btn-sm" id="eu-reset">Send Password Reset Email</button>
     </div>
     <p class="text-dim text-xs mt-8">Last edited by ${u.lastEditedBy||'—'} · ${u.lastEditedAt ? fmtDate(u.lastEditedAt) : '—'}</p>`);
+
+  wirePermissionSearch('eu-perm');
 
   // Wire override checkbox → show/hide override amount field
   if(isTL){
@@ -518,7 +563,7 @@ function showEditUserModal(userId, users, teams){
 
     disable('eu-save','Saving…');
     try {
-      const upd = {name, teamId:teamId||null, lastEditedBy:CP.name, lastEditedAt:now()};
+      const upd = {name, teamId:teamId||null, permissions:getSelectedPermissions('eu-perm'), lastEditedBy:CP.name, lastEditedAt:now()};
       if(u.active===false){
         upd.active = !!document.getElementById('eu-reactivate-chk')?.checked;
       }
@@ -653,4 +698,47 @@ async function repairLeadTeamData(leadsToFix, byId){
     toast('Error: '+e.message,'err');
     if(btn){ btn.disabled=false; btn.textContent='🔧 Repair Lead Data'; }
   }
+}
+
+// Thin UI wrapper around companies.js's backfillCompanies() — same
+// disable/toast/re-render pattern as repairLeadTeamData above.
+async function runCompanyBackfill(leadsToFix){
+  const btn = document.getElementById('btn-backfill-companies');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Backfilling…'; }
+  try {
+    const { companiesCreated, leadsUpdated } = await backfillCompanies(leadsToFix);
+    toast(`✅ Created ${companiesCreated} compan${companiesCreated!==1?'ies':'y'}, linked ${leadsUpdated} lead${leadsUpdated!==1?'s':''}.`);
+    renderOrgTab();
+  } catch(e){
+    toast('Error: '+e.message,'err');
+    if(btn){ btn.disabled=false; btn.textContent='🏢 Backfill Companies'; }
+  }
+}
+
+// ─── EDIT COMPANY ───
+function showEditCompanyModal(companyId, companies){
+  const c = companies.find(x=>x.id===companyId); if(!c) return;
+  modal(`Edit Company: ${esc(c.name)}`, `
+    <div class="row2">
+      <div class="field"><label>Industry</label><input type="text" id="ec-ind" value="${esc(c.industry||'')}" placeholder="e.g. Construction"></div>
+      <div class="field"><label>City</label><input type="text" id="ec-cy" value="${esc(c.city||'')}" placeholder="Dubai"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input type="checkbox" id="ec-du" ${c.hasDuAccount?'checked':''} style="width:auto;margin:0;cursor:pointer">
+      <label for="ec-du" style="margin:0;cursor:pointer">Has an existing du account</label>
+    </div>
+    <p id="ec-err" class="err"></p>
+    <button class="btn btn-primary btn-full mt-12" id="ec-btn">Save Changes</button>`);
+  document.getElementById('ec-btn').onclick = async () => {
+    const err = document.getElementById('ec-err');
+    disable('ec-btn','Saving…');
+    try {
+      await updateDoc(doc(db,'companies',companyId),{
+        industry: v('ec-ind'), city: v('ec-cy'),
+        hasDuAccount: document.getElementById('ec-du').checked,
+        lastEditedBy: CP.name, lastEditedAt: now()
+      });
+      closeModal(); toast('Company updated.'); renderOrgTab();
+    } catch(e){ err.textContent=e.message; enable('ec-btn','Save Changes'); }
+  };
 }
