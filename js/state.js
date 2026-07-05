@@ -11,13 +11,17 @@ import {
   getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+import {
+  getStorage, ref, uploadBytes
+} from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js';
 
 export {
   signInWithEmailAndPassword, signOut, onAuthStateChanged,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider,
   createUserWithEmailAndPassword, sendPasswordResetEmail,
   doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch
+  collection, query, where, getDocs, writeBatch,
+  ref, uploadBytes
 };
 
 const CFG = {
@@ -30,9 +34,10 @@ const CFG = {
 };
 const primaryApp = initializeApp(CFG);
 const secondaryApp = initializeApp(CFG,'Secondary');
-export const auth  = getAuth(primaryApp);
-export const auth2 = getAuth(secondaryApp);
-export const db    = getFirestore(primaryApp);
+export const auth    = getAuth(primaryApp);
+export const auth2   = getAuth(secondaryApp);
+export const db      = getFirestore(primaryApp);
+export const storage = getStorage(primaryApp);
 
 // ════════════════════════════════════════════════════
 // CONSTANTS
@@ -45,6 +50,14 @@ export const SEED_EMAILS = {
 };
 export const STAGES = ['New','Contacted','Interested','Proposal Sent','Closed','Lost'];
 export const SP = { 'New':'sp-new','Contacted':'sp-contacted','Interested':'sp-interested','Proposal Sent':'sp-proposal','Closed':'sp-won','Lost':'sp-lost' };
+
+// Backend submission pipeline (Phase 7+). Account Creation is skipped per-item
+// when companies.hasDuAccount is true at submit time — see js/submissions.js.
+export const SUBMISSION_STAGES = ['Account Creation','Financial Approval','Activity','Work Order','Activated'];
+// Required on every submission regardless of product. Per-product extras live on
+// products.requiredDocuments (empty/TBD until Ashok defines them — no schema
+// change needed when he does).
+export const MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)'];
 
 // ════════════════════════════════════════════════════
 // SHARED MUTABLE STATE
