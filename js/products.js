@@ -5,6 +5,10 @@ import {
 } from './state.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
 
+// Shared with js/org.js (backend agent specialties checklist) — keep this the
+// one source of truth for category names so the two never drift apart.
+export const PRODUCT_CATEGORIES = ['Starter','Essential','Ultimate','Mobile'];
+
 // ════════════════════════════════════════════════════
 // PRODUCTS — SEED DATA  (du Business, June 2026)
 // Sources: STARTER_BTL_V12/JULY_2025, AP-ENT-BUS-FIX-SER-MAY2019,
@@ -269,7 +273,7 @@ export async function renderProductsSection(){
   const snap = await getDocs(query(collection(db,'products'),where('active','==',true)));
   let products = snap.docs.map(d=>({id:d.id,...d.data()}));
 
-  const categories = ['Starter','Essential','Ultimate','Mobile'];
+  const categories = PRODUCT_CATEGORIES;
   let catFilter = '';
 
   function filtered(){ return catFilter ? products.filter(p=>p.category===catFilter) : products; }
@@ -453,7 +457,7 @@ function showEditProductModal(p, onUpdate){
     <div class="row2">
       <div class="field"><label>Category*</label>
         <select id="ep-cat">
-          ${['Starter','Essential','Ultimate','Mobile'].map(c=>`<option value="${c}"${p.category===c?' selected':''}>${c}</option>`).join('')}
+          ${PRODUCT_CATEGORIES.map(c=>`<option value="${c}"${p.category===c?' selected':''}>${c}</option>`).join('')}
         </select>
       </div>
       <div class="field"><label>Name*</label><input type="text" id="ep-name" value="${esc(p.name)}"></div>

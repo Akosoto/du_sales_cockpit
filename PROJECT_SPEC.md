@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign, module split, companies collection + picker, permission-grant scaffolding shipped; backend-dept next)**
+**Last updated:** July 2026 | **Phase 5 complete (companies collection + picker, permission-grant scaffolding). Phase 6 in progress (backend-department schema).**
 
 ---
 
@@ -66,9 +66,18 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   autoTarget,                      // TL only — sum of assigned agents' targets
   targetSource: 'auto' | 'override' | 'manager',
   active: true | false,            // false = deactivated (soft-removed), still exists but locked out
-  permissions: string[]            // individual permission grants, e.g. ['edit_companies'] — see
+  permissions: string[],           // individual permission grants, e.g. ['edit_companies'] — see
                                     // Permission System section. Schema + grant UI shipped; not
                                     // yet consumed by any Firestore rule or non-manager UI.
+  department: 'sales' | 'backend' | null,  // NEW (Phase 6) — denormalized from the user's team.department,
+                                    // null for manager and for anyone currently unassigned to a team.
+                                    // Cascaded automatically if a team's department is later changed
+                                    // (showEditTeamModal batch-updates every member's department).
+  specialties: string[],           // NEW (Phase 6) — backend agents only; product category names
+                                    // (js/products.js PRODUCT_CATEGORIES); empty/omitted = generalist,
+                                    // handles anything. Not set for sales agents or TLs.
+  available: boolean               // NEW (Phase 6) — backend agents only; manual "I'm out today"
+                                    // toggle, default true. Not set for sales agents or TLs.
 }
 ```
 
@@ -78,7 +87,12 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   name,
   teamLeadId: null,                // legacy field, kept for compatibility
   createdBy, createdAt,
-  permissions: string[]            // team-wide permission grants — same caveat as users.permissions
+  permissions: string[],           // team-wide permission grants — same caveat as users.permissions
+  department: 'sales' | 'backend', // NEW (Phase 6) — no field on a doc means 'sales' (all pre-Phase-6
+                                    // teams). Set via Add/Edit Team modal.
+  assignmentMode: 'auto' | 'manual' // NEW (Phase 6) — only meaningful when department === 'backend';
+                                    // absent/unused on sales teams. Drives future submission-item
+                                    // auto-assignment (Phase 7) — not consumed by any code yet.
 }
 ```
 
@@ -386,6 +400,21 @@ Role-scoped lead queries, "Mine" badge, assignment enforcement, `teamId`/`histor
 - **Companies collection** — `js/companies.js` (normalize/dedup/fuzzy-match/find-or-create/backfill), manager-only Companies card + Backfill button in the Org tab, and a searchable company picker (with inline "did you mean X?" fuzzy nudge) in the Add Lead modal. Verified live: backfill turned 115 seeded leads into 113 unique company docs with zero console errors.
 - **Permission-grant scaffolding** — `js/permissions.js` catalog + `hasPermission()` + searchable checklist UI in Edit Team/Edit User. `edit_companies` defined but not yet wired to a rule or non-manager UI (see Permission-Grant System section above) — deliberately shipped as reusable infrastructure ahead of its first real consumer.
 - **Next up:** backend-department/submissions workflow (`teams.department`, `users.department`, `submissions` collection — gated on the companies phase being confirmed solid in production, per Ashok's explicit hold) and reports (pending a business definition of "projection")
+
+### Phase 6 (in progress) — Backend department foundation
+- `teams.department` (Sales/Backend) + `teams.assignmentMode` (Auto/Manual, backend teams only) —
+  Add/Edit Team modal fields. Changing a team's department cascades to every member's
+  `users.department` in the same batch write, so the denormalized field can't go stale.
+- `users.department` denormalized from the assigned team (null if unassigned or manager) +
+  `specialties`/`available` fields for backend-department agents specifically (Add/Edit User
+  modals show a Specialties checklist + Available toggle only when the selected team's
+  department is `backend` and the role is `agent`).
+- **No Firestore rule changes needed for this phase** — `teams`/`users` writes were already
+  manager-unrestricted, so these are just new fields on docs the manager already controls. Rule
+  work resumes in Phase 7 with the `submissions` collection and Storage file-access rules.
+- **Next up:** Phase 7 — submission creation (multi-product line items, docType file upload,
+  mandatory-doc gating) + assignment logic (auto rotation using `specialties`/`available`, manual
+  fallback to a shared queue).
 
 ---
 

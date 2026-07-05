@@ -7,6 +7,7 @@ import {
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
+import { PRODUCT_CATEGORIES } from './products.js';
 
 // ════════════════════════════════════════════════════
 // SEED LEAD DATA  (115 leads split 58 agent1 / 57 agent2)
@@ -361,16 +362,33 @@ export async function renderOrgTab(){
 function showAddTeamModal(teams, tls){
   modal('Create New Team', `
     <div class="field"><label>Team Name</label><input type="text" id="at-name" placeholder="e.g. Dubai SME Team"></div>
+    <div class="row2">
+      <div class="field"><label>Department</label>
+        <select id="at-dept"><option value="sales">Sales</option><option value="backend">Backend</option></select>
+      </div>
+      <div class="field" id="at-mode-wrap" style="display:none">
+        <label>Assignment Mode</label>
+        <select id="at-mode"><option value="manual">Manual</option><option value="auto">Auto</option></select>
+      </div>
+    </div>
     <p class="text-dim text-xs" style="margin-bottom:14px">To assign Team Leads, edit each TL's profile and set their Team field to this team.</p>
     <p id="at-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="at-btn">Create Team</button>`);
+  document.getElementById('at-dept').onchange = function(){
+    document.getElementById('at-mode-wrap').style.display = this.value==='backend' ? '' : 'none';
+  };
   document.getElementById('at-btn').onclick = async () => {
     const name = v('at-name');
+    const dept = v('at-dept')||'sales';
     const err  = document.getElementById('at-err');
     if(!name){ err.textContent='Team name is required.'; return; }
     disable('at-btn','Creating…');
     try {
-      await addDoc(collection(db,'teams'),{name, teamLeadId:null, permissions:[], createdBy:CU.uid, createdAt:now()});
+      await addDoc(collection(db,'teams'),{
+        name, teamLeadId:null, permissions:[], department:dept,
+        ...(dept==='backend' ? {assignmentMode: v('at-mode')||'manual'} : {}),
+        createdBy:CU.uid, createdAt:now()
+      });
       closeModal(); toast('Team created.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('at-btn','Create Team'); }
   };
@@ -379,21 +397,55 @@ function showAddTeamModal(teams, tls){
 // ─── EDIT TEAM ───
 function showEditTeamModal(teamId, teams, tls, ags){
   const t = teams.find(x=>x.id===teamId); if(!t) return;
+  const dept = t.department||'sales';
   modal(`Edit Team: ${esc(t.name)}`, `
     <div class="field"><label>Team Name</label><input type="text" id="et-name" value="${esc(t.name)}"></div>
+    <div class="row2">
+      <div class="field"><label>Department</label>
+        <select id="et-dept">
+          <option value="sales" ${dept==='sales'?'selected':''}>Sales</option>
+          <option value="backend" ${dept==='backend'?'selected':''}>Backend</option>
+        </select>
+      </div>
+      <div class="field" id="et-mode-wrap" style="${dept!=='backend'?'display:none':''}">
+        <label>Assignment Mode</label>
+        <select id="et-mode">
+          <option value="manual" ${(t.assignmentMode||'manual')==='manual'?'selected':''}>Manual</option>
+          <option value="auto" ${t.assignmentMode==='auto'?'selected':''}>Auto</option>
+        </select>
+      </div>
+    </div>
     <p class="text-dim text-xs" style="margin-bottom:14px">To reassign Team Leads, edit the TL's profile and change their Team field.</p>
     ${permissionChecklistHtml('et-perm', t.permissions||[])}
     <p class="text-dim text-xs" style="margin-bottom:14px">Granted here apply to every member of this team. Individual members can also be granted permissions directly on their own profile.</p>
     <p id="et-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="et-btn">Save Changes</button>`);
   wirePermissionSearch('et-perm');
+  document.getElementById('et-dept').onchange = function(){
+    document.getElementById('et-mode-wrap').style.display = this.value==='backend' ? '' : 'none';
+  };
   document.getElementById('et-btn').onclick = async () => {
-    const name = v('et-name');
-    const err  = document.getElementById('et-err');
+    const name    = v('et-name');
+    const newDept = v('et-dept')||'sales';
+    const err     = document.getElementById('et-err');
     if(!name){ err.textContent='Name required.'; return; }
     disable('et-btn','Saving…');
     try {
-      await updateDoc(doc(db,'teams',teamId),{name, permissions:getSelectedPermissions('et-perm')});
+      const upd = {
+        name, permissions:getSelectedPermissions('et-perm'), department:newDept,
+        ...(newDept==='backend' ? {assignmentMode: v('et-mode')||'manual'} : {})
+      };
+      const bat = writeBatch(db);
+      bat.update(doc(db,'teams',teamId), upd);
+      // users.department is denormalized from their team's department (like
+      // teamId/tlId elsewhere) — cascade so members don't go stale if a team's
+      // department changes after they were assigned.
+      if(newDept !== dept){
+        [...tls, ...ags].filter(m => m.teamId===teamId).forEach(m => {
+          bat.update(doc(db,'users',m.id), {department:newDept});
+        });
+      }
+      await bat.commit();
       closeModal(); toast('Team updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('et-btn','Save Changes'); }
   };
@@ -419,17 +471,32 @@ function showAddUserModal(role, teams, users=[]){
     <div class="field" id="au-tl-wrap" style="display:none">
       <label>Assign to Team Lead <span class="text-dim">(optional)</span></label>
       <select id="au-tl"><option value="">— Unassigned —</option></select>
+    </div>
+    <div class="field" id="au-backend-wrap" style="display:none">
+      <label>Specialties <span class="text-dim">(leave empty = generalist, handles anything)</span></label>
+      <div class="flex gap-12" style="flex-wrap:wrap">
+        ${PRODUCT_CATEGORIES.map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
+          <input type="checkbox" class="au-specialty" value="${c}" style="width:auto;margin:0;cursor:pointer">${c}
+        </label>`).join('')}
+      </div>
+      <div class="flex gap-8 mt-8">
+        <input type="checkbox" id="au-available" checked style="width:auto;margin:0;cursor:pointer">
+        <label for="au-available" style="margin:0;cursor:pointer">Available for assignment</label>
+      </div>
     </div>` : ''}
     <p id="au-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="au-btn">Create ${label}</button>
     <p class="text-dim text-xs mt-8">They log in with this email + temp password and can change their password from settings.</p>`);
 
-  // Agent only: repopulate TL dropdown when team changes
+  function teamDept(tid){ return teams.find(t=>t.id===tid)?.department || 'sales'; }
+
+  // Agent only: repopulate TL dropdown + toggle backend specialization fields when team changes
   if(isAgent){
     document.getElementById('au-team').onchange = function(){
       const tid    = this.value;
       const tlSel  = document.getElementById('au-tl');
       const tlWrap = document.getElementById('au-tl-wrap');
+      document.getElementById('au-backend-wrap').style.display = tid && teamDept(tid)==='backend' ? '' : 'none';
       if(!tid){ tlWrap.style.display='none'; tlSel.innerHTML='<option value="">— Unassigned —</option>'; return; }
       const teamTLs = users.filter(u=>u.role==='team_lead'&&u.teamId===tid&&u.active!==false);
       tlSel.innerHTML = '<option value="">— Unassigned —</option>' +
@@ -450,16 +517,22 @@ function showAddUserModal(role, teams, users=[]){
       const uid  = cred.user.uid;
       await signOut(auth2);
 
-      const isTL = role === 'team_lead';
+      const isTL  = role === 'team_lead';
+      const dept  = teamId ? teamDept(teamId) : null;
+      const isBackendAgent = isAgent && dept==='backend';
       // New TL has no agents assigned yet (tlId = new uid, never existed before)
 
       const bat = writeBatch(db);
       bat.set(doc(db,'users',uid),{
-        name, email, role, teamId: teamId||null, permissions:[],
+        name, email, role, teamId: teamId||null, department: dept, permissions:[],
         monthlyTarget: isTL ? 0 : (Number(target)||0),
         ...(isTL
           ? { autoTarget: 0, targetSource: 'auto' }
           : { targetSource: 'manager', tlId: v('au-tl')||null }),
+        ...(isBackendAgent ? {
+          specialties: [...document.querySelectorAll('.au-specialty:checked')].map(c=>c.value),
+          available: document.getElementById('au-available').checked
+        } : {}),
         active:true, createdBy:CU.uid, createdByName:CP.name,
         createdAt:now(), lastEditedBy:CP.name, lastEditedAt:now()
       });
@@ -481,6 +554,8 @@ function showEditUserModal(userId, users, teams){
   // Model B: TL target is sum of agents where agent.tlId === tl.id
   const freshAuto  = isTL ? calculateTLTarget(u.id, users) : 0;
   const initTLs    = isAg ? users.filter(x=>x.role==='team_lead'&&x.teamId===u.teamId&&x.active!==false) : [];
+  function teamDept(tid){ return teams.find(t=>t.id===tid)?.department || 'sales'; }
+  const isBackendAg = isAg && !!u.teamId && teamDept(u.teamId)==='backend';
 
   modal(`Edit: ${esc(u.name)}`, `
     ${u.active===false ? `<div class="locked-note" style="margin-bottom:14px">
@@ -506,6 +581,18 @@ function showEditUserModal(userId, users, teams){
         <option value="">— Unassigned —</option>
         ${initTLs.map(tl=>`<option value="${tl.id}" ${tl.id===u.tlId?'selected':''}>${esc(tl.name)}</option>`).join('')}
       </select>
+    </div>
+    <div class="field" id="eu-backend-wrap" style="${!isBackendAg?'display:none':''}">
+      <label>Specialties <span class="text-dim">(leave empty = generalist, handles anything)</span></label>
+      <div class="flex gap-12" style="flex-wrap:wrap">
+        ${PRODUCT_CATEGORIES.map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
+          <input type="checkbox" class="eu-specialty" value="${c}" ${(u.specialties||[]).includes(c)?'checked':''} style="width:auto;margin:0;cursor:pointer">${c}
+        </label>`).join('')}
+      </div>
+      <div class="flex gap-8 mt-8">
+        <input type="checkbox" id="eu-available" ${u.available!==false?'checked':''} style="width:auto;margin:0;cursor:pointer">
+        <label for="eu-available" style="margin:0;cursor:pointer">Available for assignment</label>
+      </div>
     </div>` : ''}
     ${isTL ? `
     <div class="field">
@@ -538,12 +625,13 @@ function showEditUserModal(userId, users, teams){
     };
   }
 
-  // Agent: repopulate TL dropdown when team changes
+  // Agent: repopulate TL dropdown + toggle backend specialization fields when team changes
   if(isAg){
     document.getElementById('eu-team').onchange = function(){
       const tid    = this.value;
       const tlSel  = document.getElementById('eu-tl');
       const tlWrap = document.getElementById('eu-tl-wrap');
+      document.getElementById('eu-backend-wrap').style.display = tid && teamDept(tid)==='backend' ? '' : 'none';
       if(!tid){ tlWrap.style.display='none'; tlSel.innerHTML='<option value="">— Unassigned —</option>'; return; }
       const teamTLs = users.filter(x=>x.role==='team_lead'&&x.teamId===tid&&x.active!==false);
       tlSel.innerHTML = '<option value="">— Unassigned —</option>' +
@@ -563,7 +651,8 @@ function showEditUserModal(userId, users, teams){
 
     disable('eu-save','Saving…');
     try {
-      const upd = {name, teamId:teamId||null, permissions:getSelectedPermissions('eu-perm'), lastEditedBy:CP.name, lastEditedAt:now()};
+      const newDept = teamId ? teamDept(teamId) : null;
+      const upd = {name, teamId:teamId||null, department:newDept, permissions:getSelectedPermissions('eu-perm'), lastEditedBy:CP.name, lastEditedAt:now()};
       if(u.active===false){
         upd.active = !!document.getElementById('eu-reactivate-chk')?.checked;
       }
@@ -573,6 +662,10 @@ function showEditUserModal(userId, users, teams){
         upd.monthlyTarget  = Number(v('eu-target'))||0;
         upd.targetSource   = 'manager';
         upd.tlId           = newTlId;
+        if(newDept==='backend'){
+          upd.specialties = [...document.querySelectorAll('.eu-specialty:checked')].map(c=>c.value);
+          upd.available   = document.getElementById('eu-available').checked;
+        }
       }
 
       if(isTL){
