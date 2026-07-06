@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── HELPERS ──────────────────────────────────────
+    function isAuth() { return request.auth != null; }
+    function role() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+
+    // ── USERS ────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if isAuth();
+      allow create: if isAuth() && (request.auth.uid == uid || role() == 'manager');
+      allow update: if isAuth() && (request.auth.uid == uid || role() == 'manager');
+      allow delete: if isAuth() && role() == 'manager';
+    }
+
+    // ── TEAMS ────────────────────────────────────────
+    match /teams/{t} {
+      allow read: if isAuth();
+      allow write: if isAuth() && role() == 'manager';
+      // Narrow exception: any authenticated user may update ONLY the
+      // assignmentCursor field — needed because createSubmission() advances
+      // the backend team's rotation cursor as part of the submitting agent's
+      // own batch write, and that agent is not necessarily a manager.
+      allow update: if isAuth() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['assignmentCursor']);
+    }
+
+    // ── COMPANIES ────────────────────────────────────
+    // Shared entity referenced by leads.companyId (see js/companies.js).
+    // Read is open to all roles — every role's lead picker / backfill needs
+    // to look companies up. Create follows the same createdBy-ownership
+    // pattern as scripts/leads, so any authenticated user (agents included)
+    // can add a new company via findOrCreateCompany() during lead entry.
+    // Update/delete is manager-only for now — this will be relaxed via the
+    // hasPermission() grant system once that lands (separate, not-yet-built
+    // phase).
+    match /companies/{c} {
+      allow read: if isAuth();
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if isAuth() && role() == 'manager';
+    }
+
+    // ── LEADS ────────────────────────────────────────
+    match /leads/{l} {
+      allow read: if isAuth();
+
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid;
+
+      // Manager: unrestricted
+      allow update, delete: if isAuth() && role() == 'manager';
+
+      // Agent: update leads assigned to them, cannot touch ownership/admin fields
+      allow update: if isAuth() && role() == 'agent'
+        && resource.data.assignedTo == request.auth.uid
+        && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['assignedTo','assignedBy','ownerLocked','createdBy','createdByRole','teamId']);
+
+      // Agent: delete only leads they personally created, and only if not manager-locked
+      allow delete: if isAuth() && role() == 'agent'
+        && resource.data.createdBy == request.auth.uid
+        && resource.data.ownerLocked != true;
+
+      // Team lead: update leads within their team, cannot touch admin fields.
+      // Uses teamId match for general visibility/edits (team-wide, per spec).
+      // Sub-group (tlId) enforcement: if a write changes tlId (i.e. reassigns
+      // the lead), the lead must currently be unowned or already theirs, and
+      // must land back in their own sub-group. This closes the gap where one
+      // TL could reassign a lead into or out of another TL's sub-group.
+      allow update: if isAuth() && role() == 'team_lead'
+        && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId
+        && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['ownerLocked','createdBy','createdByRole','teamId'])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['tlId'])
+          || (
+            (resource.data.tlId == request.auth.uid || resource.data.tlId == null || resource.data.tlId == '')
+            && request.resource.data.tlId == request.auth.uid
+          )
+        );
+
+      // Team lead: delete non-locked leads within their team (team-wide, per spec —
+      // unchanged; delete was never reported as needing sub-group restriction)
+      allow delete: if isAuth() && role() == 'team_lead'
+        && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId
+        && resource.data.ownerLocked != true;
+    }
+
+    // ── CHANNELS ─────────────────────────────────────
+    match /channels/{c} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update, delete: if isAuth() && role() == 'manager';
+    }
+
+    // ── SCRIPTS ──────────────────────────────────────
+    match /scripts/{s} {
+      allow read: if isAuth();
+
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid && (
+        role() == 'manager' ||
+        (role() == 'team_lead' && request.resource.data.scope == 'team')
+      );
+
+      allow update, delete: if isAuth() && role() == 'manager';
+
+      allow update, delete: if isAuth() && role() == 'team_lead'
+        && resource.data.createdBy == request.auth.uid;
+
+      allow update: if isAuth() && role() == 'team_lead'
+        && resource.data.createdBy != request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingApproval'])
+        && request.resource.data.pendingApproval != null
+        && request.resource.data.pendingApproval.submittedBy == request.auth.uid;
+
+      allow update: if isAuth() && role() == 'team_lead'
+        && resource.data.pendingApproval != null
+        && resource.data.pendingApproval.submittedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingApproval'])
+        && request.resource.data.pendingApproval == null;
+    }
+
+    // ── PRODUCTS ─────────────────────────────────────
+    match /products/{p} {
+      allow read: if isAuth();
+      allow write: if isAuth() && role() == 'manager';
+    }
+
+    // ── SUBMISSIONS ──────────────────────────────────
+    // Agent → backend handoff (Phase 7). See js/submissions.js and
+    // PHASE5_SPEC_AND_HANDOFF.md section 1 for the full schema.
+    match /submissions/{s} {
+      allow read: if isAuth() && (
+        role() == 'manager' ||
+        resource.data.agentId == request.auth.uid ||
+        resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.department == 'backend'
+      );
+
+      allow create: if isAuth()
+        && request.resource.data.agentId == request.auth.uid
+        && request.resource.data.submittedBy == request.auth.uid;
+
+      // Broad for now — manager or anyone in the backend department. Will be
+      // narrowed once Phase 8's actual stage-advancement update shape is known.
+      allow update: if isAuth() && (
+        role() == 'manager' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.department == 'backend'
+      );
+    }
+  }
+}
