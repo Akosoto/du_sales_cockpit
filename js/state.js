@@ -11,6 +11,7 @@ import {
   getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+import { firebaseConfig } from '../config.js';
 
 export {
   signInWithEmailAndPassword, signOut, onAuthStateChanged,
@@ -20,16 +21,10 @@ export {
   collection, query, where, getDocs, writeBatch
 };
 
-const CFG = {
-  apiKey:"AIzaSyAdVywB6D3M1HJBwWPQc9HwC1JwfXx1rk0",
-  authDomain:"du-sales-cockpit.firebaseapp.com",
-  projectId:"du-sales-cockpit",
-  storageBucket:"du-sales-cockpit.firebasestorage.app",
-  messagingSenderId:"591817381089",
-  appId:"1:591817381089:web:eca074dd9bd886565dd3a0"
-};
-const primaryApp = initializeApp(CFG);
-const secondaryApp = initializeApp(CFG,'Secondary');
+// firebaseConfig now lives in the gitignored, per-deployment config.js
+// (ARCHITECTURE.md Section 2) — see config.example.js for the template.
+const primaryApp = initializeApp(firebaseConfig);
+const secondaryApp = initializeApp(firebaseConfig,'Secondary');
 export const auth  = getAuth(primaryApp);
 export const auth2 = getAuth(secondaryApp);
 export const db    = getFirestore(primaryApp);

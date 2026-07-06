@@ -1,1 +1,5 @@
 .claude/
+
+# Per-deployment config (ARCHITECTURE.md Section 2) — real Firebase keys and
+# org-specific values. See config.example.js for the committed template.
+config.js
