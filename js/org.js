@@ -8,13 +8,12 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
 
-// ════════════════════════════════════════════════════
-// SEED LEAD DATA  (115 leads split 58 agent1 / 57 agent2)
-// [contact, company, email, phone, stage, industry, city]
-// ════════════════════════════════════════════════════
-// [seed lead data removed by git-filter-repo -- contained real prospect
-//  names, business emails, and personal phone numbers. See
-//  ARCHITECTURE.md audit item 8.]
+// NOTE: this file used to carry 115 hardcoded prospect leads (real names,
+// business emails, phone numbers) plus a one-time seedLeads() import
+// button, for demo seeding. Both deleted — PII does not belong in source
+// (ARCHITECTURE.md audit item 8). Data already lives in Firestore; a
+// productized app seeds via CSV import (Data Import Tool), not hardcoded
+// arrays. Purged from git history too.
 
 // ════════════════════════════════════════════════════
 // ORG TAB — MANAGER ONLY
@@ -33,7 +32,6 @@ export async function renderOrgTab(){
   const ags   = users.filter(u=>u.role==='agent');
   const byId  = {}; users.forEach(u=>byId[u.id]=u);
   const teamById = {}; teams.forEach(t=>teamById[t.id]=t);
-  const leadsSeeded = lSnap.size > 0;
   const allLeads = lSnap.docs.map(d=>({id:d.id,...d.data()}));
   // Leads assigned to a real agent but missing teamId — these silently fail the
   // TL Firestore security rule (resource.data.teamId must match), locking TLs
@@ -76,11 +74,6 @@ export async function renderOrgTab(){
         <button class="btn btn-primary btn-sm" id="btn-add-ag">+ New Agent</button>
       </div>
     </div>
-
-    ${!leadsSeeded ? `<div class="seed-banner">
-      <p>Lead data not yet imported. <strong>115 owner leads</strong> are ready to load — Agent 1 gets 58, Agent 2 gets 57.</p>
-      <button class="btn btn-primary btn-sm" id="btn-seed">📥 Import Leads</button>
-    </div>` : ''}
 
     ${needsRepair.length ? `<div class="seed-banner">
       <p><strong>${needsRepair.length} lead${needsRepair.length!==1?'s':''}</strong> ${needsRepair.length!==1?'are':'is'} missing team data and currently invisible/uneditable to Team Leads (Firestore permission rule blocks them). This backfills teamId/tlId from each lead's assigned agent — safe, non-destructive.</p>
@@ -254,7 +247,6 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-add-team')?.addEventListener('click', () => showAddTeamModal(teams, tls));
   ct.querySelector('#btn-add-tl')?.addEventListener('click',   () => showAddUserModal('team_lead', teams, users));
   ct.querySelector('#btn-add-ag')?.addEventListener('click',   () => showAddUserModal('agent', teams, users));
-  ct.querySelector('#btn-seed')?.addEventListener('click',     () => seedLeads());
   ct.querySelector('#btn-repair')?.addEventListener('click',   () => repairLeadTeamData(needsRepair, byId));
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies)));
@@ -619,57 +611,6 @@ function showEditUserModal(userId, users, teams){
       document.getElementById('eu-err').textContent = `Reset email sent to ${u.email}. Only works if that email inbox is accessible.`;
     } catch(e){ document.getElementById('eu-err').textContent = e.message; }
   };
-}
-
-// ════════════════════════════════════════════════════
-// SEED LEADS
-// ════════════════════════════════════════════════════
-async function seedLeads(){
-  const btn = document.getElementById('btn-seed');
-  if(btn){ btn.disabled = true; btn.textContent = '⏳ Importing…'; }
-  try {
-    // Find agents by email
-    const uSnap = await getDocs(collection(db,'users'));
-    const users  = uSnap.docs.map(d=>({id:d.id,...d.data()}));
-    const ag1    = users.find(u=>u.email==='agent1@shauntech.app');
-    const ag2    = users.find(u=>u.email==='agent2@shauntech.app');
-
-    if(!ag1||!ag2){
-      toast('Agent 1 and/or Agent 2 have not logged in yet. Both must sign in at least once before seeding.','err');
-      if(btn){ btn.disabled=false; btn.textContent='📥 Import Leads'; } return;
-    }
-
-    const existing = await getDocs(collection(db,'leads'));
-    if(existing.size>0){
-      toast(`${existing.size} leads already exist. Import skipped.`,'info');
-      if(btn){ btn.disabled=false; btn.textContent='📥 Import Leads'; } return;
-    }
-
-    const ts  = now();
-    const bat = writeBatch(db);
-
-    L1.forEach(([contact,company,email,phone,stage,industry,city]) => {
-      const ref = doc(collection(db,'leads'));
-      bat.set(ref,{contact,company,email,phone,stage,industry,city,
-        assignedTo:ag1.id, assignedBy:CU.uid, createdBy:CU.uid, createdByRole:'manager',
-        ownerLocked:true, dealValue:0, notes:'', followup:'',
-        lastEditedBy:CP.name, lastEditedAt:ts});
-    });
-    L2.forEach(([contact,company,email,phone,stage,industry,city]) => {
-      const ref = doc(collection(db,'leads'));
-      bat.set(ref,{contact,company,email,phone,stage,industry,city,
-        assignedTo:ag2.id, assignedBy:CU.uid, createdBy:CU.uid, createdByRole:'manager',
-        ownerLocked:true, dealValue:0, notes:'', followup:'',
-        lastEditedBy:CP.name, lastEditedAt:ts});
-    });
-
-    await bat.commit();
-    toast(`✅ 115 leads imported — 58 to Agent 1, 57 to Agent 2.`);
-    renderOrgTab();
-  } catch(e){
-    toast('Error: '+e.message,'err');
-    if(btn){ btn.disabled=false; btn.textContent='📥 Import Leads'; }
-  }
 }
 
 // Backfill teamId/tlId on leads that predate those fields (e.g. the original
