@@ -290,7 +290,10 @@ export async function renderOrgTab(){
       'Their leads will remain but become unassigned from this member. Their login will be deactivated.',
       async () => {
         const delId = b.dataset.delUser;
-        await updateDoc(doc(db,'users',delId),{active:false,teamId:null,tlId:null,lastEditedBy:CP.name,lastEditedAt:now()});
+        // department cleared alongside teamId/tlId (ARCHITECTURE.md audit item
+        // 15) — otherwise a deactivated backend agent keeps isActiveBackend()
+        // rule access via a stale department field even after soft-removal.
+        await updateDoc(doc(db,'users',delId),{active:false,teamId:null,tlId:null,department:null,lastEditedBy:CP.name,lastEditedAt:now()});
         if(u?.tlId){
           const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
           const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);

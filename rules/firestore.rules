@@ -5,6 +5,15 @@ service cloud.firestore {
     // ── HELPERS ──────────────────────────────────────
     function isAuth() { return request.auth != null; }
     function role() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+    // Audit item 15: deactivated backend staff must lose access even though
+    // soft-remove doesn't clear department (only teamId/tlId) — org.js's
+    // remove flow now also clears department, but this checks active as a
+    // second guard so a rules change alone is enough even if that ever drifts.
+    // Single get() reused for both checks — no extra read over the old form.
+    function isActiveBackend() {
+      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return u.department == 'backend' && u.active != false;
+    }
 
     // ── USERS ────────────────────────────────────────
     match /users/{uid} {
@@ -129,22 +138,30 @@ service cloud.firestore {
     // Agent → backend handoff (Phase 7). See js/submissions.js and
     // PHASE5_SPEC_AND_HANDOFF.md section 1 for the full schema.
     match /submissions/{s} {
+      // Audit item 14: the teamId clause used to match ANY role on the same
+      // team, letting fellow sales agents read each other's submissions
+      // (and the ID-document paths within them) — violates
+      // PHASE5_SPEC_AND_HANDOFF.md §5 (agent, their TL, backend, manager
+      // ONLY). Now requires role()=='team_lead' too.
       allow read: if isAuth() && (
         role() == 'manager' ||
         resource.data.agentId == request.auth.uid ||
-        resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId ||
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.department == 'backend'
+        (role() == 'team_lead' && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId) ||
+        isActiveBackend()
       );
 
       allow create: if isAuth()
         && request.resource.data.agentId == request.auth.uid
         && request.resource.data.submittedBy == request.auth.uid;
 
-      // Broad for now — manager or anyone in the backend department. Will be
-      // narrowed once Phase 8's actual stage-advancement update shape is known.
+      // Broad for now — manager or anyone in the active backend department.
+      // Will be narrowed once Phase 8's actual stage-advancement update
+      // shape is known. (Audit item 16 — the agent correction-loop update
+      // rule — is intentionally NOT added yet; designed together with the
+      // Phase B correction UI, not now.)
       allow update: if isAuth() && (
         role() == 'manager' ||
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.department == 'backend'
+        isActiveBackend()
       );
     }
   }
