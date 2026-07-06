@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Phase 5 in progress (bulk-assign, module split, companies collection + picker, permission-grant scaffolding shipped; backend-dept next)**
+**Last updated:** July 2026 | **Phase 5 complete on `main`** (companies collection + picker, permission-grant scaffolding, module split). Backend-department/submissions work (Phases 6-7 of the original handoff numbering) is built on the `wip-submissions` branch, not yet merged to `main`. **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
 
 ---
 
@@ -391,10 +391,21 @@ Role-scoped lead queries, "Mine" badge, assignment enforcement, `teamId`/`histor
 
 ## Planned / Future Phases
 
-See `PHASE5_SPEC_AND_HANDOFF.md` for full detail on:
-- Companies as a real entity (dedup, `companyId` on leads, merge tool)
-- Reusable permission-grant system (team-level + user-level `permissions[]`)
-- Backend department + submission workflow (status pipeline: Submitted → In Review → Needs Correction → Activated/Rejected)
-- Reports (projection definition still open — pipeline-based vs. submission-based)
-- Document expiry tracking (lowest priority, fully decoupled)
-- Splitting `index.html` (currently 3,163+ lines) into ES modules before the next large addition
+**Superseded by `ARCHITECTURE.md`** — that document is now the source of truth for all future
+build phases (Phase A0 through G) and overrides anything below where they conflict. This section
+is kept only as a pointer, not duplicated content that could drift out of sync.
+
+Already shipped, previously listed here as pending (do not re-plan these):
+- ~~Companies as a real entity~~ — done, see Data Model above.
+- ~~Reusable permission-grant system~~ — done, see Permission-Grant System above.
+- ~~Splitting `index.html` into ES modules~~ — done, see File Structure above.
+
+Still ahead, with correct current detail in `ARCHITECTURE.md` (not restated here to avoid two
+sources of truth going stale independently):
+- Backend department + submission workflow — the actual shipped pipeline is
+  `SUBMISSION_STAGES` (Account Creation → Financial Approval → Activity → Work Order → Activated)
+  with a `blocked: needsCorrection|rejected` side-branch, not the earlier "Submitted → In Review"
+  model this section used to describe. See `ARCHITECTURE.md` §0 (audit), §8 (Phase A-G plan).
+- Reports — full 17-report catalog with audience/source/rollup design in `ARCHITECTURE.md` §7,
+  superseding the vague "projection report" placeholder this file used to carry.
+- Document expiry tracking, company merge tooling — `ARCHITECTURE.md` §0 audit items and phase plan.
