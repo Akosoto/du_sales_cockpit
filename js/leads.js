@@ -28,11 +28,13 @@ export async function renderPipelineTab(){
     leads = (await getDocs(collection(db,'leads'))).docs.map(d=>({id:d.id,...d.data()}));
   } else if(role==='team_lead'){
     if(!CP.teamId){ ct.innerHTML=`<div class="empty mt-16"><div class="empty-icon">👥</div><div class="empty-title">Not assigned to a team</div><div class="empty-sub">Contact your manager.</div></div>`; return; }
-    const agSnap = await getDocs(query(collection(db,'users'),where('teamId','==',CP.teamId),where('role','==','agent')));
-    const agIds  = agSnap.docs.map(d=>d.id);
-    if(agIds.length>0){
-      leads = (await getDocs(query(collection(db,'leads'),where('assignedTo','in',agIds)))).docs.map(d=>({id:d.id,...d.data()}));
-    }
+    // Single teamId query — matches dashboard.js and the Firestore rule's own
+    // teamId scope (ARCHITECTURE.md audit items 5+9). The old two-step
+    // agents-then-in() query broke past 30 agents (Firestore's `in` cap) and
+    // silently missed unassigned-in-team leads, which member-removal
+    // deliberately creates — those showed up in Dashboard counts but were
+    // invisible here, so TLs could never rescue orphaned leads via bulk-assign.
+    leads = (await getDocs(query(collection(db,'leads'),where('teamId','==',CP.teamId)))).docs.map(d=>({id:d.id,...d.data()}));
   } else {
     leads = (await getDocs(query(collection(db,'leads'),where('assignedTo','==',CU.uid)))).docs.map(d=>({id:d.id,...d.data()}));
   }
