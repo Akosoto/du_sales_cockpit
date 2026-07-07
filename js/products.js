@@ -1,8 +1,8 @@
 import {
   db, CU, CP,
-  doc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch
+  collection, query, where, getDocs
 } from './state.js';
+import { dbAdd, dbUpdate, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
 
 // Shared with js/org.js (backend agent specialties checklist) — keep this the
@@ -219,13 +219,9 @@ const SEED_PRODUCTS = [
 async function seedProducts(){
   const snap = await getDocs(collection(db,'products'));
   if(snap.size > 0) return;
-  const bat = writeBatch(db);
+  const bat = newBatch();
   SEED_PRODUCTS.forEach(p => {
-    bat.set(doc(collection(db,'products')), {
-      ...p, monthlyWaivers:[], active:true,
-      createdBy:CU.uid, createdByName:CP.name, createdAt:now(),
-      lastEditedBy:CP.name, lastEditedAt:now()
-    });
+    batchAdd(bat, 'products', { ...p, monthlyWaivers:[], active:true, createdByName:CP.name });
   });
   await bat.commit();
 }
@@ -332,7 +328,7 @@ export async function renderProductsSection(){
             <button class="btn btn-ghost btn-xs" data-pr-edit="${p.id}">✏ Edit</button>
             <button class="btn btn-ghost btn-xs" data-pr-disc="${p.id}">% Discounts</button>
             <button class="btn btn-ghost btn-xs" data-pr-wv="${p.id}">💰 Waivers</button>
-            <button class="btn btn-danger btn-xs" data-pr-del="${p.id}">Delete</button>
+            <button class="btn btn-danger btn-xs" data-pr-del="${p.id}">Remove</button>
           </div>`:''}
       </div>`;
     }).join('')}</div>`;
@@ -353,10 +349,15 @@ export async function renderProductsSection(){
       const pid = b.dataset.prDel;
       const p = products.find(x=>x.id===pid);
       if(!p) return;
-      b.addEventListener('click',()=>confirmModal(`Delete "${esc(p.name)}"?`,'Cannot be undone.',async()=>{
-        await deleteDoc(doc(db,'products',pid));
+      // Soft delete (ARCHITECTURE.md audit item 11) — products are
+      // deactivated, not hard-deleted, since a future submission line item
+      // can reference a productId as a snapshot even after the catalog entry
+      // is retired. The product fetch already scopes to active==true, so a
+      // deactivated product disappears from view exactly as before.
+      b.addEventListener('click',()=>confirmModal(`Remove "${esc(p.name)}"?`,'It will no longer appear in the catalog. Existing submissions referencing it are unaffected.',async()=>{
+        await dbUpdate('products', pid, {active:false});
         products = products.filter(x=>x.id!==pid);
-        closeModal(); toast('Product deleted.','info');
+        closeModal(); toast('Product removed.','info');
         renderCards();
       }));
     });
@@ -440,12 +441,11 @@ function showAddProductModal(onUpdate){
         pricingOptions, activationFee:Number(v('np-act'))||0,
         sourceDoc:v('np-src'), notes:v('np-notes'),
         active:true, discounts:[], monthlyWaivers:[],
-        createdBy:CU.uid, createdByName:CP.name, createdAt:now(),
-        lastEditedBy:CP.name, lastEditedAt:now()
+        createdByName:CP.name
       };
-      const ref=await addDoc(collection(db,'products'),payload);
+      const ref=await dbAdd('products', payload);
       closeModal(); toast('Product created.');
-      onUpdate({id:ref.id,...payload});
+      onUpdate({id:ref.id,...payload,createdBy:CU.uid,createdAt:now(),lastEditedBy:CP.name,lastEditedAt:now()});
     }catch(e){ err.textContent=e.message; enable('np-btn','Create Product'); }
   };
 }
@@ -502,11 +502,10 @@ function showEditProductModal(p, onUpdate){
       const upd={
         category:v('ep-cat'), name, specs:parseSpecs(v('ep-specs')),
         pricingOptions, activationFee:Number(v('ep-act'))||0,
-        sourceDoc:v('ep-src'), notes:v('ep-notes'),
-        lastEditedBy:CP.name, lastEditedAt:now()
+        sourceDoc:v('ep-src'), notes:v('ep-notes')
       };
-      await updateDoc(doc(db,'products',p.id),upd);
-      closeModal(); toast('Product updated.'); onUpdate({...p,...upd});
+      await dbUpdate('products', p.id, upd);
+      closeModal(); toast('Product updated.'); onUpdate({...p,...upd,lastEditedBy:CP.name,lastEditedAt:now()});
     }catch(e){ err.textContent=e.message; enable('ep-btn','Save Changes'); }
   };
 }
@@ -544,7 +543,7 @@ function showManageDiscountsModal(product, onUpdate){
       const id = b.dataset.delDisc;
       b.onclick = () => confirmModal('Delete this discount?','Cannot be undone.',async()=>{
         discounts = discounts.filter(x=>x.id!==id);
-        await updateDoc(doc(db,'products',product.id),{discounts, lastEditedBy:CP.name, lastEditedAt:now()});
+        await dbUpdate('products', product.id, {discounts});
         toast('Discount deleted.','info');
         onUpdate({...product, discounts});
         renderList();
@@ -595,7 +594,7 @@ function showManageDiscountsModal(product, onUpdate){
           createdAt: existing?existing.createdAt:now()
         };
         discounts = existing ? discounts.map(d=>d.id===entry.id?entry:d) : [...discounts, entry];
-        await updateDoc(doc(db,'products',product.id),{discounts, lastEditedBy:CP.name, lastEditedAt:now()});
+        await dbUpdate('products', product.id, {discounts});
         toast(existing?'Discount updated.':'Discount added.');
         onUpdate({...product, discounts});
         renderList();
@@ -639,7 +638,7 @@ function showManageWaiversModal(product, onUpdate){
       const id = b.dataset.delWv;
       b.onclick = () => confirmModal('Delete this waiver?','Cannot be undone.',async()=>{
         waivers = waivers.filter(x=>x.id!==id);
-        await updateDoc(doc(db,'products',product.id),{monthlyWaivers:waivers, lastEditedBy:CP.name, lastEditedAt:now()});
+        await dbUpdate('products', product.id, {monthlyWaivers:waivers});
         toast('Waiver deleted.','info');
         onUpdate({...product, monthlyWaivers:waivers});
         renderList();
@@ -683,7 +682,7 @@ function showManageWaiversModal(product, onUpdate){
           createdAt: existing?existing.createdAt:now()
         };
         waivers = existing ? waivers.map(w=>w.id===entry.id?entry:w) : [...waivers, entry];
-        await updateDoc(doc(db,'products',product.id),{monthlyWaivers:waivers, lastEditedBy:CP.name, lastEditedAt:now()});
+        await dbUpdate('products', product.id, {monthlyWaivers:waivers});
         toast(existing?'Waiver updated.':'Waiver added.');
         onUpdate({...product, monthlyWaivers:waivers});
         renderList();
