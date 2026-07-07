@@ -48,7 +48,7 @@ document.addEventListener('click', e => {
 });
 
 export function confirmModal(title, msg, onYes, danger=true){
-  modal(title, `<p class="text-dim" style="margin-bottom:16px">${msg}</p>
+  modal(title, `<p class="text-dim" style="margin-bottom:16px">${esc(msg)}</p>
     <div class="flex gap-8">
       <button class="btn ${danger?'btn-danger':'btn-primary'}" id="yes-btn">Confirm</button>
       <button class="btn btn-ghost" onclick="document.getElementById('modal').style.display='none'">Cancel</button>

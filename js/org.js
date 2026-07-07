@@ -353,7 +353,7 @@ export async function renderOrgTab(){
         const orphSnap = await getDocs(query(collection(db,'leads'), where('assignedTo','==',delId)));
         orphSnap.docs.forEach(ld => batchUpdate(bat, 'leads', ld.id, {
           assignedTo:'', tlId:'',
-          history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${esc(u.name)} deleted` }]
+          history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u.name} deleted` }]
         }));
       }
 
