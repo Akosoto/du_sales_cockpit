@@ -1,8 +1,8 @@
 import {
   db, CU, CP,
-  doc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch
+  collection, query, where, getDocs
 } from './state.js';
+import { dbAdd, dbUpdate, dbDelete, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
 
 // ════════════════════════════════════════════════════
@@ -13,9 +13,9 @@ async function seedChannels(){
   const snap = await getDocs(collection(db,'channels'));
   if(snap.size > 0) return;
   const defaults = ['WhatsApp','LinkedIn','Email','Cold Call'];
-  const bat = writeBatch(db);
+  const bat = newBatch();
   defaults.forEach(name => {
-    bat.set(doc(collection(db,'channels')),{name,createdBy:CU.uid,createdAt:now(),active:true});
+    batchAdd(bat, 'channels', {name, active:true});
   });
   await bat.commit();
 }
@@ -182,7 +182,7 @@ export async function renderScriptsSection(){
       const s=scripts.find(x=>x.id===sid);
       if(!s) return;
       b.addEventListener('click',()=>confirmModal(`Delete "${esc(s.title)}"?`,'Cannot be undone.',async()=>{
-        await deleteDoc(doc(db,'scripts',sid));
+        await dbDelete('scripts', sid);
         scripts.splice(scripts.findIndex(x=>x.id===sid),1);
         closeModal(); toast('Script deleted.','info');
         renderQueueBlock(); renderCards();
@@ -204,7 +204,10 @@ export async function renderScriptsSection(){
         'Withdraw proposed edit?',
         'Your suggested changes will be discarded. The original script is unchanged.',
         async()=>{
-          await updateDoc(doc(db,'scripts',sid),{pendingApproval:null});
+          // skipAudit: this update is bound by the Firestore rule's
+          // affectedKeys().hasOnly(['pendingApproval']) restriction — adding
+          // lastEditedBy/lastEditedAt would widen the write and get rejected.
+          await dbUpdate('scripts', sid, {pendingApproval:null}, {skipAudit:true});
           s.pendingApproval=null;
           closeModal(); toast('Edit withdrawn.'); renderCards();
         }
@@ -282,13 +285,12 @@ function showAddScriptModal(channels, scripts, onUpdate){
         title, body, channel,
         scope:    isManager?'global':'team',
         teamId:   isManager?null:CP.teamId,
-        createdBy:CU.uid, createdByName:CP.name, createdByRole:CP.role,
-        createdAt:now(), lastEditedBy:CP.name, lastEditedAt:now(),
+        createdByName:CP.name, createdByRole:CP.role,
         pendingApproval:null, approved:true
       };
-      const ref=await addDoc(collection(db,'scripts'),payload);
+      const ref=await dbAdd('scripts', payload);
       closeModal(); toast('Script created.');
-      onUpdate({id:ref.id,...payload});
+      onUpdate({id:ref.id,...payload,createdBy:CU.uid,createdAt:now(),lastEditedBy:CP.name,lastEditedAt:now()});
     }catch(e){err.textContent=e.message; enable('ns-btn','Create Script');}
   };
 }
@@ -314,9 +316,9 @@ function showEditScriptModal(s, channels, onUpdate){
     if(!body) {err.textContent='Script body is required.'; return;}
     disable('es-btn','Saving…');
     try{
-      const upd={title,body,channel,lastEditedBy:CP.name,lastEditedAt:now()};
-      await updateDoc(doc(db,'scripts',s.id),upd);
-      closeModal(); toast('Script updated.'); onUpdate({...s,...upd});
+      const upd={title,body,channel};
+      await dbUpdate('scripts', s.id, upd);
+      closeModal(); toast('Script updated.'); onUpdate({...s,...upd,lastEditedBy:CP.name,lastEditedAt:now()});
     }catch(e){err.textContent=e.message; enable('es-btn','Save Changes');}
   };
 }
@@ -347,7 +349,9 @@ function showSuggestEditModal(s, onUpdate){
         submittedBy:CU.uid, submittedByName:CP.name,
         submittedAt:now(), originalBody:s.body, proposedBody:proposed
       };
-      await updateDoc(doc(db,'scripts',s.id),{pendingApproval:pa});
+      // skipAudit: bound by affectedKeys().hasOnly(['pendingApproval']) — see
+      // the withdraw-edit handler above for the same constraint.
+      await dbUpdate('scripts', s.id, {pendingApproval:pa}, {skipAudit:true});
       closeModal(); toast('Edit submitted for manager review.');
       onUpdate({...s,pendingApproval:pa});
     }catch(e){err.textContent=e.message; enable('se-btn','Submit for Approval');}
@@ -379,8 +383,11 @@ function showApprovalModal(s, onUpdate){
   document.getElementById('ap-approve').onclick=async()=>{
     disable('ap-approve','Approving…');
     try{
+      // lastEditedBy credits the TL who wrote the change, not the manager
+      // approving it — explicit here, overriding db.js's default stamp
+      // (caller-provided fields always win over the gateway's defaults).
       const upd={body:pa.proposedBody,pendingApproval:null,lastEditedBy:pa.submittedByName,lastEditedAt:now()};
-      await updateDoc(doc(db,'scripts',s.id),upd);
+      await dbUpdate('scripts', s.id, upd);
       closeModal(); toast('Edit approved and published.');
       onUpdate({...s,...upd});
     }catch(e){document.getElementById('ap-err').textContent=e.message; enable('ap-approve','✓ Approve & Publish');}
@@ -389,7 +396,8 @@ function showApprovalModal(s, onUpdate){
   document.getElementById('ap-reject').onclick=async()=>{
     disable('ap-reject','Rejecting…');
     try{
-      await updateDoc(doc(db,'scripts',s.id),{pendingApproval:null});
+      // skipAudit: same affectedKeys().hasOnly(['pendingApproval']) constraint.
+      await dbUpdate('scripts', s.id, {pendingApproval:null}, {skipAudit:true});
       closeModal(); toast('Edit rejected — original retained.','info');
       onUpdate({...s,pendingApproval:null});
     }catch(e){document.getElementById('ap-err').textContent=e.message; enable('ap-reject','✕ Reject');}
@@ -426,7 +434,7 @@ function showManageChannelsModal(channels, refreshFn){
       const chId=b.dataset.delCh;
       b.addEventListener('click',async()=>{
         if(!confirm('Remove this channel? Existing scripts keep their channel label.')) return;
-        await updateDoc(doc(db,'channels',chId),{active:false});
+        await dbUpdate('channels', chId, {active:false});
         channels.splice(channels.findIndex(x=>x.id===chId),1);
         renderChList();
       });
@@ -450,7 +458,7 @@ function showManageChannelsModal(channels, refreshFn){
     if(channels.find(c=>c.name.toLowerCase()===name.toLowerCase())){err.textContent='Channel already exists.'; return;}
     disable('ch-add-btn','Adding…');
     try{
-      const ref=await addDoc(collection(db,'channels'),{name,createdBy:CU.uid,createdAt:now(),active:true});
+      const ref=await dbAdd('channels', {name, active:true});
       channels.push({id:ref.id,name,active:true});
       document.getElementById('ch-new').value='';
       err.textContent='';
