@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **`wip-submissions` merged into `main`** — companies, backend-department schema, and submission creation (Phases 5-7 of the original handoff numbering) are all now on `main`. Submission file upload is still blocked pending a Storage decision (Blaze plan cost — see ARCHITECTURE.md Section 4). **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
+**Last updated:** July 2026 | **ARCHITECTURE.md Phase A0/A (multi-tenancy foundation) shipped** — `js/db.js` mutation gateway built and every module migrated through it, one-off `orgId` backfill run live across all 259 existing docs, and `rules/firestore.rules` rewritten with the `sameOrg()`/`sameOrgWrite()` org-scoping pattern (published to the Firebase Console and confirmed working after a critical bootstrap-bug fix — see Firestore Security Rules and Phase A0/A below). **`wip-submissions` merged into `main`** — companies, backend-department schema, and submission creation (Phases 5-7 of the original handoff numbering) are all now on `main`. Submission file upload is still blocked pending a Storage decision (Blaze plan cost — see ARCHITECTURE.md Section 4). **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
 
 ---
 
@@ -10,7 +10,16 @@ A Firebase-backed B2B sales management web app for Shaun Technologies Trading LL
 **Live URL:** https://akosoto.github.io/du_sales_cockpit
 **Firebase project:** `du-sales-cockpit`
 **Stack:** `index.html` (shell: HTML + CSS only) + `js/*.js` ES modules, Firebase Auth, Firestore, no build step
-**Repo:** https://github.com/Akosoto/du_sales_cockpit (branch `main`, GitHub Pages deploys from `main` / root)
+**Repo:** https://github.com/Akosoto/du_sales_cockpit (branch `main`)
+
+**Deployment (NEW, Phase A — `.github/workflows/deploy.yml`):** GitHub Actions build, not the old
+"deploy from branch" static mode. `config.js` is gitignored (per-deployment Firebase config +
+`orgId` + branding + `storageDriver` + `featureFlags` — see `config.example.js` for the template);
+the workflow writes it from a repository secret (`CONFIG_JS`, whole-file contents) via a shell-safe
+`env:` block before uploading the Pages artifact. **One-time GitHub setup required:** Pages source
+switched to "GitHub Actions" (Settings → Pages) and the `CONFIG_JS` repo secret populated from the
+raw local `config.js` file — never paste it from a chat message, which may render/redact the API
+key as bullet characters (this caused a real production outage this session, see Phase A0/A below).
 
 ### File structure (as of the Phase 5 module split)
 ```
@@ -18,11 +27,23 @@ index.html          — HTML shell + all CSS, loads js/main.js as the sole entry
 js/state.js          — Firebase init (db/auth/auth2), SEED_EMAILS, STAGES, SP, mutable CU/CP/TAB
                         (exported as live bindings; only state.js's own setUser()/setTab() may
                         reassign them — every other module just imports and reads)
+js/db.js             — NEW (Phase A) — single Firestore mutation gateway: dbAdd/dbSet/dbUpdate/
+                        dbDelete/newBatch/batchAdd/batchSet/batchUpdate/batchDelete. Every module's
+                        direct addDoc/setDoc/updateDoc/deleteDoc/writeBatch call has been migrated
+                        through this file (see Phase A0/A below). Stamps `orgId` from config.js on
+                        every create, centralises createdBy/createdAt/lastEditedBy/lastEditedAt,
+                        auto-writes a structured `closedAt` on `stage`→`'Closed'`, caps `history[]`
+                        at 100 entries (keeps the tail). `opts.skipAudit:true` escape hatch for the
+                        handful of call sites bound by a narrow `affectedKeys().hasOnly([...])` rule
+                        (teams.assignmentCursor rotation, scripts.pendingApproval withdraw/suggest/
+                        reject, and the orgId migration itself — see below).
 js/helpers.js         — v, esc, now, fmtDate, disable, enable, toast, modal, closeModal,
                         confirmModal, stagePill, calculateTLTarget, buildMsFilter, wireMsFilter
 js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routing, change-password
 js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData,
-                        Companies card (list/edit/backfill), permission-checklist wiring
+                        Companies card (list/edit/backfill), permission-checklist wiring,
+                        runOrgIdMigration (NEW, Phase A — one-off manager-triggered orgId
+                        backfill, banner+button UX matching repairLeadTeamData, safe to re-run)
 js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
                         (add-lead includes the company search/fuzzy-match picker), and the
                         Submit to Backend modal (shown on Closed leads with a companyId)
@@ -60,6 +81,13 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
 ---
 
 ## Data Model
+
+**Multi-tenancy (NEW, Phase A):** every collection below now carries an `orgId` field, stamped
+automatically by `js/db.js` on every create from `config.js`'s `orgId` export (`"shauntech"` for
+this deployment). All 259 pre-existing docs across every collection were backfilled live via the
+one-off `runOrgIdMigration()` (see Phase A0/A). Firestore rules enforce `sameOrg()`/`sameOrgWrite()`
+on every clause — see Firestore Security Rules below. Not restated per-collection in the schemas
+below to avoid drift; assume `orgId: string` is present on every document in every collection.
 
 ### `users`
 ```
@@ -109,6 +137,10 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
                                     // Add Lead picker (js/leads.js showAddLeadModal); existing leads
                                     // backfilled via the Org tab's "Backfill Companies" button
   stage,                           // Pipeline stage
+  closedAt,                        // NEW (Phase A) — structured ISO timestamp, auto-stamped by
+                                    // js/db.js whenever `stage` is set to 'Closed' (only if not
+                                    // already set). Replaces the old fragile history[]-text-scan
+                                    // the Dashboard used for monthly attainment.
   assignedTo, assignedBy,
   teamId,                          // team of the assigned agent (empty string if unassigned)
   tlId,                            // TL of the assigned agent (empty string if unassigned; written on create/reassign)
@@ -117,7 +149,8 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   deleteRequest: { requestedBy, requestedByName, requestedAt } | null,  // TL request to delete a locked lead, pending manager approval
   createdBy, createdByRole,
   lastEditedBy, lastEditedAt,
-  history: [{ ts, actorId, actorName, change }]
+  history: [{ ts, actorId, actorName, change }]  // capped at 100 entries by js/db.js (keeps the
+                                    // tail — entries are only ever appended, never reordered)
 }
 ```
 
@@ -161,7 +194,9 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   specs: { key: value },           // free-form key-value pairs, displayed on card
   sourceDoc,                       // rate sheet version reference e.g. "ENT-ULT-BTL-SEP-2025"
   notes,                           // freetext — add-on caveats, availability notes
-  active: true | false,
+  active: true | false,            // NEW (Phase A) — product "delete" is now a soft-delete
+                                    // (sets active:false via js/db.js dbUpdate), never removes the
+                                    // doc. Product list/picker UI already filtered on active!==false.
   discounts: [ { id, appliesToTerm, appliesToTermLabel, price, percentage, validFrom, validTo, conditions, createdBy, createdByName, createdAt } ],
   monthlyWaivers: [ { id, label, value, valueType: 'amount'|'percentage', conditions, createdBy, createdByName, createdAt } ],
   createdBy, createdByName, createdAt,
@@ -383,6 +418,41 @@ Helper: `calculateTLTarget(tlId, users)` — pure function, sums `monthlyTarget`
 
 ## Firestore Security Rules
 
+**NEW (Phase A): rules are now version-controlled** at `rules/firestore.rules` in this repo — the
+Console is still the actual deploy target (paste-and-publish, no CLI deploy set up), but the
+repo file is the source of truth going forward, superseding the older "Console is the source of
+truth, rules aren't in this repo" convention.
+
+**Multi-tenancy (`sameOrg()`/`sameOrgWrite()`):** every collection's every clause now also requires
+an org check — `sameOrg()` for read/update/delete (compares the actor's `orgId`, via a cached
+`userDoc()` lookup, to the existing doc's `orgId`); `sameOrgWrite()` for create (compares against
+the *incoming* doc's `orgId`, since `resource.data` doesn't exist yet pre-create).
+
+> **Bootstrap bug fixed live in production (critical):** the first version of these helpers assumed
+> a missing `orgId` field compares as `null == null → true` before the migration ran. That
+> assumption was wrong in practice and broke `permission-denied` on every login (including a basic
+> self-read of one's own `users/{uid}` doc) the moment the rules were first published — Firebase
+> Auth sign-in succeeded but the app couldn't read anything. Fixed with explicit `'orgId' in ...`
+> existence checks instead of relying on unverified null-comparison semantics:
+> ```
+> function sameOrg() {
+>   return !('orgId' in userDoc()) || !('orgId' in resource.data) || userDoc().orgId == resource.data.orgId;
+> }
+> function sameOrgWrite() {
+>   return !('orgId' in userDoc()) || userDoc().orgId == request.resource.data.orgId;
+> }
+> ```
+> Once every doc has `orgId` (true today, post-migration), the bootstrap bypass clause is
+> permanently dormant. Verified fixed via a live diagnostic (direct `getDoc` on the manager's own
+> profile through the deployed app) before declaring it safe to log in again.
+
+**Migration-ordering gotcha (caught before running, not a live failure):** `runOrgIdMigration()`
+migrates collections in this exact order — `teams, leads, companies, channels, scripts, products,
+submissions, users` — with **`users` deliberately last**. Migrating `users` first would stamp the
+acting manager's own `orgId` immediately, and every subsequent collection's `sameOrg()` check would
+then compare a real orgId against still-unmigrated docs and fail closed, silently locking the
+migration out of everything after `users`.
+
 All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, seven collections:
 
 | Collection | Read | Write |
@@ -400,7 +470,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 - `role()` helper does a `get()` on `users/{auth.uid}` — cached within a single rule evaluation, so calling it multiple times across helper functions doesn't multiply read cost.
 - `deleteRequest` field is intentionally **not** in the TL update rule's blocked-fields list — a TL writing a delete request, or a manager clearing one, needs no rule changes beyond what already exists.
 - `companyId` needed no new `leads` rule — it's not an admin-locked field.
-- The `companies` rule was handed to Ashok as a full-file paste-in for the Firebase Console (rules aren't version-controlled in this repo — Console is the source of truth) — confirm it's been published before relying on non-manager company creation working in production.
+- The `companies` rule (like every other collection's) is handed to Ashok as a full-file paste-in for the Firebase Console from `rules/firestore.rules` (see the version-control note above) — confirm it's been published before relying on non-manager company creation working in production.
 - **Caught during Phase 7 rule review:** `createSubmission()` writes `teams.assignmentCursor` as part of the submitting agent's own batch — the existing manager-only `teams` write rule would have silently failed that update for any non-manager agent. Fixed by adding a narrowly-scoped `affectedKeys().hasOnly(['assignmentCursor'])` exception, the same pattern already used for `scripts.pendingApproval`.
 - **Storage rules (separate ruleset, Storage → Rules in Firebase Console):** write is allowed for any authenticated user restricted to PDF/image content-type and a 10MB cap — not gated on the submission doc's existence, because files upload *before* the Firestore submission doc is written (see `createSubmission()`). Read is gated via `firestore.get()` cross-service calls against the submission doc (manager/submitting agent/their TL/backend department) — **not yet exercised by any UI** (no file-viewing screen exists until Phase 8), so treat the read rule as best-effort until then.
 
@@ -490,6 +560,34 @@ Role-scoped lead queries, "Mine" badge, assignment enforcement, `teamId`/`histor
   needsCorrection/rejected correction loop, and anything that reads files back out of Storage.
 - **Next up:** Phase 8 — backend stage pipeline (queue view, Account Creation → Financial
   Approval → Activity → Work Order → Activated, correction loop).
+
+### Phase A0/A (shipped) — Multi-tenancy foundation
+Per `ARCHITECTURE.md`'s white-label pivot (Sections 0, 2, 3, 8).
+- **Step 0:** merged `wip-submissions` into `main` (see header note above) — resolved conflicts in
+  `PROJECT_SPEC.md`/`js/state.js`, verified the Submit to Backend modal and all tabs still work.
+- **`js/db.js`** — new single Firestore mutation gateway, built and every module (`org.js`,
+  `leads.js`, `scripts.js`, `products.js`, `companies.js`, `auth.js`, `submissions.js`) migrated
+  through it one at a time, tested and committed individually. See File Structure above for what
+  it centralises (orgId stamping, audit fields, `closedAt`, `history[]` cap, product soft-delete).
+- **`runOrgIdMigration()`** (`js/org.js`) — one-off manager-triggered backfill, run live: stamped
+  `orgId` on all 259 pre-existing docs across every collection, 0 missed. Same banner+button UX
+  as `repairLeadTeamData`, safe to re-run.
+- **`rules/firestore.rules`** rewritten with the `sameOrg()`/`sameOrgWrite()` multi-tenancy pattern
+  across every collection — now version-controlled in this repo (see Firestore Security Rules
+  section above for full detail, including the critical bootstrap bug found and fixed live).
+- **GitHub Pages deploy switched to GitHub Actions** (`.github/workflows/deploy.yml`) — the old
+  "deploy from branch" mode shipped a repo missing the gitignored `config.js`, breaking login on
+  the live site entirely. Fixed with a build step that writes `config.js` from a `CONFIG_JS`
+  repository secret. A second, separate outage (masked/bullet-character API key in the secret,
+  from copy-pasting a chat-rendered value instead of the raw file) was diagnosed and fixed the
+  same way — see Deployment note above.
+- **Final all-roles regression pass** — verified live (manager/team_lead/agent) after the rules fix
+  and migration: profile reads, dashboard/pipeline views, and a real create→update→delete cycle
+  for the agent role, plus an edit-and-revert for the team_lead role. No permission errors, no
+  orphaned test data left behind.
+- **Not started yet:** Phase B (Storage driver decision — `storageDriver: 'firestore-b64'` is
+  chosen in `config.js` but not yet implemented) and everything after it in `ARCHITECTURE.md`'s
+  Phase A-G plan.
 
 ---
 
