@@ -1,10 +1,11 @@
 import {
-  db, CU, CP, STAGES,
+  db, CU, CP, STAGES, MANDATORY_DOC_TYPES,
   doc, getDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch
 } from './state.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
 import { fetchCompanies, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
+import { computeRequiredDocs, createSubmission } from './submissions.js';
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -239,7 +240,7 @@ export async function renderPipelineTab(){
 }
 
 // ─── LEAD MODAL ───
-export function showLeadModal(lead, byId, agents){
+export async function showLeadModal(lead, byId, agents){
   const role      = CP.role;
   const isLocked  = lead.ownerLocked;
   const ownLead   = lead.createdBy === CU.uid;
@@ -250,6 +251,20 @@ export function showLeadModal(lead, byId, agents){
   const hasPendingDeleteReq = !!lead.deleteRequest;
   const isMyDeleteRequest  = hasPendingDeleteReq && lead.deleteRequest.requestedBy===CU.uid;
   const showAssign = role==='manager' || role==='team_lead';
+
+  // Backend handoff — only relevant once a lead is Closed and has a linked
+  // company (companyId is required for submissions.hasDuAccount lookup).
+  // Only fetched for Closed leads to avoid an extra read on every lead open.
+  // Wrapped defensively: a rules/network hiccup on this lookup must never
+  // block the rest of the (unrelated) lead modal from opening.
+  let existingSubmission = null;
+  const canSubmit = lead.stage==='Closed' && lead.companyId && (role==='manager' || lead.assignedTo===CU.uid);
+  if(lead.stage==='Closed' && lead.companyId){
+    try {
+      const subSnap = await getDocs(query(collection(db,'submissions'), where('leadId','==',lead.id)));
+      if(!subSnap.empty) existingSubmission = {id:subSnap.docs[0].id, ...subSnap.docs[0].data()};
+    } catch(e){ /* submissions rule may not be published yet — degrade gracefully */ }
+  }
 
   modal(`${esc(lead.company||'Lead')}`, `
     <div class="info-grid mb-12">
@@ -274,6 +289,8 @@ export function showLeadModal(lead, byId, agents){
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
     ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment is manager-only; deletion requires manager approval.</div>` : ''}
     ${hasPendingDeleteReq ? `<div class="locked-note" style="background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:var(--red)">🗑 Deletion requested by <strong>${esc(lead.deleteRequest.requestedByName||'—')}</strong> on ${fmtDate(lead.deleteRequest.requestedAt)} — pending manager approval.</div>` : ''}
+    ${existingSubmission ? `<div class="locked-note" style="background:rgba(124,58,237,.1);border-color:rgba(124,58,237,.3);color:var(--purple2)">📤 Submitted to backend on ${fmtDate(existingSubmission.submittedAt)} — ${existingSubmission.items.length} item${existingSubmission.items.length!==1?'s':''}.</div>` : ''}
+    ${canSubmit && !existingSubmission ? `<button class="btn btn-primary btn-full mt-12" id="lm-submit">📤 Submit to Backend</button>` : ''}
     <p class="text-dim text-xs mt-8">Last edited by <strong>${esc(lead.lastEditedBy||'—')}</strong> · ${lead.lastEditedAt?fmtDate(lead.lastEditedAt):'—'}</p>
     <p id="lm-err" class="err"></p>
     <div class="flex gap-8 mt-12" style="flex-wrap:wrap">
@@ -283,6 +300,8 @@ export function showLeadModal(lead, byId, agents){
       ${canRequestDelete && hasPendingDeleteReq && isMyDeleteRequest ? `<button class="btn btn-ghost btn-sm" id="lm-withdraw-del">Withdraw Delete Request</button>` : ''}
       ${role==='manager' && hasPendingDeleteReq ? `<button class="btn btn-danger btn-sm" id="lm-approve-del">✅ Approve Deletion</button><button class="btn btn-ghost btn-sm" id="lm-reject-del">✖ Reject Request</button>` : ''}
     </div>`,true);
+
+  document.getElementById('lm-submit')?.addEventListener('click', () => showSubmitModal(lead, byId));
 
   // Show deal value when Won
   document.getElementById('ls-stage').addEventListener('change', function(){
@@ -507,4 +526,137 @@ function showAddLeadModal(agents, byId, companies){
       closeModal(); toast('Lead added.'); renderPipelineTab();
     } catch(e){ err.textContent=e.message; enable('nl-btn','Add Lead'); }
   };
+}
+
+// ─── SUBMIT TO BACKEND MODAL ───
+// Agent-side handoff from a Closed lead (Phase 7). Bundles one or more
+// products into line items and gates submission on the mandatory documents
+// (js/state.js MANDATORY_DOC_TYPES + any per-product extras) being uploaded.
+async function showSubmitModal(lead, byId){
+  const [prodSnap, teamSnap, companySnap] = await Promise.all([
+    getDocs(query(collection(db,'products'), where('active','==',true))),
+    getDocs(collection(db,'teams')),
+    getDoc(doc(db,'companies', lead.companyId))
+  ]);
+  const products     = prodSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const productsById = {}; products.forEach(p=>productsById[p.id]=p);
+  const teams        = teamSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const company       = companySnap.exists() ? {id:companySnap.id,...companySnap.data()} : null;
+  const users        = Object.values(byId);
+
+  let items = [];
+  let pendingFiles = []; // { file, docType }
+
+  function requiredDocs(){ return computeRequiredDocs(items, productsById); }
+  function missingDocs(){ const req = requiredDocs(); return req.filter(rd => !pendingFiles.some(f=>f.docType===rd)); }
+
+  function render(){
+    const req      = requiredDocs();
+    const missing  = missingDocs();
+    const canGo    = items.length>0 && missing.length===0;
+
+    modal(`Submit to Backend — ${esc(lead.company)}`, `
+      <div class="field">
+        <label>Add Product</label>
+        <div class="row2">
+          <select id="sm-prod"><option value="">— Select product —</option>
+            ${products.map(p=>`<option value="${p.id}">${esc(p.category)} — ${esc(p.name)}</option>`).join('')}
+          </select>
+          <select id="sm-term" disabled><option value="">— Select product first —</option></select>
+        </div>
+        <div class="row2 mt-8">
+          <input type="number" id="sm-dv" placeholder="Deal value (AED)">
+          <button type="button" class="btn btn-ghost" id="sm-add-item">+ Add Item</button>
+        </div>
+      </div>
+      <div id="sm-items" class="mt-12">
+        ${items.length ? items.map(it=>`<div class="pr-sub-row flex" style="justify-content:space-between;align-items:center">
+          <div><strong>${esc(it.productName)}</strong> <span class="text-dim text-xs">${esc(it.category)} · ${esc(it.subType)}</span></div>
+          <div class="flex gap-8">
+            <span class="text-dim text-xs">AED ${Number(it.dealValue).toLocaleString()}</span>
+            <button type="button" class="btn btn-danger btn-xs" data-rm-item="${it.itemId}">Remove</button>
+          </div>
+        </div>`).join('') : '<p class="text-dim text-xs">No products added yet.</p>'}
+      </div>
+      <div class="divider"></div>
+      <div class="field">
+        <label>Documents ${req.length?`<span class="text-dim text-xs">(required: ${req.join(', ')})</span>`:''}</label>
+        <input type="file" id="sm-file-input" multiple accept="application/pdf,image/*">
+      </div>
+      <div id="sm-files" class="mt-8">
+        ${pendingFiles.map((f,i)=>`<div class="flex gap-8 mt-8" style="align-items:center">
+          <span class="text-xs" style="flex:1">${esc(f.file.name)}</span>
+          <select data-file-doctype="${i}">
+            ${req.map(rd=>`<option value="${esc(rd)}"${f.docType===rd?' selected':''}>${esc(rd)}</option>`).join('')}
+          </select>
+          <button type="button" class="btn btn-danger btn-xs" data-rm-file="${i}">Remove</button>
+        </div>`).join('')}
+      </div>
+      ${missing.length ? `<p class="err mt-8">Missing required document${missing.length!==1?'s':''}: ${missing.join(', ')}</p>` : ''}
+      ${!items.length ? `<p class="err mt-8">Add at least one product.</p>` : ''}
+      <p id="sm-err" class="err"></p>
+      <button class="btn btn-primary btn-full mt-12" id="sm-submit-btn" ${canGo?'':'disabled'}>Submit</button>`, true);
+
+    document.getElementById('sm-prod').onchange = function(){
+      const p       = productsById[this.value];
+      const termSel = document.getElementById('sm-term');
+      if(!p){ termSel.innerHTML = '<option value="">— Select product first —</option>'; termSel.disabled = true; return; }
+      termSel.disabled = false;
+      termSel.innerHTML = (p.pricingOptions||[]).map((po,i)=>`<option value="${i}">${esc(po.label)} (AED ${po.price})</option>`).join('');
+      termSel.onchange = () => {
+        const po = p.pricingOptions[Number(termSel.value)];
+        document.getElementById('sm-dv').value = po ? po.price : '';
+      };
+      termSel.dispatchEvent(new Event('change'));
+    };
+
+    document.getElementById('sm-add-item').onclick = () => {
+      const p   = productsById[v('sm-prod')];
+      const err = document.getElementById('sm-err');
+      if(!p){ err.textContent='Select a product first.'; return; }
+      const po = p.pricingOptions[Number(document.getElementById('sm-term').value)];
+      const dv = v('sm-dv');
+      if(!dv){ err.textContent='Deal value is required.'; return; }
+      items.push({
+        itemId: `it_${Date.now()}_${items.length}`,
+        productId: p.id, productName: p.name, category: p.category,
+        subType: po ? po.label : '', dealValue: Number(dv)
+      });
+      render();
+    };
+
+    document.querySelectorAll('[data-rm-item]').forEach(b => b.onclick = () => {
+      items = items.filter(it => it.itemId !== b.dataset.rmItem);
+      render();
+    });
+
+    document.getElementById('sm-file-input').onchange = function(){
+      [...this.files].forEach(file => pendingFiles.push({ file, docType: req[0]||'' }));
+      render();
+    };
+
+    document.querySelectorAll('[data-file-doctype]').forEach(sel => sel.onchange = function(){
+      pendingFiles[Number(this.dataset.fileDoctype)].docType = this.value;
+      render();
+    });
+
+    document.querySelectorAll('[data-rm-file]').forEach(b => b.onclick = () => {
+      pendingFiles.splice(Number(b.dataset.rmFile), 1);
+      render();
+    });
+
+    document.getElementById('sm-submit-btn').onclick = async () => {
+      if(!canGo) return;
+      disable('sm-submit-btn','Submitting…');
+      try {
+        await createSubmission({ lead, company, items, files: pendingFiles, requiredDocs: req, teams, users });
+        closeModal(); toast('Submitted to backend.'); renderPipelineTab();
+      } catch(e){
+        document.getElementById('sm-err').textContent = e.message;
+        enable('sm-submit-btn','Submit');
+      }
+    };
+  }
+
+  render();
 }

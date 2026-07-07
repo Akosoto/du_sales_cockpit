@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Phase 5 complete on `main`** (companies collection + picker, permission-grant scaffolding, module split). Backend-department/submissions work (Phases 6-7 of the original handoff numbering) is built on the `wip-submissions` branch, not yet merged to `main`. **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
+**Last updated:** July 2026 | **`wip-submissions` merged into `main`** — companies, backend-department schema, and submission creation (Phases 5-7 of the original handoff numbering) are all now on `main`. Submission file upload is still blocked pending a Storage decision (Blaze plan cost — see ARCHITECTURE.md Section 4). **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
 
 ---
 
@@ -24,15 +24,20 @@ js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routin
 js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData,
                         Companies card (list/edit/backfill), permission-checklist wiring
 js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
-                        (add-lead includes the company search/fuzzy-match picker)
+                        (add-lead includes the company search/fuzzy-match picker), and the
+                        Submit to Backend modal (shown on Closed leads with a companyId)
 js/companies.js       — normalizeCompanyName, findFuzzyMatch, fetchCompanies,
                         findOrCreateCompany, backfillCompanies — the one shared
                         implementation used by both the lead picker and the backfill
 js/permissions.js     — PERMISSIONS catalog, hasPermission(), searchable checklist
                         HTML/wiring for Edit Team/Edit User modals
+js/submissions.js     — computeRequiredDocs, pickBackendAgent (rotation-based auto-assign),
+                        createSubmission (uploads files, resolves per-item stage/assignment,
+                        writes the submission doc) — pure logic; the modal UI lives in leads.js
 js/dashboard.js       — Dashboard tab
 js/scripts.js         — Scripts tab, channels, approval workflow
-js/products.js        — Products tab, seed catalog, discounts, waivers
+js/products.js        — Products tab, seed catalog, discounts, waivers, PRODUCT_CATEGORIES
+                        (shared with js/org.js's backend agent specialties checklist)
 js/main.js            — getTabs/renderNav/switchTab — the only place that imports every
                         render*Tab function and routes between them
 ```
@@ -66,9 +71,18 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   autoTarget,                      // TL only — sum of assigned agents' targets
   targetSource: 'auto' | 'override' | 'manager',
   active: true | false,            // false = deactivated (soft-removed), still exists but locked out
-  permissions: string[]            // individual permission grants, e.g. ['edit_companies'] — see
+  permissions: string[],           // individual permission grants, e.g. ['edit_companies'] — see
                                     // Permission System section. Schema + grant UI shipped; not
                                     // yet consumed by any Firestore rule or non-manager UI.
+  department: 'sales' | 'backend' | null,  // NEW (Phase 6) — denormalized from the user's team.department,
+                                    // null for manager and for anyone currently unassigned to a team.
+                                    // Cascaded automatically if a team's department is later changed
+                                    // (showEditTeamModal batch-updates every member's department).
+  specialties: string[],           // NEW (Phase 6) — backend agents only; product category names
+                                    // (js/products.js PRODUCT_CATEGORIES); empty/omitted = generalist,
+                                    // handles anything. Not set for sales agents or TLs.
+  available: boolean               // NEW (Phase 6) — backend agents only; manual "I'm out today"
+                                    // toggle, default true. Not set for sales agents or TLs.
 }
 ```
 
@@ -78,7 +92,12 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   name,
   teamLeadId: null,                // legacy field, kept for compatibility
   createdBy, createdAt,
-  permissions: string[]            // team-wide permission grants — same caveat as users.permissions
+  permissions: string[],           // team-wide permission grants — same caveat as users.permissions
+  department: 'sales' | 'backend', // NEW (Phase 6) — no field on a doc means 'sales' (all pre-Phase-6
+                                    // teams). Set via Add/Edit Team modal.
+  assignmentMode: 'auto' | 'manual' // NEW (Phase 6) — only meaningful when department === 'backend';
+                                    // absent/unused on sales teams. Drives future submission-item
+                                    // auto-assignment (Phase 7) — not consumed by any code yet.
 }
 ```
 
@@ -186,6 +205,57 @@ Dropped as confirmed-dead code during the split (verified via grep for call site
   tool yet — deliberately deferred, per spec, until duplicate volume is visible in practice.
 - Blocking prerequisite for the backend-department/submissions/reports/document-expiry work —
   see `PHASE5_SPEC_AND_HANDOFF.md`.
+
+### `submissions` (Phase 7) — agent → backend handoff
+```
+{
+  leadId, companyId,
+  agentId, agentName,
+  teamId, tlId,                     // sales team/TL credit, snapshotted at submit time
+  items: [
+    {
+      itemId, productId, productName, category, subType,  // productName/category/subType are
+                                     // SNAPSHOTS — a later catalog change must not rewrite history
+      dealValue,
+      stage: 'Account Creation' | 'Financial Approval' | 'Activity' | 'Work Order' | 'Activated',
+      activityRef: null|string, workOrderRef: null|string,   // required before advancing past
+                                     // Activity/Work Order — not yet enforced (Phase 8, stage
+                                     // advancement UI doesn't exist yet)
+      blocked: null | 'needsCorrection' | 'rejected', pausedAtStage: null|stageName, correctionNote,
+      stageHistory: [ { ts, actorId, actorName, stage, note } ],
+      assignedBackendAgent: userId|null, activatedAt: null|timestamp
+    }
+  ],
+  requiredDocs: [ docType, ... ],   // MANDATORY_DOC_TYPES + any per-product requiredDocuments,
+                                     // computed at submit time and stored (not re-derived later)
+  files: [ { docType, name, storagePath, uploadedAt, uploadedBy, size, type } ],
+  submittedAt, submittedBy, createdAt, lastEditedBy, lastEditedAt
+}
+```
+- `SUBMISSION_STAGES` and `MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)']`
+  live in `js/state.js`. Per-product extras (`products.requiredDocuments: [{docType,label}]`) are
+  empty/TBD until Ashok defines them — `computeRequiredDocs()` already reads the field, so no
+  code change is needed when he does.
+- Every item starts at `Financial Approval` instead of `Account Creation` when
+  `companies.hasDuAccount === true` at submit time.
+- **Assignment (v1, `js/submissions.js` pickBackendAgent):** candidates are backend-department
+  agents in the team who are `available !== false` and either have no `specialties` (generalist)
+  or list the item's category. Zero matches → `assignedBackendAgent: null` (shared queue). One
+  match → assigned directly. Multiple matches → simple rotation via `teams.assignmentCursor`
+  (incremented per auto-assignment, not a load-balancer — see spec section 1). Manual-mode teams
+  leave every item unassigned for the TL to assign by hand (that UI is Phase 8).
+- **v1 simplification, not yet in the spec's own words:** assignment only considers the first
+  team with `department:'backend'` found in `teams` — multi-backend-team routing isn't designed
+  yet. If no backend team exists, every item is simply left unassigned.
+- **Submit to Backend UI** (`js/leads.js` showSubmitModal) appears on a Closed lead with a
+  `companyId`, for the assigned agent or manager, once no submission already exists for that
+  lead (1 lead → at most 1 submission, v1 assumption). Gates the Submit button until every
+  `requiredDocs` entry has a tagged uploaded file and at least one product line item is added.
+- Files upload directly to Firebase Storage (`js/state.js` exports `storage`/`ref`/`uploadBytes`)
+  under `submissions/{submissionId}/{timestamp}_{filename}` — only `storagePath` is stored, no
+  download URL (nothing needs to display/download a file yet; that's Phase 8).
+- **No backend-side queue view, stage advancement, or correction loop yet** — this is Phase 8.
+  Right now a submission can be created and assigned but nothing reads it back.
 
 ---
 
@@ -313,23 +383,26 @@ Helper: `calculateTLTarget(tlId, users)` — pure function, sums `monthlyTarget`
 
 ## Firestore Security Rules
 
-All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, six collections:
+All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, seven collections:
 
 | Collection | Read | Write |
 |---|---|---|
 | `users` | Any auth | Self or manager (create/update); manager-only (delete) |
-| `teams` | Any auth | Manager only |
+| `teams` | Any auth | Manager only, **plus** any auth may update ONLY the `assignmentCursor` field (`affectedKeys().hasOnly(['assignmentCursor'])`) — needed so an agent's own submission-create call can advance the rotation cursor without being manager |
 | `companies` | Any auth | Create: any auth, must set `createdBy == request.auth.uid` (same pattern as `leads`/`scripts`); update/delete: manager only |
 | `leads` | Any auth | Manager unrestricted; TL within own `teamId` for general edits, blocked from `ownerLocked`/`createdBy`/`createdByRole`/`teamId`; **`tlId` reassignment additionally gated** — a TL may only change `tlId` if the lead is currently unowned or already theirs, and the result must land back in their own sub-group; Agent own assigned leads, blocked from admin fields; delete guards on `ownerLocked` |
 | `channels` | Any auth | Create: any auth (seed guard); update/delete: manager only |
 | `scripts` | Any auth | Manager unrestricted; TL own scripts direct, manager scripts suggest-only via `pendingApproval` (`affectedKeys().hasOnly(['pendingApproval'])`) |
 | `products` | Any auth | Manager only |
+| `submissions` (Phase 7) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId`/`submittedBy` to self; update: manager or backend-department (broad for now — Phase 8's actual stage-advancement UI will narrow this once the real update shape is known) |
 
 **Key implementation notes:**
 - `role()` helper does a `get()` on `users/{auth.uid}` — cached within a single rule evaluation, so calling it multiple times across helper functions doesn't multiply read cost.
 - `deleteRequest` field is intentionally **not** in the TL update rule's blocked-fields list — a TL writing a delete request, or a manager clearing one, needs no rule changes beyond what already exists.
 - `companyId` needed no new `leads` rule — it's not an admin-locked field.
 - The `companies` rule was handed to Ashok as a full-file paste-in for the Firebase Console (rules aren't version-controlled in this repo — Console is the source of truth) — confirm it's been published before relying on non-manager company creation working in production.
+- **Caught during Phase 7 rule review:** `createSubmission()` writes `teams.assignmentCursor` as part of the submitting agent's own batch — the existing manager-only `teams` write rule would have silently failed that update for any non-manager agent. Fixed by adding a narrowly-scoped `affectedKeys().hasOnly(['assignmentCursor'])` exception, the same pattern already used for `scripts.pendingApproval`.
+- **Storage rules (separate ruleset, Storage → Rules in Firebase Console):** write is allowed for any authenticated user restricted to PDF/image content-type and a 10MB cap — not gated on the submission doc's existence, because files upload *before* the Firestore submission doc is written (see `createSubmission()`). Read is gated via `firestore.get()` cross-service calls against the submission doc (manager/submitting agent/their TL/backend department) — **not yet exercised by any UI** (no file-viewing screen exists until Phase 8), so treat the read rule as best-effort until then.
 
 ---
 
@@ -386,6 +459,37 @@ Role-scoped lead queries, "Mine" badge, assignment enforcement, `teamId`/`histor
 - **Companies collection** — `js/companies.js` (normalize/dedup/fuzzy-match/find-or-create/backfill), manager-only Companies card + Backfill button in the Org tab, and a searchable company picker (with inline "did you mean X?" fuzzy nudge) in the Add Lead modal. Verified live: backfill turned 115 seeded leads into 113 unique company docs with zero console errors.
 - **Permission-grant scaffolding** — `js/permissions.js` catalog + `hasPermission()` + searchable checklist UI in Edit Team/Edit User. `edit_companies` defined but not yet wired to a rule or non-manager UI (see Permission-Grant System section above) — deliberately shipped as reusable infrastructure ahead of its first real consumer.
 - **Next up:** backend-department/submissions workflow (`teams.department`, `users.department`, `submissions` collection — gated on the companies phase being confirmed solid in production, per Ashok's explicit hold) and reports (pending a business definition of "projection")
+
+### Phase 6 — Backend department foundation
+- `teams.department` (Sales/Backend) + `teams.assignmentMode` (Auto/Manual, backend teams only) —
+  Add/Edit Team modal fields. Changing a team's department cascades to every member's
+  `users.department` in the same batch write, so the denormalized field can't go stale.
+- `users.department` denormalized from the assigned team (null if unassigned or manager) +
+  `specialties`/`available` fields for backend-department agents specifically (Add/Edit User
+  modals show a Specialties checklist + Available toggle only when the selected team's
+  department is `backend` and the role is `agent`).
+- **No Firestore rule changes needed for this phase** — `teams`/`users` writes were already
+  manager-unrestricted, so these are just new fields on docs the manager already controls.
+- Verified live: created/edited/deleted a real Backend team and backend agent (specialties +
+  availability round-tripped correctly), zero console errors. Committed locally (1da7e34).
+
+### Phase 7 (in progress) — Submission creation
+- New `submissions` collection (`js/submissions.js` + Submit to Backend modal in `js/leads.js`) —
+  see the Data Model section above for the full schema.
+- Multi-product line items (product + pricing option → dealValue, editable), file upload tagged
+  with a docType, submit blocked until every computed `requiredDocs` entry has a file and at
+  least one item is added.
+- v1 auto-assignment (`pickBackendAgent`): available + specialty-matching (or generalist) backend
+  agents, simple rotation via `teams.assignmentCursor` when multiple candidates match. Manual-mode
+  teams and zero-match cases leave the item unassigned for later manual triage.
+- **Rule work resumed here** (Firestore `submissions` rule + Storage rules for file access) — see
+  the Firestore Security Rules section. Caught and fixed one real bug during review: the
+  submission-create batch also updates `teams.assignmentCursor`, which the existing manager-only
+  `teams` write rule would have silently blocked for a non-manager agent.
+- **Not built yet (Phase 8):** backend queue view, per-item stage advancement, the
+  needsCorrection/rejected correction loop, and anything that reads files back out of Storage.
+- **Next up:** Phase 8 — backend stage pipeline (queue view, Account Creation → Financial
+  Approval → Activity → Work Order → Activated, correction loop).
 
 ---
 
