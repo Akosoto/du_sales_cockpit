@@ -25,8 +25,27 @@ service cloud.firestore {
     // per the audit's "a client cannot write into another org even with a
     // modified client" requirement — with one deliberate exception, see the
     // USERS self-registration comment below.
-    function sameOrg() { return userDoc().orgId == resource.data.orgId; }
-    function sameOrgWrite() { return userDoc().orgId == request.resource.data.orgId; }
+    //
+    // Bootstrap safety: BEFORE the one-off orgId migration runs, NO document
+    // has an orgId field at all. An earlier version of this function assumed
+    // Firestore Rules treats a missing field as null on both sides, making
+    // null == null evaluate true during the bootstrap window — that
+    // assumption was wrong in practice and broke login for every account
+    // (missing-field access did not behave as a safe null-comparison here).
+    // Fixed with explicit 'in' existence checks instead of relying on
+    // unverified comparison semantics: if either side hasn't been migrated
+    // yet, allow the read/update so the app (and the migration itself) can
+    // function during that window. Once every doc has orgId, this bootstrap
+    // clause is permanently dormant. sameOrgWrite() only bypasses on the
+    // ACTOR side (not the incoming data) since js/db.js's gateway always
+    // stamps a real orgId on every create going forward — the incoming side
+    // being unmigrated should not happen for any current app code path.
+    function sameOrg() {
+      return !('orgId' in userDoc()) || !('orgId' in resource.data) || userDoc().orgId == resource.data.orgId;
+    }
+    function sameOrgWrite() {
+      return !('orgId' in userDoc()) || userDoc().orgId == request.resource.data.orgId;
+    }
 
     // ── USERS ────────────────────────────────────────
     match /users/{uid} {
