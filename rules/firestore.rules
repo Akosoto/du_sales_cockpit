@@ -4,34 +4,59 @@ service cloud.firestore {
 
     // ── HELPERS ──────────────────────────────────────
     function isAuth() { return request.auth != null; }
-    function role() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function role() { return userDoc().role; }
     // Audit item 15: deactivated backend staff must lose access even though
     // soft-remove doesn't clear department (only teamId/tlId) — org.js's
     // remove flow now also clears department, but this checks active as a
     // second guard so a rules change alone is enough even if that ever drifts.
     // Single get() reused for both checks — no extra read over the old form.
     function isActiveBackend() {
-      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      let u = userDoc();
       return u.department == 'backend' && u.active != false;
     }
 
+    // ── MULTI-TENANCY (ARCHITECTURE.md Section 3) ─────
+    // sameOrg(): for read/update/delete — compares the actor's orgId to the
+    // EXISTING document's orgId (resource.data). sameOrgWrite(): for create
+    // — compares the actor's orgId to the INCOMING document's orgId
+    // (request.resource.data), since resource.data doesn't exist yet on a
+    // create. Every collection below requires one of these on every clause,
+    // per the audit's "a client cannot write into another org even with a
+    // modified client" requirement — with one deliberate exception, see the
+    // USERS self-registration comment below.
+    function sameOrg() { return userDoc().orgId == resource.data.orgId; }
+    function sameOrgWrite() { return userDoc().orgId == request.resource.data.orgId; }
+
     // ── USERS ────────────────────────────────────────
     match /users/{uid} {
-      allow read: if isAuth();
-      allow create: if isAuth() && (request.auth.uid == uid || role() == 'manager');
-      allow update: if isAuth() && (request.auth.uid == uid || role() == 'manager');
-      allow delete: if isAuth() && role() == 'manager';
+      allow read: if isAuth() && sameOrg();
+      allow create: if isAuth() && (
+        // Self-registration bootstrap (first-ever login, ensureProfile() in
+        // auth.js): deliberately NOT gated on sameOrgWrite() — userDoc()'s
+        // get() would fail since the caller's own doc doesn't exist yet to
+        // read an orgId from. Trusted because self-registration is closed
+        // to the hardcoded SEED_EMAILS in state.js, not open signup — every
+        // self-registering user gets their orgId from the same config.js
+        // as everyone else in this single-tenant deployment.
+        request.auth.uid == uid ||
+        (role() == 'manager' && sameOrgWrite())
+      );
+      allow update: if isAuth() && (request.auth.uid == uid || role() == 'manager') && sameOrg();
+      allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
     // ── TEAMS ────────────────────────────────────────
     match /teams/{t} {
-      allow read: if isAuth();
-      allow write: if isAuth() && role() == 'manager';
+      allow read: if isAuth() && sameOrg();
+      allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
       // Narrow exception: any authenticated user may update ONLY the
       // assignmentCursor field — needed because createSubmission() advances
       // the backend team's rotation cursor as part of the submitting agent's
       // own batch write, and that agent is not necessarily a manager.
-      allow update: if isAuth() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['assignmentCursor']);
+      allow update: if isAuth() && sameOrg()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['assignmentCursor']);
     }
 
     // ── COMPANIES ────────────────────────────────────
@@ -44,28 +69,28 @@ service cloud.firestore {
     // hasPermission() grant system once that lands (separate, not-yet-built
     // phase).
     match /companies/{c} {
-      allow read: if isAuth();
-      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid;
-      allow update, delete: if isAuth() && role() == 'manager';
+      allow read: if isAuth() && sameOrg();
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid && sameOrgWrite();
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
     // ── LEADS ────────────────────────────────────────
     match /leads/{l} {
-      allow read: if isAuth();
+      allow read: if isAuth() && sameOrg();
 
-      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid;
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid && sameOrgWrite();
 
       // Manager: unrestricted
-      allow update, delete: if isAuth() && role() == 'manager';
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
 
       // Agent: update leads assigned to them, cannot touch ownership/admin fields
-      allow update: if isAuth() && role() == 'agent'
+      allow update: if isAuth() && role() == 'agent' && sameOrg()
         && resource.data.assignedTo == request.auth.uid
         && !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['assignedTo','assignedBy','ownerLocked','createdBy','createdByRole','teamId']);
 
       // Agent: delete only leads they personally created, and only if not manager-locked
-      allow delete: if isAuth() && role() == 'agent'
+      allow delete: if isAuth() && role() == 'agent' && sameOrg()
         && resource.data.createdBy == request.auth.uid
         && resource.data.ownerLocked != true;
 
@@ -75,8 +100,8 @@ service cloud.firestore {
       // the lead), the lead must currently be unowned or already theirs, and
       // must land back in their own sub-group. This closes the gap where one
       // TL could reassign a lead into or out of another TL's sub-group.
-      allow update: if isAuth() && role() == 'team_lead'
-        && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId
+      allow update: if isAuth() && role() == 'team_lead' && sameOrg()
+        && resource.data.teamId == userDoc().teamId
         && !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['ownerLocked','createdBy','createdByRole','teamId'])
         && (
@@ -89,39 +114,39 @@ service cloud.firestore {
 
       // Team lead: delete non-locked leads within their team (team-wide, per spec —
       // unchanged; delete was never reported as needing sub-group restriction)
-      allow delete: if isAuth() && role() == 'team_lead'
-        && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId
+      allow delete: if isAuth() && role() == 'team_lead' && sameOrg()
+        && resource.data.teamId == userDoc().teamId
         && resource.data.ownerLocked != true;
     }
 
     // ── CHANNELS ─────────────────────────────────────
     match /channels/{c} {
-      allow read: if isAuth();
-      allow create: if isAuth();
-      allow update, delete: if isAuth() && role() == 'manager';
+      allow read: if isAuth() && sameOrg();
+      allow create: if isAuth() && sameOrgWrite();
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
     // ── SCRIPTS ──────────────────────────────────────
     match /scripts/{s} {
-      allow read: if isAuth();
+      allow read: if isAuth() && sameOrg();
 
-      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid && (
+      allow create: if isAuth() && request.resource.data.createdBy == request.auth.uid && sameOrgWrite() && (
         role() == 'manager' ||
         (role() == 'team_lead' && request.resource.data.scope == 'team')
       );
 
-      allow update, delete: if isAuth() && role() == 'manager';
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
 
-      allow update, delete: if isAuth() && role() == 'team_lead'
+      allow update, delete: if isAuth() && role() == 'team_lead' && sameOrg()
         && resource.data.createdBy == request.auth.uid;
 
-      allow update: if isAuth() && role() == 'team_lead'
+      allow update: if isAuth() && role() == 'team_lead' && sameOrg()
         && resource.data.createdBy != request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingApproval'])
         && request.resource.data.pendingApproval != null
         && request.resource.data.pendingApproval.submittedBy == request.auth.uid;
 
-      allow update: if isAuth() && role() == 'team_lead'
+      allow update: if isAuth() && role() == 'team_lead' && sameOrg()
         && resource.data.pendingApproval != null
         && resource.data.pendingApproval.submittedBy == request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingApproval'])
@@ -130,8 +155,9 @@ service cloud.firestore {
 
     // ── PRODUCTS ─────────────────────────────────────
     match /products/{p} {
-      allow read: if isAuth();
-      allow write: if isAuth() && role() == 'manager';
+      allow read: if isAuth() && sameOrg();
+      allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
+      allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
     // ── SUBMISSIONS ──────────────────────────────────
@@ -143,14 +169,14 @@ service cloud.firestore {
       // (and the ID-document paths within them) — violates
       // PHASE5_SPEC_AND_HANDOFF.md §5 (agent, their TL, backend, manager
       // ONLY). Now requires role()=='team_lead' too.
-      allow read: if isAuth() && (
+      allow read: if isAuth() && sameOrg() && (
         role() == 'manager' ||
         resource.data.agentId == request.auth.uid ||
-        (role() == 'team_lead' && resource.data.teamId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId) ||
+        (role() == 'team_lead' && resource.data.teamId == userDoc().teamId) ||
         isActiveBackend()
       );
 
-      allow create: if isAuth()
+      allow create: if isAuth() && sameOrgWrite()
         && request.resource.data.agentId == request.auth.uid
         && request.resource.data.submittedBy == request.auth.uid;
 
@@ -159,7 +185,7 @@ service cloud.firestore {
       // shape is known. (Audit item 16 — the agent correction-loop update
       // rule — is intentionally NOT added yet; designed together with the
       // Phase B correction UI, not now.)
-      allow update: if isAuth() && (
+      allow update: if isAuth() && sameOrg() && (
         role() == 'manager' ||
         isActiveBackend()
       );
