@@ -28,12 +28,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Write config.js from repository secret
+        env:
+          CONFIG_JS: ${{ secrets.CONFIG_JS }}
         run: |
-          if [ -z "${{ secrets.CONFIG_JS }}" ]; then
+          if [ -z "$CONFIG_JS" ]; then
             echo "::error::CONFIG_JS repository secret is not set — see config.example.js for the template to paste as the secret's value."
             exit 1
           fi
-          printf '%s\n' "${{ secrets.CONFIG_JS }}" > config.js
+          printf '%s\n' "$CONFIG_JS" > config.js
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
