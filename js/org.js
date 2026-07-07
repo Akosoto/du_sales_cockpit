@@ -764,12 +764,21 @@ async function runCompanyBackfill(leadsToFix){
 // One-off orgId stamping migration (ARCHITECTURE.md Phase A step 3). Every
 // new doc gets orgId automatically now (js/db.js), but existing docs
 // predate that — this backfills them across every collection so the
-// upcoming sameOrg() rule (published separately, once this migration has
-// run) doesn't lock managers/agents out of their own pre-existing data.
-// skipAudit:true throughout — this is a pure schema backfill, not a real
-// edit, so it must not clobber lastEditedBy/lastEditedAt on documents
+// sameOrg() rule doesn't lock managers/agents out of their own pre-existing
+// data. skipAudit:true throughout — this is a pure schema backfill, not a
+// real edit, so it must not clobber lastEditedBy/lastEditedAt on documents
 // nobody actually touched.
-const ORGID_MIGRATION_COLLECTIONS = ['users','teams','leads','companies','channels','scripts','products','submissions'];
+//
+// 'users' MUST be migrated LAST, not first. sameOrg() compares the acting
+// manager's own orgId (via userDoc()) to each target doc's orgId. Before
+// this migration runs, NOTHING has orgId, so every comparison is
+// null == null -> true. But if 'users' were migrated first, the manager's
+// own doc would get orgId stamped immediately — and every subsequent
+// collection's check would then become "shauntech" == null -> false,
+// silently locking the migration out of everything after 'users'. Doing
+// 'users' last keeps the acting manager's own orgId null (consistent with
+// whatever's still unmigrated) until nothing else is left to stamp.
+const ORGID_MIGRATION_COLLECTIONS = ['teams','leads','companies','channels','scripts','products','submissions','users'];
 
 async function runOrgIdMigration(){
   const btn = document.getElementById('btn-orgid-migration');
