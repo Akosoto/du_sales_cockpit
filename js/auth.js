@@ -2,8 +2,9 @@ import {
   auth, db, CU, CP, SEED_EMAILS, setUser,
   signInWithEmailAndPassword, signOut, onAuthStateChanged,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider,
-  doc, getDoc, setDoc
+  doc, getDoc
 } from './state.js';
+import { dbSet } from './db.js';
 import { v, now, toast, modal, closeModal } from './helpers.js';
 import { renderNav, switchTab } from './main.js';
 
@@ -68,8 +69,7 @@ document.getElementById('li-pw-eye').onclick = function(){
 // ENSURE FIRESTORE USER PROFILE ON FIRST LOGIN
 // ════════════════════════════════════════════════════
 async function ensureProfile(fbUser){
-  const ref  = doc(db, 'users', fbUser.uid);
-  const snap = await getDoc(ref);
+  const snap = await getDoc(doc(db, 'users', fbUser.uid));
   if(snap.exists()) return { id: fbUser.uid, ...snap.data() };
 
   const seed = SEED_EMAILS[(fbUser.email||'').toLowerCase()];
@@ -80,7 +80,10 @@ async function ensureProfile(fbUser){
     teamId: null, monthlyTarget: 0, targetSource: 'manager',
     active: true, createdBy: 'system', createdAt: now()
   };
-  await setDoc(ref, data);
+  // skipAudit: this is a brand-new user's first-ever login — CU/CP are still
+  // null at this point (setUser() runs AFTER ensureProfile() returns), so
+  // db.js's default audit stamping (reads CU.uid/CP.name) would throw here.
+  await dbSet('users', fbUser.uid, data, {skipAudit:true});
   return { id: fbUser.uid, ...data };
 }
 
