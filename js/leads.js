@@ -1,8 +1,9 @@
 import {
   db, CU, CP, STAGES, MANDATORY_DOC_TYPES,
-  doc, getDoc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch
+  doc, getDoc,
+  collection, query, where, getDocs
 } from './state.js';
+import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
 import { fetchCompanies, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import { computeRequiredDocs, createSubmission } from './submissions.js';
@@ -143,13 +144,12 @@ export async function renderPipelineTab(){
       try {
         const CHUNK = 400;
         for(let i=0;i<ids.length;i+=CHUNK){
-          const bat = writeBatch(db);
+          const bat = newBatch();
           ids.slice(i,i+CHUNK).forEach(id=>{
             const lead = leads.find(l=>l.id===id); if(!lead) return;
-            bat.update(doc(db,'leads',id), {
+            batchUpdate(bat, 'leads', id, {
               assignedTo: targetId,
               teamId: target.teamId||'', tlId: target.tlId||'',
-              lastEditedBy: CP.name, lastEditedAt: now(),
               history: [...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Assigned: ${byId[lead.assignedTo]?.name||'—'} → ${target.name} (bulk)` }]
             });
           });
@@ -225,13 +225,13 @@ export async function renderPipelineTab(){
   document.querySelectorAll('[data-approve-del]').forEach(b=>b.addEventListener('click',()=>{
     const l = leads.find(x=>x.id===b.dataset.approveDel); if(!l) return;
     confirmModal(`Approve deletion for ${esc(l.company)}?`, 'This cannot be undone.', async () => {
-      await deleteDoc(doc(db,'leads',l.id));
+      await dbDelete('leads', l.id);
       toast('Lead deleted.','info'); renderPipelineTab();
     });
   }));
   document.querySelectorAll('[data-reject-del]').forEach(b=>b.addEventListener('click', async () => {
     const l = leads.find(x=>x.id===b.dataset.rejectDel); if(!l) return;
-    await updateDoc(doc(db,'leads',l.id), {
+    await dbUpdate('leads', l.id, {
       deleteRequest:null,
       history:[...(l.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request rejected' }]
     });
@@ -327,7 +327,6 @@ export async function showLeadModal(lead, byId, agents){
       const update = {
         stage, followup:fu, notes, dealValue:Number(dv),
         assignedTo:newAssignTo,
-        lastEditedBy:CP.name, lastEditedAt:now(),
         history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:changeSummary }]
       };
 
@@ -338,7 +337,7 @@ export async function showLeadModal(lead, byId, agents){
         update.tlId   = aSnap.exists() ? (aSnap.data().tlId  ||'') : '';
       }
 
-      await updateDoc(doc(db,'leads',lead.id), update);
+      await dbUpdate('leads', lead.id, update);
       closeModal(); toast('Lead saved.'); renderPipelineTab();
     } catch(e){ document.getElementById('lm-err').textContent=e.message; enable('lm-save','Save Changes'); }
   };
@@ -354,7 +353,7 @@ export async function showLeadModal(lead, byId, agents){
     confirmModal(`Delete lead for ${esc(lead.company)}?`,
       'This cannot be undone.',
       async () => {
-        await deleteDoc(doc(db,'leads',lead.id));
+        await dbDelete('leads', lead.id);
         closeModal(); toast('Lead deleted.','info'); renderPipelineTab();
       });
   });
@@ -363,7 +362,7 @@ export async function showLeadModal(lead, byId, agents){
     confirmModal(`Request deletion for ${esc(lead.company)}?`,
       'This lead was created by your manager. A deletion request will be sent for approval — the lead stays active until approved.',
       async () => {
-        await updateDoc(doc(db,'leads',lead.id), {
+        await dbUpdate('leads', lead.id, {
           deleteRequest: { requestedBy:CU.uid, requestedByName:CP.name, requestedAt:now() },
           history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion requested — pending manager approval' }]
         });
@@ -372,7 +371,7 @@ export async function showLeadModal(lead, byId, agents){
   });
 
   document.getElementById('lm-withdraw-del')?.addEventListener('click', async () => {
-    await updateDoc(doc(db,'leads',lead.id), {
+    await dbUpdate('leads', lead.id, {
       deleteRequest:null,
       history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request withdrawn' }]
     });
@@ -383,13 +382,13 @@ export async function showLeadModal(lead, byId, agents){
     confirmModal(`Approve deletion for ${esc(lead.company)}?`,
       'This cannot be undone.',
       async () => {
-        await deleteDoc(doc(db,'leads',lead.id));
+        await dbDelete('leads', lead.id);
         closeModal(); toast('Lead deleted.','info'); renderPipelineTab();
       });
   });
 
   document.getElementById('lm-reject-del')?.addEventListener('click', async () => {
-    await updateDoc(doc(db,'leads',lead.id), {
+    await dbUpdate('leads', lead.id, {
       deleteRequest:null,
       history:[...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request rejected' }]
     });
@@ -512,15 +511,14 @@ function showAddLeadModal(agents, byId, companies){
         const aSnap = await getDoc(doc(db,'users',assignTo));
         if(aSnap.exists()){ leadTeamId = aSnap.data().teamId||''; leadTlId = aSnap.data().tlId||''; }
       }
-      await addDoc(collection(db,'leads'),{
+      await dbAdd('leads', {
         company:co, companyId, contact:v('nl-ct'), phone:v('nl-ph'), email:v('nl-em'),
         industry:v('nl-ind'), city:v('nl-cy'), stage:v('nl-st')||'New',
         assignedTo:assignTo, assignedBy:CU.uid,
         teamId:leadTeamId, tlId:leadTlId,
-        createdBy:CU.uid, createdByRole:CP.role,
+        createdByRole:CP.role,
         ownerLocked: CP.role==='manager',
         dealValue:0, notes:'', followup:'',
-        lastEditedBy:CP.name, lastEditedAt:now(),
         history:[{ ts:now(), actorId:CU.uid, actorName:CP.name, change:'Lead created' }]
       });
       closeModal(); toast('Lead added.'); renderPipelineTab();
