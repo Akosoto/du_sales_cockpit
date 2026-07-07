@@ -1,5 +1,5 @@
-import { db, CU, CP, doc, addDoc, getDocs, collection, writeBatch } from './state.js';
-import { now } from './helpers.js';
+import { db, doc, getDocs, collection } from './state.js';
+import { dbAdd, newBatch, batchSet, batchUpdate } from './db.js';
 
 // ════════════════════════════════════════════════════
 // COMPANIES — shared logic
@@ -63,14 +63,12 @@ export async function findOrCreateCompany(name, extra = {}, knownCompanies = nul
   const existing = companies.find(c => c.normalizedName === norm);
   if(existing) return existing.id;
 
-  const ref = await addDoc(collection(db,'companies'), {
+  const ref = await dbAdd('companies', {
     name: name.trim(),
     normalizedName: norm,
     industry: extra.industry||'', city: extra.city||'',
     hasDuAccount: false,
-    createdBy: CU.uid, createdAt: now(),
-    mergedInto: null,
-    lastEditedBy: CP.name, lastEditedAt: now()
+    mergedInto: null
   });
   return ref.id;
 }
@@ -103,27 +101,26 @@ export async function backfillCompanies(leadsToFix){
 
   const allOps = [];
   newCompanyDocs.forEach(({ref,norm,sample}) => {
-    allOps.push({ kind:'set', ref, data:{
+    allOps.push({ kind:'set', collectionName:'companies', id:ref.id, data:{
       name: sample.company, normalizedName: norm,
       industry: sample.industry||'', city: sample.city||'',
-      hasDuAccount:false, createdBy:CU.uid, createdAt:now(),
-      mergedInto:null, lastEditedBy:CP.name, lastEditedAt:now()
+      hasDuAccount:false, mergedInto:null
     }});
   });
   let leadsUpdated = 0;
   leadsToFix.forEach(l => {
     const norm = normalizeCompanyName(l.company);
     if(!norm) return;
-    allOps.push({ kind:'update', ref: doc(db,'leads',l.id), data:{ companyId: byNorm[norm] } });
+    allOps.push({ kind:'update', collectionName:'leads', id:l.id, data:{ companyId: byNorm[norm] } });
     leadsUpdated++;
   });
 
   const CHUNK = 400;
   for(let i=0;i<allOps.length;i+=CHUNK){
-    const bat = writeBatch(db);
+    const bat = newBatch();
     allOps.slice(i,i+CHUNK).forEach(op => {
-      if(op.kind==='set') bat.set(op.ref, op.data);
-      else bat.update(op.ref, op.data);
+      if(op.kind==='set') batchSet(bat, op.collectionName, op.id, op.data);
+      else batchUpdate(bat, op.collectionName, op.id, op.data);
     });
     await bat.commit();
   }
