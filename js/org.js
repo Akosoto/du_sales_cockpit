@@ -8,6 +8,7 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
 import { PRODUCT_CATEGORIES } from './products.js';
+import { orgId } from '../config.js';
 
 // NOTE: this file used to carry 115 hardcoded prospect leads (real names,
 // business emails, phone numbers) plus a one-time seedLeads() import
@@ -45,6 +46,12 @@ export async function renderOrgTab(){
   const companyById = {}; companies.forEach(c=>companyById[c.id]=c);
   const companyLeadCount = {};
   allLeads.forEach(l => { if(l.companyId) companyLeadCount[l.companyId] = (companyLeadCount[l.companyId]||0)+1; });
+  // orgId migration (ARCHITECTURE.md Phase A step 3) — every new doc gets
+  // orgId stamped automatically now (js/db.js), but existing docs predate
+  // that. Checked from data already fetched here (no extra reads) as a
+  // proxy signal — the actual migration below covers all 8 collections
+  // regardless of which ones triggered this banner.
+  const needsOrgIdMigration = teams.some(t=>!t.orgId) || users.some(u=>!u.orgId) || allLeads.some(l=>!l.orgId) || companies.some(c=>!c.orgId);
 
   function perfStats(uids){
     const l = allLeads.filter(x=>uids.includes(x.assignedTo));
@@ -84,6 +91,11 @@ export async function renderOrgTab(){
     ${needsCompanyBackfill.length ? `<div class="seed-banner">
       <p><strong>${needsCompanyBackfill.length} lead${needsCompanyBackfill.length!==1?'s':''}</strong> ${needsCompanyBackfill.length!==1?'predate':'predates'} the Companies collection and ${needsCompanyBackfill.length!==1?'have':'has'} no linked company record. This groups them by matching company name, creates one company per unique name, and links each lead — safe to re-run.</p>
       <button class="btn btn-primary btn-sm" id="btn-backfill-companies">🏢 Backfill Companies (${needsCompanyBackfill.length})</button>
+    </div>` : ''}
+
+    ${needsOrgIdMigration ? `<div class="seed-banner">
+      <p>Some existing records predate multi-tenant support and are missing an <strong>orgId</strong> tag. This stamps <code>orgId: "${esc(orgId)}"</code> on every existing document across users, teams, leads, companies, channels, scripts, products, and submissions — safe to re-run, and required before the Firestore rules can enforce org isolation.</p>
+      <button class="btn btn-primary btn-sm" id="btn-orgid-migration">🏷️ Stamp orgId on Existing Data</button>
     </div>` : ''}
 
     <div class="stats-row">
@@ -250,6 +262,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-add-ag')?.addEventListener('click',   () => showAddUserModal('agent', teams, users));
   ct.querySelector('#btn-repair')?.addEventListener('click',   () => repairLeadTeamData(needsRepair, byId));
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
+  ct.querySelector('#btn-orgid-migration')?.addEventListener('click', () => runOrgIdMigration());
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
@@ -745,6 +758,42 @@ async function runCompanyBackfill(leadsToFix){
   } catch(e){
     toast('Error: '+e.message,'err');
     if(btn){ btn.disabled=false; btn.textContent='🏢 Backfill Companies'; }
+  }
+}
+
+// One-off orgId stamping migration (ARCHITECTURE.md Phase A step 3). Every
+// new doc gets orgId automatically now (js/db.js), but existing docs
+// predate that — this backfills them across every collection so the
+// upcoming sameOrg() rule (published separately, once this migration has
+// run) doesn't lock managers/agents out of their own pre-existing data.
+// skipAudit:true throughout — this is a pure schema backfill, not a real
+// edit, so it must not clobber lastEditedBy/lastEditedAt on documents
+// nobody actually touched.
+const ORGID_MIGRATION_COLLECTIONS = ['users','teams','leads','companies','channels','scripts','products','submissions'];
+
+async function runOrgIdMigration(){
+  const btn = document.getElementById('btn-orgid-migration');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Stamping…'; }
+  try {
+    let stamped = 0;
+    for(const collectionName of ORGID_MIGRATION_COLLECTIONS){
+      const snap = await getDocs(collection(db, collectionName));
+      const missing = snap.docs.filter(d => d.data().orgId !== orgId);
+      const CHUNK = 400;
+      for(let i=0;i<missing.length;i+=CHUNK){
+        const bat = newBatch();
+        missing.slice(i,i+CHUNK).forEach(d => {
+          batchUpdate(bat, collectionName, d.id, {orgId}, {skipAudit:true});
+          stamped++;
+        });
+        await bat.commit();
+      }
+    }
+    toast(`✅ Stamped orgId on ${stamped} document${stamped!==1?'s':''}.`);
+    renderOrgTab();
+  } catch(e){
+    toast('Error: '+e.message,'err');
+    if(btn){ btn.disabled=false; btn.textContent='🏷️ Stamp orgId on Existing Data'; }
   }
 }
 
