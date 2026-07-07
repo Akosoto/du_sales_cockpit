@@ -1,8 +1,9 @@
 import {
   db, CU, CP, storage, MANDATORY_DOC_TYPES,
-  doc, getDoc, collection, writeBatch,
+  doc, getDoc, collection,
   ref, uploadBytes
 } from './state.js';
+import { newBatch, batchSet, batchUpdate } from './db.js';
 import { now } from './helpers.js';
 
 // ════════════════════════════════════════════════════
@@ -82,19 +83,20 @@ export async function createSubmission({ lead, company, items, files, requiredDo
     });
   }
 
-  const bat = writeBatch(db);
-  bat.set(subRef, {
+  const bat = newBatch();
+  batchSet(bat, 'submissions', subRef.id, {
     leadId: lead.id, companyId: lead.companyId,
     agentId: CU.uid, agentName: CP.name,
     teamId: lead.teamId||'', tlId: lead.tlId||'',
     items: resolvedItems,
     requiredDocs,
     files: uploadedFiles,
-    submittedAt: now(), submittedBy: CU.uid,
-    createdAt: now(), lastEditedBy: CP.name, lastEditedAt: now()
+    submittedAt: now(), submittedBy: CU.uid
   });
   if(backendTeam && cursor !== (backendTeam.assignmentCursor||0)){
-    bat.update(doc(db,'teams',backendTeam.id), { assignmentCursor: cursor });
+    // skipAudit: bound by the Firestore rule's
+    // affectedKeys().hasOnly(['assignmentCursor']) restriction.
+    batchUpdate(bat, 'teams', backendTeam.id, { assignmentCursor: cursor }, {skipAudit:true});
   }
   await bat.commit();
   return subRef.id;
