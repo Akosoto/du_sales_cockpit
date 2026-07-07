@@ -1,9 +1,9 @@
 import {
   db, CU, CP, auth, auth2,
-  doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch,
+  collection, query, where, getDocs,
   createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from './state.js';
+import { dbAdd, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
@@ -259,13 +259,13 @@ export async function renderOrgTab(){
       'Members will become unassigned. Leads are not deleted.',
       async () => {
         const ms = await getDocs(query(collection(db,'users'), where('teamId','==',b.dataset.delTeam)));
-        const bat = writeBatch(db);
+        const bat = newBatch();
         ms.docs.forEach(d => {
           const fields = {teamId:null};
           if(d.data().role==='agent') fields.tlId = null;
-          bat.update(doc(db,'users',d.id), fields);
+          batchUpdate(bat, 'users', d.id, fields);
         });
-        bat.delete(doc(db,'teams',b.dataset.delTeam));
+        batchDelete(bat, 'teams', b.dataset.delTeam);
         await bat.commit();
         closeModal(); toast('Team deleted.','info'); renderOrgTab();
       });
@@ -294,20 +294,19 @@ export async function renderOrgTab(){
         // department cleared alongside teamId/tlId (ARCHITECTURE.md audit item
         // 15) — otherwise a deactivated backend agent keeps isActiveBackend()
         // rule access via a stale department field even after soft-removal.
-        await updateDoc(doc(db,'users',delId),{active:false,teamId:null,tlId:null,department:null,lastEditedBy:CP.name,lastEditedAt:now()});
+        await dbUpdate('users', delId, {active:false,teamId:null,tlId:null,department:null});
         if(u?.tlId){
           const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
           const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
-          await updateDoc(doc(db,'users',u.tlId),{autoTarget:newAuto});
+          await dbUpdate('users', u.tlId, {autoTarget:newAuto});
         }
         // Unassign their leads so they don't silently vanish from team pipeline views
         const orphSnap = await getDocs(query(collection(db,'leads'),where('assignedTo','==',delId)));
         if(!orphSnap.empty){
-          const bat2 = writeBatch(db);
+          const bat2 = newBatch();
           orphSnap.docs.forEach(ld => {
-            bat2.update(ld.ref, {
+            batchUpdate(bat2, 'leads', ld.id, {
               assignedTo:'', tlId:'',
-              lastEditedBy:CP.name, lastEditedAt:now(),
               history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u?.name||'member'} removed from team` }]
             });
           });
@@ -325,28 +324,27 @@ export async function renderOrgTab(){
       : 'This cannot be undone. Their leads will become unassigned. The login will stop working immediately.';
     confirmModal(`Permanently delete "${esc(u.name)}"?`, warnMsg, async () => {
       const delId = u.id;
-      const bat = writeBatch(db);
+      const bat = newBatch();
 
       if(isTL){
         const orphanedAgents = users.filter(x => x.role==='agent' && x.tlId===delId);
-        orphanedAgents.forEach(a => bat.update(doc(db,'users',a.id), {tlId:null}));
+        orphanedAgents.forEach(a => batchUpdate(bat, 'users', a.id, {tlId:null}));
         const tlLeadsSnap = await getDocs(query(collection(db,'leads'), where('tlId','==',delId)));
-        tlLeadsSnap.docs.forEach(ld => bat.update(ld.ref, {tlId:''}));
+        tlLeadsSnap.docs.forEach(ld => batchUpdate(bat, 'leads', ld.id, {tlId:''}));
       } else {
         if(u.tlId){
           const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
           const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
-          bat.update(doc(db,'users',u.tlId), {autoTarget:newAuto});
+          batchUpdate(bat, 'users', u.tlId, {autoTarget:newAuto});
         }
         const orphSnap = await getDocs(query(collection(db,'leads'), where('assignedTo','==',delId)));
-        orphSnap.docs.forEach(ld => bat.update(ld.ref, {
+        orphSnap.docs.forEach(ld => batchUpdate(bat, 'leads', ld.id, {
           assignedTo:'', tlId:'',
-          lastEditedBy:CP.name, lastEditedAt:now(),
           history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${esc(u.name)} deleted` }]
         }));
       }
 
-      bat.delete(doc(db,'users',delId));
+      batchDelete(bat, 'users', delId);
       await bat.commit();
       closeModal(); toast(`${isTL?'Team Lead':'Agent'} deleted.`,'info'); renderOrgTab();
     }, true);
@@ -379,10 +377,9 @@ function showAddTeamModal(teams, tls){
     if(!name){ err.textContent='Team name is required.'; return; }
     disable('at-btn','Creating…');
     try {
-      await addDoc(collection(db,'teams'),{
+      await dbAdd('teams', {
         name, teamLeadId:null, permissions:[], department:dept,
-        ...(dept==='backend' ? {assignmentMode: v('at-mode')||'manual'} : {}),
-        createdBy:CU.uid, createdAt:now()
+        ...(dept==='backend' ? {assignmentMode: v('at-mode')||'manual'} : {})
       });
       closeModal(); toast('Team created.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('at-btn','Create Team'); }
@@ -430,14 +427,14 @@ function showEditTeamModal(teamId, teams, tls, ags){
         name, permissions:getSelectedPermissions('et-perm'), department:newDept,
         ...(newDept==='backend' ? {assignmentMode: v('et-mode')||'manual'} : {})
       };
-      const bat = writeBatch(db);
-      bat.update(doc(db,'teams',teamId), upd);
+      const bat = newBatch();
+      batchUpdate(bat, 'teams', teamId, upd);
       // users.department is denormalized from their team's department (like
       // teamId/tlId elsewhere) — cascade so members don't go stale if a team's
       // department changes after they were assigned.
       if(newDept !== dept){
         [...tls, ...ags].filter(m => m.teamId===teamId).forEach(m => {
-          bat.update(doc(db,'users',m.id), {department:newDept});
+          batchUpdate(bat, 'users', m.id, {department:newDept});
         });
       }
       await bat.commit();
@@ -517,8 +514,8 @@ function showAddUserModal(role, teams, users=[]){
       const isBackendAgent = isAgent && dept==='backend';
       // New TL has no agents assigned yet (tlId = new uid, never existed before)
 
-      const bat = writeBatch(db);
-      bat.set(doc(db,'users',uid),{
+      const bat = newBatch();
+      batchSet(bat, 'users', uid, {
         name, email, role, teamId: teamId||null, department: dept, permissions:[],
         monthlyTarget: isTL ? 0 : (Number(target)||0),
         ...(isTL
@@ -528,8 +525,7 @@ function showAddUserModal(role, teams, users=[]){
           specialties: [...document.querySelectorAll('.au-specialty:checked')].map(c=>c.value),
           available: document.getElementById('au-available').checked
         } : {}),
-        active:true, createdBy:CU.uid, createdByName:CP.name,
-        createdAt:now(), lastEditedBy:CP.name, lastEditedAt:now()
+        active:true, createdByName:CP.name
       });
       await bat.commit();
       closeModal(); toast(`${label} created. They can now sign in.`); renderOrgTab();
@@ -647,7 +643,7 @@ function showEditUserModal(userId, users, teams){
     disable('eu-save','Saving…');
     try {
       const newDept = teamId ? teamDept(teamId) : null;
-      const upd = {name, teamId:teamId||null, department:newDept, permissions:getSelectedPermissions('eu-perm'), lastEditedBy:CP.name, lastEditedAt:now()};
+      const upd = {name, teamId:teamId||null, department:newDept, permissions:getSelectedPermissions('eu-perm')};
       if(u.active===false){
         upd.active = !!document.getElementById('eu-reactivate-chk')?.checked;
       }
@@ -673,8 +669,8 @@ function showEditUserModal(userId, users, teams){
         upd.monthlyTarget = overrideChk ? overrideVal : newAutoTarget;
       }
 
-      const bat = writeBatch(db);
-      bat.update(doc(db,'users',userId), upd);
+      const bat = newBatch();
+      batchUpdate(bat, 'users', userId, upd);
 
       // Agent saved → cascade autoTarget to old TL and new TL
       if(isAg){
@@ -689,9 +685,9 @@ function showEditUserModal(userId, users, teams){
             .filter(x => x.role==='agent' && x.tlId===tlIdAffected && x.id!==userId && x.active!==false)
             .reduce((s,x) => s + (Number(x.monthlyTarget)||0), 0)
             + (tlIdAffected===newTlId ? (Number(upd.monthlyTarget)||0) : 0);
-          const tlUpd = {autoTarget:tlAuto, lastEditedBy:CP.name, lastEditedAt:now()};
+          const tlUpd = {autoTarget:tlAuto};
           if(tl.targetSource !== 'override') tlUpd.monthlyTarget = tlAuto;
-          bat.update(doc(db,'users',tl.id), tlUpd);
+          batchUpdate(bat, 'users', tl.id, tlUpd);
         }
       }
 
@@ -720,11 +716,11 @@ async function repairLeadTeamData(leadsToFix, byId){
     let fixed = 0;
     for(let i = 0; i < leadsToFix.length; i += CHUNK){
       const chunk = leadsToFix.slice(i, i + CHUNK);
-      const bat = writeBatch(db);
+      const bat = newBatch();
       chunk.forEach(l => {
         const assignee = byId[l.assignedTo];
         if(!assignee) return;
-        bat.update(doc(db,'leads',l.id), { teamId: assignee.teamId||'', tlId: assignee.tlId||'' });
+        batchUpdate(bat, 'leads', l.id, { teamId: assignee.teamId||'', tlId: assignee.tlId||'' });
         fixed++;
       });
       await bat.commit();
@@ -770,10 +766,9 @@ function showEditCompanyModal(companyId, companies){
     const err = document.getElementById('ec-err');
     disable('ec-btn','Saving…');
     try {
-      await updateDoc(doc(db,'companies',companyId),{
+      await dbUpdate('companies', companyId, {
         industry: v('ec-ind'), city: v('ec-cy'),
-        hasDuAccount: document.getElementById('ec-du').checked,
-        lastEditedBy: CP.name, lastEditedAt: now()
+        hasDuAccount: document.getElementById('ec-du').checked
       });
       closeModal(); toast('Company updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('ec-btn','Save Changes'); }
