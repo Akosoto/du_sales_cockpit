@@ -46,7 +46,10 @@ js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLead
                         backfill, banner+button UX matching repairLeadTeamData, safe to re-run)
 js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
                         (add-lead includes the company search/fuzzy-match picker), and the
-                        Submit to Backend modal (shown on Closed leads with a companyId)
+                        Submit to Backend modal (shown on Closed leads with a companyId).
+                        Pipeline tab is server-side paginated (NEW, Phase A — see Phase A0/A
+                        below), 25 leads/page, numbered page buttons; requires 5 Firestore
+                        composite indexes (created, see Firestore Security Rules below).
 js/companies.js       — normalizeCompanyName, findFuzzyMatch, fetchCompanies,
                         findOrCreateCompany, backfillCompanies — the one shared
                         implementation used by both the lead picker and the backfill
@@ -585,6 +588,21 @@ Per `ARCHITECTURE.md`'s white-label pivot (Sections 0, 2, 3, 8).
   and migration: profile reads, dashboard/pipeline views, and a real create→update→delete cycle
   for the agent role, plus an edit-and-revert for the team_lead role. No permission errors, no
   orphaned test data left behind.
+- **Pipeline tab pagination** (`js/leads.js`, the last piece of step 4's quick fixes) — the
+  unbounded `getDocs(collection(db,'leads'))` full-collection scan (all roles) was replaced with
+  real server-side cursor pagination: `orderBy('lastEditedAt','desc')` + `limit(PAGE_SIZE)` scoped
+  by role (`teamId==`/`assignedTo==`) and the active stage tab, numbered page buttons (page size
+  25), and per-page caching (both the Firestore cursor AND the rendered rows) so revisiting an
+  already-seen page costs zero reads. Stage-tab counts and total-page count use
+  `getCountFromServer()` (a cheap aggregation query, ~1 read per 1000 matched docs) instead of a
+  full scan just to count. Team/TL/Agent multi-select filters and the free-text search box can't
+  be pushed server-side without a paid full-text index, so they auto-load additional pages of the
+  current stage+role query in the background (capped at 5,000 docs) and filter client-side over
+  everything loaded so far — a warning banner shows if the cap is hit before finding everything.
+  **Requires 5 Firestore composite indexes** (one per role×stage-shape combination: manager+stage,
+  TL+all, TL+stage, agent+all, agent+stage — manager+all needs no index, pure single-field sort);
+  created via the Console's auto-generated links this session, all confirmed `Enabled`. Verified
+  live for manager and team_lead roles (pagination, stage tabs, search, team filter, page caching).
 - **Not started yet:** Phase B (Storage driver decision — `storageDriver: 'firestore-b64'` is
   chosen in `config.js` but not yet implemented) and everything after it in `ARCHITECTURE.md`'s
   Phase A-G plan.
