@@ -32,7 +32,7 @@ import { computeRequiredDocs, createSubmission } from './submissions.js';
 //    filter client-side over everything loaded so far — correctness over
 //    the search box's coverage, bounded so one search action can't runaway
 //    into a full-collection scan.
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 25;
 const SCAN_CAP  = 5000;
 
 export async function renderPipelineTab(){
