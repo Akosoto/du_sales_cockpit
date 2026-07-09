@@ -9,7 +9,8 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
 import {
   getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, writeBatch
+  collection, query, where, getDocs, writeBatch,
+  orderBy, limit, startAfter, getCountFromServer
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import {
   getStorage, ref, uploadBytes
@@ -22,6 +23,7 @@ export {
   createUserWithEmailAndPassword, sendPasswordResetEmail,
   doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch,
+  orderBy, limit, startAfter, getCountFromServer,
   ref, uploadBytes
 };
 

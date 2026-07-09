@@ -1,7 +1,8 @@
 import {
   db, CU, CP, STAGES, MANDATORY_DOC_TYPES,
   doc, getDoc,
-  collection, query, where, getDocs
+  collection, query, where, getDocs,
+  orderBy, limit, startAfter, getCountFromServer
 } from './state.js';
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
@@ -11,9 +12,37 @@ import { computeRequiredDocs, createSubmission } from './submissions.js';
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
 // ════════════════════════════════════════════════════
+// ARCHITECTURE.md Phase A quota-discipline stopgap: the old version of this
+// tab did one unbounded getDocs(collection(db,'leads')) per role — fine at
+// 115 seed leads, but a hard 50K reads/day quota problem within weeks of
+// real usage at the stated growth rate. Replaced with:
+//  - Real server-side pagination (orderBy+limit+startAfter) for the default
+//    browse path (role scope + stage tabs) — Firestore auto-appends a
+//    document-ID tiebreaker to every orderBy, so cursors stay stable even
+//    when many leads share one lastEditedAt (e.g. a bulk-assign batch).
+//    Visited pages are cached in memory (both their cursor AND their
+//    rendered rows), so revisiting a page costs zero additional reads;
+//    jumping to an unvisited page walks the intervening pages once.
+//  - getCountFromServer() (a cheap aggregation query, ~1 read per 1000
+//    matched docs) for stage-tab counts and total-page count, instead of
+//    scanning everything just to count it.
+//  - Team/TL/Agent filters and free-text search can't be pushed server-side
+//    without a paid full-text index, so they auto-load additional pages of
+//    the current stage+role query in the background (up to SCAN_CAP) and
+//    filter client-side over everything loaded so far — correctness over
+//    the search box's coverage, bounded so one search action can't runaway
+//    into a full-collection scan.
+const PAGE_SIZE = 50;
+const SCAN_CAP  = 5000;
+
 export async function renderPipelineTab(){
   const ct   = document.getElementById('content');
   const role = CP.role;
+
+  if(role==='team_lead' && !CP.teamId){
+    ct.innerHTML=`<div class="empty mt-16"><div class="empty-icon">👥</div><div class="empty-title">Not assigned to a team</div><div class="empty-sub">Contact your manager.</div></div>`;
+    return;
+  }
 
   // Load users
   const uSnap  = await getDocs(collection(db,'users'));
@@ -24,21 +53,23 @@ export async function renderPipelineTab(){
   // agents/byId pattern already used for this tab.
   const companies = await fetchCompanies();
 
-  // Load leads scoped by role
-  let leads = [];
-  if(role==='manager'){
-    leads = (await getDocs(collection(db,'leads'))).docs.map(d=>({id:d.id,...d.data()}));
-  } else if(role==='team_lead'){
-    if(!CP.teamId){ ct.innerHTML=`<div class="empty mt-16"><div class="empty-icon">👥</div><div class="empty-title">Not assigned to a team</div><div class="empty-sub">Contact your manager.</div></div>`; return; }
-    // Single teamId query — matches dashboard.js and the Firestore rule's own
-    // teamId scope (ARCHITECTURE.md audit items 5+9). The old two-step
-    // agents-then-in() query broke past 30 agents (Firestore's `in` cap) and
-    // silently missed unassigned-in-team leads, which member-removal
-    // deliberately creates — those showed up in Dashboard counts but were
-    // invisible here, so TLs could never rescue orphaned leads via bulk-assign.
-    leads = (await getDocs(query(collection(db,'leads'),where('teamId','==',CP.teamId)))).docs.map(d=>({id:d.id,...d.data()}));
-  } else {
-    leads = (await getDocs(query(collection(db,'leads'),where('assignedTo','==',CU.uid)))).docs.map(d=>({id:d.id,...d.data()}));
+  function roleScopeWhere(){
+    if(role==='team_lead') return [where('teamId','==',CP.teamId)];
+    if(role==='agent')     return [where('assignedTo','==',CU.uid)];
+    return [];
+  }
+  function dataQuery(stage, cursor){
+    const c = [...roleScopeWhere()];
+    if(stage) c.push(where('stage','==',stage));
+    c.push(orderBy('lastEditedAt','desc'));
+    if(cursor) c.push(startAfter(cursor));
+    c.push(limit(PAGE_SIZE));
+    return query(collection(db,'leads'), ...c);
+  }
+  function countQuery(stage){
+    const c = [...roleScopeWhere()];
+    if(stage) c.push(where('stage','==',stage));
+    return query(collection(db,'leads'), ...c);
   }
 
   // Available agents for assignment dropdown — TL scoped to own sub-group only (Model B)
@@ -64,13 +95,47 @@ export async function renderPipelineTab(){
   const tlsForFilter    = role==='manager' ? Object.values(byId).filter(u=>u.role==='team_lead'&&u.active!==false) : [];
   const agentsForFilter = agents;
 
+  // Manager-only pending delete-request banner — a separate, small bounded
+  // query (deletion requests are inherently rare; doesn't need pagination).
+  // Firestore's != excludes both null AND missing-field docs, which is
+  // exactly "no pending request" either way.
+  let pendingDeletes = [];
+  if(role==='manager'){
+    const pdSnap = await getDocs(query(collection(db,'leads'), where('deleteRequest','!=',null), limit(200)));
+    pendingDeletes = pdSnap.docs.map(d=>({id:d.id,...d.data()}));
+  }
+
+  // Stage-tab counts — cheap aggregation queries instead of a full scan.
+  const sCounts = {};
+  const [totalAgg, ...stageAggs] = await Promise.all([
+    getCountFromServer(countQuery('')),
+    ...STAGES.map(s => getCountFromServer(countQuery(s)))
+  ]);
+  STAGES.forEach((s,i) => sCounts[s] = stageAggs[i].data().count);
+
   let stageF='', searchF='';
   let teamFs=[], tlFs=[], agentFs=[];
   const selected = new Set();
 
-  function filtered(){
-    let r = leads;
-    if(stageF)       r = r.filter(l=>l.stage===stageF);
+  // ── Paged mode state (default) ──
+  let pageContent = {};      // {pageNum: [...leads]} — cached rendered rows
+  let pageBoundaries = [];   // pageBoundaries[i] = last doc snapshot of page i+1
+  let totalCount = totalAgg.data().count;
+
+  // ── Expanded mode state (team/TL/agent filter or search active) ──
+  let expandedLeads = [];
+  let expandedCursor = null;
+  let expandedDone = false;
+  let expandedCapped = false;
+
+  let currentPage = 1;
+  let totalPages = 1;
+  let visibleLeads = [];
+
+  function filtersActive(){ return !!searchF || teamFs.length || tlFs.length || agentFs.length; }
+
+  function applyClientFilters(list){
+    let r = list;
     if(searchF){ const q=searchF.toLowerCase(); r=r.filter(l=>(l.company||'').toLowerCase().includes(q)||(l.contact||'').toLowerCase().includes(q)||(l.email||'').toLowerCase().includes(q)||(l.phone||'').includes(q)); }
     if(teamFs.length)  r = r.filter(l=>teamFs.includes(l.teamId));
     if(tlFs.length)    r = r.filter(l=>tlFs.includes(l.tlId));
@@ -78,14 +143,73 @@ export async function renderPipelineTab(){
     return r;
   }
 
-  const sCounts = {}; STAGES.forEach(s=>sCounts[s]=leads.filter(l=>l.stage===s).length);
-  const pendingDeletes = role==='manager' ? leads.filter(l=>l.deleteRequest) : [];
+  async function ensureExpandedLoaded(){
+    while(!expandedDone && expandedLeads.length < SCAN_CAP){
+      const snap = await getDocs(dataQuery(stageF, expandedCursor));
+      if(snap.empty){ expandedDone = true; break; }
+      expandedLeads.push(...snap.docs.map(d=>({id:d.id,...d.data()})));
+      expandedCursor = snap.docs[snap.docs.length-1];
+      if(snap.docs.length < PAGE_SIZE) expandedDone = true;
+    }
+    if(!expandedDone && expandedLeads.length >= SCAN_CAP) expandedCapped = true;
+  }
+
+  // Navigate within the CURRENT mode/filter set (pager clicks) — reuses
+  // cache, never resets it.
+  async function goToPage(n){
+    try {
+      if(filtersActive()){
+        const list = applyClientFilters(expandedLeads);
+        totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+        n = Math.min(Math.max(1,n), totalPages);
+        currentPage = n;
+        visibleLeads = list.slice((n-1)*PAGE_SIZE, n*PAGE_SIZE);
+      } else {
+        totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+        n = Math.min(Math.max(1,n), totalPages);
+        if(!pageContent[n]){
+          for(let p=pageBoundaries.length+1; p<=n; p++){
+            const cursor = p===1 ? null : pageBoundaries[p-2];
+            const snap = await getDocs(dataQuery(stageF, cursor));
+            pageContent[p] = snap.docs.map(d=>({id:d.id,...d.data()}));
+            if(snap.docs.length) pageBoundaries[p-1] = snap.docs[snap.docs.length-1];
+          }
+        }
+        currentPage = n;
+        visibleLeads = pageContent[n] || [];
+      }
+    } catch(e){
+      toast(e.code==='failed-precondition' ? 'This view needs a one-time Firestore index — check the console for the creation link.' : 'Error loading leads: '+e.message, 'err');
+      console.error('Pipeline query failed', e);
+      visibleLeads = [];
+    }
+    selected.clear();
+    renderList();
+  }
+
+  // Stage tab / search / team-TL-agent filter changes all land here — the
+  // underlying result SET changed, so cache/mode resets before paging to 1.
+  async function refreshView(){
+    try {
+      if(filtersActive()){
+        expandedLeads=[]; expandedCursor=null; expandedDone=false; expandedCapped=false;
+        await ensureExpandedLoaded();
+      } else {
+        pageContent={}; pageBoundaries=[];
+      }
+      totalCount = stageF ? sCounts[stageF] : totalAgg.data().count;
+    } catch(e){
+      toast(e.code==='failed-precondition' ? 'This view needs a one-time Firestore index — check the console for the creation link.' : 'Error loading leads: '+e.message, 'err');
+      console.error('Pipeline query failed', e);
+    }
+    await goToPage(1);
+  }
 
   ct.innerHTML = `
     <div class="pg-hdr">
       <div>
         <h2>${role==='manager'?'All Leads':role==='team_lead'?'Team Pipeline':'My Leads'}</h2>
-        <p class="pg-hdr-sub" id="lead-cnt">${leads.length} leads</p>
+        <p class="pg-hdr-sub" id="lead-cnt">${totalCount} leads</p>
       </div>
       <div class="pg-actions">
         <input type="text" id="srch" class="search-input" placeholder="Search company, contact…">
@@ -116,11 +240,13 @@ export async function renderPipelineTab(){
       ${agentsForFilter.length ? buildMsFilter('ms-ag','Agent',agentsForFilter) : ''}
     </div>` : ''}
     <div class="filters" id="filters">
-      <button class="filter-btn active" data-s="">All <span class="filter-count">${leads.length}</span></button>
+      <button class="filter-btn active" data-s="">All <span class="filter-count">${totalAgg.data().count}</span></button>
       ${STAGES.map(s=>`<button class="filter-btn" data-s="${s}">${s} <span class="filter-count">${sCounts[s]}</span></button>`).join('')}
     </div>
     <div id="bulk-bar-wrap"></div>
-    <div id="lead-list"></div>`;
+    <div id="scan-warning"></div>
+    <div id="lead-list"></div>
+    <div id="pager"></div>`;
 
   function renderBulkBar(){
     const wrap = document.getElementById('bulk-bar-wrap');
@@ -146,7 +272,7 @@ export async function renderPipelineTab(){
         for(let i=0;i<ids.length;i+=CHUNK){
           const bat = newBatch();
           ids.slice(i,i+CHUNK).forEach(id=>{
-            const lead = leads.find(l=>l.id===id); if(!lead) return;
+            const lead = visibleLeads.find(l=>l.id===id); if(!lead) return;
             batchUpdate(bat, 'leads', id, {
               assignedTo: targetId,
               teamId: target.teamId||'', tlId: target.tlId||'',
@@ -162,19 +288,36 @@ export async function renderPipelineTab(){
     });
   }
 
+  function renderPager(){
+    const el = document.getElementById('pager');
+    if(totalPages <= 1){ el.innerHTML=''; return; }
+    const pages = [1];
+    if(currentPage - 2 > 2) pages.push('…');
+    for(let p=Math.max(2,currentPage-2); p<=Math.min(totalPages-1,currentPage+2); p++) pages.push(p);
+    if(currentPage + 2 < totalPages - 1) pages.push('…');
+    if(totalPages>1) pages.push(totalPages);
+    el.innerHTML = `<div class="flex gap-8 mt-12" style="flex-wrap:wrap;align-items:center">
+      ${pages.map(p=>p==='…'?`<span class="text-dim">…</span>`:`<button class="filter-btn${p===currentPage?' active':''}" data-pg="${p}">${p}</button>`).join('')}
+    </div>`;
+    el.querySelectorAll('[data-pg]').forEach(b=>b.addEventListener('click',()=>goToPage(Number(b.dataset.pg))));
+  }
+
   function renderList(){
-    const f = filtered();
-    document.getElementById('lead-cnt').textContent = `${f.length} lead${f.length!==1?'s':''}`;
+    const cnt = filtersActive() ? applyClientFilters(expandedLeads).length : totalCount;
+    document.getElementById('lead-cnt').textContent = `${cnt} lead${cnt!==1?'s':''}`;
+    const warnEl = document.getElementById('scan-warning');
+    warnEl.innerHTML = expandedCapped ? `<p class="text-sm" style="color:var(--amber);margin:8px 0">⚠ Search/filter scanned ${SCAN_CAP.toLocaleString()} leads (the safety limit) without reaching the end — narrow with a stage or team filter for complete results.</p>` : '';
     const el = document.getElementById('lead-list');
     renderBulkBar();
-    if(!f.length){ el.innerHTML=`<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">No leads found</div><div class="empty-sub">Try adjusting your search or filter.</div></div>`; return; }
+    renderPager();
+    if(!visibleLeads.length){ el.innerHTML=`<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">No leads found</div><div class="empty-sub">Try adjusting your search or filter.</div></div>`; return; }
     const canBulk = role !== 'agent' && agents.length > 0;
-    const eligible = canBulk ? f.filter(bulkEligible) : [];
+    const eligible = canBulk ? visibleLeads.filter(bulkEligible) : [];
     el.innerHTML = `<div class="tbl-wrap"><table>
       <thead><tr>${canBulk?`<th><input type="checkbox" id="chk-all" class="lead-chk"></th>`:''}<th>Company</th><th>Contact</th><th>Phone</th>${role!=='agent'?'<th>Agent</th>':''}
         <th>Stage</th><th>City</th><th>Follow-up</th><th>Updated</th><th></th></tr></thead>
       <tbody>
-        ${f.map(l=>`<tr>
+        ${visibleLeads.map(l=>`<tr>
           ${canBulk?(bulkEligible(l)?`<td><input type="checkbox" class="lead-chk" data-chk="${l.id}"${selected.has(l.id)?' checked':''}></td>`:'<td></td>'):''}
           <td class="td-company">${esc(l.company||'—')}${l.assignedTo===CU.uid?'<span style="font-size:10px;font-weight:700;background:rgba(16,185,129,.2);color:#34d399;padding:2px 8px;border-radius:10px;margin-left:6px;vertical-align:middle">📌 Mine</span>':''}</td>
           <td class="td-dim">${esc(l.contact||'—')}</td>
@@ -189,7 +332,7 @@ export async function renderPipelineTab(){
       </tbody>
     </table></div>`;
     el.querySelectorAll('[data-lid]').forEach(b=>b.addEventListener('click',()=>{
-      const lead = leads.find(x=>x.id===b.dataset.lid);
+      const lead = visibleLeads.find(x=>x.id===b.dataset.lid);
       if(lead) showLeadModal(lead, byId, agents);
     }));
     if(canBulk && eligible.length){
@@ -207,30 +350,33 @@ export async function renderPipelineTab(){
     }
   }
 
-  renderList();
+  await goToPage(1);
 
-  document.getElementById('srch').addEventListener('input', e=>{ searchF=e.target.value; selected.clear(); renderList(); });
+  let searchDebounce;
+  document.getElementById('srch').addEventListener('input', e=>{
+    searchF = e.target.value;
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(refreshView, 400);
+  });
   document.querySelectorAll('[data-s]').forEach(b=>b.addEventListener('click',()=>{
     stageF=b.dataset.s;
     document.querySelectorAll('[data-s]').forEach(x=>x.classList.toggle('active',x===b));
-    selected.clear();
-    renderList();
+    refreshView();
   }));
   document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId, companies));
-  const clearSelAndRender = () => { selected.clear(); renderList(); };
-  wireMsFilter('ms-tm', teamFs,  clearSelAndRender);
-  wireMsFilter('ms-tl', tlFs,    clearSelAndRender);
-  wireMsFilter('ms-ag', agentFs, clearSelAndRender);
+  wireMsFilter('ms-tm', teamFs,  refreshView);
+  wireMsFilter('ms-tl', tlFs,    refreshView);
+  wireMsFilter('ms-ag', agentFs, refreshView);
 
   document.querySelectorAll('[data-approve-del]').forEach(b=>b.addEventListener('click',()=>{
-    const l = leads.find(x=>x.id===b.dataset.approveDel); if(!l) return;
+    const l = pendingDeletes.find(x=>x.id===b.dataset.approveDel); if(!l) return;
     confirmModal(`Approve deletion for ${esc(l.company)}?`, 'This cannot be undone.', async () => {
       await dbDelete('leads', l.id);
       toast('Lead deleted.','info'); renderPipelineTab();
     });
   }));
   document.querySelectorAll('[data-reject-del]').forEach(b=>b.addEventListener('click', async () => {
-    const l = leads.find(x=>x.id===b.dataset.rejectDel); if(!l) return;
+    const l = pendingDeletes.find(x=>x.id===b.dataset.rejectDel); if(!l) return;
     await dbUpdate('leads', l.id, {
       deleteRequest:null,
       history:[...(l.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:'Deletion request rejected' }]
