@@ -5,7 +5,7 @@ import {
 } from './state.js';
 import { dbAdd, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
-import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions } from './permissions.js';
+import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions, hasPermission } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
 import { PRODUCT_CATEGORIES } from './products.js';
 import { orgId } from '../config.js';
@@ -265,7 +265,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
   ct.querySelector('#btn-orgid-migration')?.addEventListener('click', () => runOrgIdMigration());
   ct.querySelector('#btn-backup-export')?.addEventListener('click', () => runBackupExport());
-  ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies)));
+  ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies, users)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
   ct.querySelectorAll('[data-del-team]').forEach(b  => b.addEventListener('click', () => {
@@ -842,8 +842,22 @@ async function runBackupExport(){
 }
 
 // ─── EDIT COMPANY ───
-function showEditCompanyModal(companyId, companies){
+// Company enrichment (ARCHITECTURE.md §3) — accountCode, segment, contacts,
+// addressBlock, docExpiries, partnerHistory, accountOwner, billing skeleton.
+// riskFlags is intentionally NOT exposed here — it's system-computed (doc
+// expiry proximity, billing status, churn-list import), not hand-edited.
+// Gated by the edit_companies permission grant, same as any future non-Org-tab
+// entry point — today only managers ever reach this modal (Org tab routing),
+// for whom hasPermission() already always returns true, so this is a no-op
+// check until that grant is wired to a UI outside the Org tab.
+function showEditCompanyModal(companyId, companies, users){
   const c = companies.find(x=>x.id===companyId); if(!c) return;
+  if(!hasPermission('edit_companies', CP)){ toast("You don't have permission to edit companies.",'err'); return; }
+  const contacts = c.contacts || {};
+  const addr = c.addressBlock || {};
+  const exp = c.docExpiries || {};
+  const billing = c.billing || {};
+
   modal(`Edit Company: ${esc(c.name)}`, `
     <div class="row2">
       <div class="field"><label>Industry</label><input type="text" id="ec-ind" value="${esc(c.industry||'')}" placeholder="e.g. Construction"></div>
@@ -853,15 +867,131 @@ function showEditCompanyModal(companyId, companies){
       <input type="checkbox" id="ec-du" ${c.hasDuAccount?'checked':''} style="width:auto;margin:0;cursor:pointer">
       <label for="ec-du" style="margin:0;cursor:pointer">Has an existing du account</label>
     </div>
+
+    <div class="divider"></div>
+    <div class="row2">
+      <div class="field"><label>Account Code</label><input type="text" id="ec-acct" value="${esc(c.accountCode||'')}" placeholder="e.g. ACC-10293"></div>
+      <div class="field"><label>Segment</label>
+        <select id="ec-seg">
+          <option value="">— None —</option>
+          <option value="SOHO" ${c.segment==='SOHO'?'selected':''}>SOHO</option>
+          <option value="SME" ${c.segment==='SME'?'selected':''}>SME</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">CONTACTS</p>
+    <div class="row2">
+      <div class="field"><label>Authorized Person</label><input type="text" id="ec-ct-auth" value="${esc(contacts.authorizedPerson||'')}"></div>
+      <div class="field"><label>Technical Contact</label><input type="text" id="ec-ct-tech" value="${esc(contacts.technicalName||'')}"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>Phone</label><input type="text" id="ec-ct-ph" value="${esc(contacts.phone||'')}"></div>
+      <div class="field"><label>Alt Phone</label><input type="text" id="ec-ct-altph" value="${esc(contacts.altPhone||'')}"></div>
+    </div>
+    <div class="field"><label>Email</label><input type="email" id="ec-ct-em" value="${esc(contacts.email||'')}"></div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">ADDRESS</p>
+    <div class="row2">
+      <div class="field"><label>Building</label><input type="text" id="ec-ad-bldg" value="${esc(addr.building||'')}"></div>
+      <div class="field"><label>Street</label><input type="text" id="ec-ad-st" value="${esc(addr.street||'')}"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>Address City</label><input type="text" id="ec-ad-cy" value="${esc(addr.city||'')}"></div>
+      <div class="field"><label>Emirate</label><input type="text" id="ec-ad-emirate" value="${esc(addr.emirate||'')}"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>PO Box</label><input type="text" id="ec-ad-pobox" value="${esc(addr.poBox||'')}"></div>
+      <div class="field"><label>Full Address</label><input type="text" id="ec-ad-full" value="${esc(addr.full||'')}"></div>
+    </div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">DOCUMENT EXPIRIES</p>
+    <div class="row2">
+      <div class="field"><label>Trade License</label><input type="date" id="ec-exp-tl" value="${exp.tradeLicense||''}"></div>
+      <div class="field"><label>Establishment Card</label><input type="date" id="ec-exp-ec" value="${exp.establishmentCard||''}"></div>
+    </div>
+    <div class="field"><label>Emirates ID</label><input type="date" id="ec-exp-eid" value="${exp.eid||''}"></div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">ACCOUNT OWNER (KAM)</p>
+    <div class="field">
+      <select id="ec-owner">
+        <option value="">— None —</option>
+        ${users.map(u=>`<option value="${u.id}" ${c.accountOwner===u.id?'selected':''}>${esc(u.name)}</option>`).join('')}
+      </select>
+    </div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">BILLING</p>
+    <div class="row2">
+      <div class="field"><label>Last Confirmed Paid Month</label><input type="month" id="ec-bill-month" value="${billing.lastConfirmedPaidMonth||''}"></div>
+      <div class="field"><label>Status</label>
+        <select id="ec-bill-status">
+          <option value="ok" ${!billing.status||billing.status==='ok'?'selected':''}>OK</option>
+          <option value="pending" ${billing.status==='pending'?'selected':''}>Pending</option>
+          <option value="overdue" ${billing.status==='overdue'?'selected':''}>Overdue</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <p class="text-dim text-xs mb-8">PARTNER HISTORY</p>
+    <div id="ec-ph-list">
+      ${(c.partnerHistory||[]).length ? c.partnerHistory.map(p=>`<div class="text-sm mb-4">${p.type==='gained'?'📥':'📤'} <strong>${esc(p.partner)}</strong>${p.date?` — ${fmtDate(p.date)}`:''}${p.note?` (${esc(p.note)})`:''}</div>`).join('') : '<p class="text-dim text-xs">No history yet.</p>'}
+    </div>
+    <p class="text-dim text-xs mt-8">Add a new entry (optional — leave Partner blank to skip):</p>
+    <div class="row2">
+      <div class="field"><label>Type</label>
+        <select id="ec-ph-type"><option value="gained">Gained</option><option value="lost">Lost</option></select>
+      </div>
+      <div class="field"><label>Partner</label><input type="text" id="ec-ph-partner" placeholder="Other partner name"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>Date</label><input type="date" id="ec-ph-date"></div>
+      <div class="field"><label>Note</label><input type="text" id="ec-ph-note"></div>
+    </div>
+
     <p id="ec-err" class="err"></p>
-    <button class="btn btn-primary btn-full mt-12" id="ec-btn">Save Changes</button>`);
+    <button class="btn btn-primary btn-full mt-12" id="ec-btn">Save Changes</button>`, true);
+
   document.getElementById('ec-btn').onclick = async () => {
     const err = document.getElementById('ec-err');
     disable('ec-btn','Saving…');
     try {
+      const partnerHistory = [...(c.partnerHistory||[])];
+      const newPartner = v('ec-ph-partner');
+      if(newPartner){
+        partnerHistory.push({
+          type: v('ec-ph-type')||'gained', partner: newPartner,
+          date: v('ec-ph-date')||null, note: v('ec-ph-note')||''
+        });
+      }
       await dbUpdate('companies', companyId, {
         industry: v('ec-ind'), city: v('ec-cy'),
-        hasDuAccount: document.getElementById('ec-du').checked
+        hasDuAccount: document.getElementById('ec-du').checked,
+        accountCode: v('ec-acct')||null,
+        segment: v('ec-seg')||null,
+        contacts: {
+          authorizedPerson: v('ec-ct-auth'), technicalName: v('ec-ct-tech'),
+          phone: v('ec-ct-ph'), altPhone: v('ec-ct-altph'), email: v('ec-ct-em')
+        },
+        addressBlock: {
+          building: v('ec-ad-bldg'), street: v('ec-ad-st'), city: v('ec-ad-cy'),
+          emirate: v('ec-ad-emirate'), poBox: v('ec-ad-pobox'), full: v('ec-ad-full')
+        },
+        docExpiries: {
+          tradeLicense: v('ec-exp-tl')||null, establishmentCard: v('ec-exp-ec')||null, eid: v('ec-exp-eid')||null
+        },
+        accountOwner: v('ec-owner')||null,
+        billing: {
+          ...billing,
+          lastConfirmedPaidMonth: v('ec-bill-month')||null,
+          status: v('ec-bill-status')||'ok'
+        },
+        partnerHistory
       });
       closeModal(); toast('Company updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('ec-btn','Save Changes'); }

@@ -57,9 +57,20 @@ export async function fetchCompanies(){
 // The one shared function for turning a typed/imported name into a companyId.
 // Pass `knownCompanies` (already-fetched list) to avoid a redundant read when
 // the caller already has one, e.g. the lead modal's picker.
+//
+// accountCode dedup (ARCHITECTURE.md §3 company enrichment) is checked FIRST,
+// ahead of normalizedName — it's a stronger identity signal (an exact du
+// account reference) than a name match, which two genuinely different
+// companies could coincidentally share/collide on.
 export async function findOrCreateCompany(name, extra = {}, knownCompanies = null){
   const norm = normalizeCompanyName(name);
   const companies = knownCompanies || await fetchCompanies();
+
+  if(extra.accountCode){
+    const byCode = companies.find(c => c.accountCode && c.accountCode === extra.accountCode);
+    if(byCode) return byCode.id;
+  }
+
   const existing = companies.find(c => c.normalizedName === norm);
   if(existing) return existing.id;
 
@@ -67,6 +78,7 @@ export async function findOrCreateCompany(name, extra = {}, knownCompanies = nul
     name: name.trim(),
     normalizedName: norm,
     industry: extra.industry||'', city: extra.city||'',
+    accountCode: extra.accountCode || null,
     hasDuAccount: false,
     mergedInto: null
   });

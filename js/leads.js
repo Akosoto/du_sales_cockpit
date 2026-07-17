@@ -567,6 +567,16 @@ function showAddLeadModal(agents, byId, companies){
       </div>
     </div>
     <div class="row2">
+      <div class="field"><label>Account Code (optional)</label><input type="text" id="nl-acct" placeholder="e.g. ACC-10293"></div>
+      <div></div>
+    </div>
+    <div id="nl-acct-match" style="display:none" class="locked-note mb-12">
+      ✓ Account code already exists: <strong id="nl-acct-match-name"></strong>
+      <div class="flex gap-8 mt-8">
+        <button type="button" class="btn btn-ghost btn-xs" id="nl-acct-use-existing">Use this company</button>
+      </div>
+    </div>
+    <div class="row2">
       <div class="field"><label>Phone</label><input type="text" id="nl-ph" placeholder="+971 50 000 0000"></div>
       <div class="field"><label>Email</label><input type="email" id="nl-em" placeholder="contact@company.com"></div>
     </div>
@@ -595,6 +605,8 @@ function showAddLeadModal(agents, byId, companies){
   const coInput = document.getElementById('nl-co');
   const coDd    = document.getElementById('nl-co-dd');
   const fuzzyBox = document.getElementById('nl-co-fuzzy');
+  const acctInput = document.getElementById('nl-acct');
+  const acctMatchBox = document.getElementById('nl-acct-match');
   coInput.addEventListener('input', () => {
     selectedCompanyId = ''; fuzzyAcknowledged = false;
     fuzzyBox.style.display = 'none';
@@ -609,8 +621,29 @@ function showAddLeadModal(agents, byId, companies){
     const item = e.target.closest('[data-cid]'); if(!item) return;
     const c = companies.find(x=>x.id===item.dataset.cid); if(!c) return;
     coInput.value = c.name; selectedCompanyId = c.id;
+    acctInput.value = c.accountCode || '';
     coDd.classList.remove('open'); coDd.innerHTML='';
     fuzzyBox.style.display = 'none';
+    acctMatchBox.style.display = 'none';
+  });
+
+  // accountCode exact-match nudge — a stronger dedup signal than name, so this
+  // surfaces independently of the name-based fuzzy-match box above.
+  acctInput.addEventListener('input', () => {
+    const code = acctInput.value.trim();
+    if(!code){ acctMatchBox.style.display = 'none'; return; }
+    const match = companies.find(c => c.accountCode && c.accountCode === code);
+    if(match){
+      document.getElementById('nl-acct-match-name').textContent = match.name;
+      acctMatchBox.style.display = '';
+      document.getElementById('nl-acct-use-existing').onclick = () => {
+        coInput.value = match.name; selectedCompanyId = match.id;
+        acctMatchBox.style.display = 'none';
+        fuzzyBox.style.display = 'none';
+      };
+    } else {
+      acctMatchBox.style.display = 'none';
+    }
   });
 
   document.getElementById('nl-btn').onclick = async () => {
@@ -620,10 +653,17 @@ function showAddLeadModal(agents, byId, companies){
     const assignTo = role==='agent' ? CU.uid : (v('nl-ag')||'');
     if(role==='team_lead' && !assignTo){ err.textContent='No agents in your sub-group yet. Ask your manager to assign agents first.'; return; }
 
-    // Resolve companyId: explicit picker selection wins; otherwise check for an
-    // exact normalizedName match (typed the existing name without clicking it);
-    // otherwise nudge with a fuzzy "did you mean" before creating genuinely new.
+    // Resolve companyId: explicit picker selection wins; then an exact
+    // accountCode match (stronger identity signal than name — ARCHITECTURE.md
+    // §3); then an exact normalizedName match (typed the existing name
+    // without clicking it); otherwise nudge with a fuzzy "did you mean"
+    // before creating genuinely new.
+    const acctCode = v('nl-acct');
     let companyId = selectedCompanyId;
+    if(!companyId && acctCode){
+      const byCode = companies.find(c => c.accountCode && c.accountCode === acctCode);
+      if(byCode) companyId = byCode.id;
+    }
     if(!companyId){
       const norm = normalizeCompanyName(co);
       const exact = companies.find(c => c.normalizedName === norm);
@@ -649,7 +689,7 @@ function showAddLeadModal(agents, byId, companies){
     disable('nl-btn','Adding…');
     try {
       if(!companyId){
-        companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy')}, companies);
+        companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy'), accountCode:acctCode}, companies);
       }
       // Resolve teamId from assignee's user doc (skip for manager self-assign)
       let leadTeamId = '', leadTlId = '';
