@@ -77,6 +77,7 @@ export async function renderOrgTab(){
     <div class="pg-hdr">
       <div><h2>Org & Teams</h2><p class="pg-hdr-sub">${teams.length} team${teams.length!==1?'s':''} · ${tls.length} team lead${tls.length!==1?'s':''} · ${ags.length} agent${ags.length!==1?'s':''}</p></div>
       <div class="pg-actions">
+        <button class="btn btn-ghost btn-sm" id="btn-backup-export">⬇️ Backup / Export All Data</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-team">+ New Team</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-tl">+ New Team Lead</button>
         <button class="btn btn-primary btn-sm" id="btn-add-ag">+ New Agent</button>
@@ -263,6 +264,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-repair')?.addEventListener('click',   () => repairLeadTeamData(needsRepair, byId));
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
   ct.querySelector('#btn-orgid-migration')?.addEventListener('click', () => runOrgIdMigration());
+  ct.querySelector('#btn-backup-export')?.addEventListener('click', () => runBackupExport());
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
@@ -803,6 +805,39 @@ async function runOrgIdMigration(){
   } catch(e){
     toast('Error: '+e.message,'err');
     if(btn){ btn.disabled=false; btn.textContent='🏷️ Stamp orgId on Existing Data'; }
+  }
+}
+
+// Every org-scoped collection, backed up into one timestamped JSON file
+// (ARCHITECTURE.md §0/§10 — prerequisite for every future migration/import,
+// originally scoped to precede the orgId migration; built after the fact
+// since that migration already ran and is verified safe).
+const BACKUP_COLLECTIONS = ['users','teams','leads','companies','channels','scripts','products','submissions','auditLog'];
+
+async function runBackupExport(){
+  const btn = document.getElementById('btn-backup-export');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
+  try {
+    const data = {};
+    for(const collectionName of BACKUP_COLLECTIONS){
+      const snap = await getDocs(query(collection(db, collectionName), where('orgId','==',orgId)));
+      data[collectionName] = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    }
+    const payload = { exportedAt: now(), exportedBy: CP.name, orgId, data };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${orgId}-backup-${now().replace(/[:.]/g,'-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast('Backup downloaded.');
+  } catch(e){
+    toast('Error: '+e.message,'err');
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '⬇️ Backup / Export All Data'; }
   }
 }
 
