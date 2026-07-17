@@ -209,5 +209,17 @@ service cloud.firestore {
         isActiveBackend()
       );
     }
+
+    // ── AUDIT LOG (ARCHITECTURE.md §3) ──────────────
+    // Append-only: js/db.js writes one doc per mutation, in the same batch
+    // as the mutation itself. No update/delete ever — the log is only ever
+    // added to. Read is manager-only; no UI consumes this yet, but that's
+    // exactly why it shouldn't be readable by the same users whose actions
+    // it records.
+    match /auditLog/{a} {
+      allow read: if isAuth() && role() == 'manager' && sameOrg();
+      allow create: if isAuth() && sameOrgWrite();
+      allow update, delete: if false;
+    }
   }
 }
