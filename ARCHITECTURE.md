@@ -28,11 +28,26 @@ Session 1 (complete, verified):
   orphaned-lead invisibility (items 5+9).
 - ✔ PROJECT_SPEC.md stale sections corrected.
 
-Still open from audit: db.js mutation gateway + orgId stamping +
-sameOrg() rules (Session 2); rollups replace full-collection scans
-(Phase C); string-derived close-month analytics → structured closedAt
-(Session 2); product soft-delete (Session 2); backup-export button
-(Session 2, BEFORE orgId migration); hygiene one-liners (item 12).
+Status after Session 2 (complete, verified — corrects v2.0's original
+"still open" framing, which predated this session's actual work):
+- ✔ db.js mutation gateway built; all direct Firestore mutation call
+  sites migrated through it (orgId stamp, audit fields).
+- ✔ orgId migration run live across all existing docs (0 missed);
+  sameOrg()/sameOrgWrite() rules published — a bootstrap null-comparison
+  bug that broke all logins was found and fixed live before declaring
+  it safe.
+- ✔ Structured closedAt on stage→Closed (replaces the string-scan);
+  product soft-delete (active:false); hygiene one-liners (item 12).
+- ✔ Pipeline tab pagination stopgap (server-side cursor pagination +
+  getCountFromServer — rollups fix an aggregate's read cost, not a
+  listing UI's, so this needed its own fix regardless of Phase C).
+
+Still open: auditLog collection (gateway doesn't yet write a separate
+audit-log doc per mutation) and the backup-export button (originally
+scoped to precede the orgId migration; migration already ran and is
+verified safe, so this is no longer a live risk gate, but the button
+itself is still unbuilt and is a prerequisite for every future
+migration/import). Both are this session's next two steps.
 
 Infrastructure: Firestore region confirmed `me-central2` (Dammam) — no
 latency issue. RULE: every client project must be created in
@@ -132,19 +147,28 @@ leads/{id}            + **sourceId** (external source), **commission**
 sources/{id}          **type: freelancer|subcontractor, name, contact,
                       terms, active** (manager-only; never get logins)
 submissions/{id}      leadId, companyId, agentId, teamId, tlId,
-                      **status: pendingVerification|submittedToDu|
-                        inProgress|activated|rejected** (coarse),
-                      **events[]** (append-only timeline — see §5),
-                      items[] {productId, qty, mrc, **typeOfRequest**,
-                        **contractTerm**, **categoryFields** (gaid /
+                      **bundleId** (links sibling submissions created
+                        from the same Submit-to-Backend form — the
+                        agent's view groups by this; du-facing reality
+                        is one row per product order, so this is NOT
+                        an items[] array — see §5),
+                      productId, qty, mrc, **typeOfRequest**,
+                      **contractTerm**, **categoryFields** (gaid /
                         msisdn / simSerial / passcode — optional),
-                        **sprFlag + sprNote**},
+                      **sprFlag + sprNote**,
+                      **status: pendingVerification|submittedToDu|
+                        inProgress|activated|rejected** (coarse, PER
+                        SUBMISSION — a bundle activates partially in
+                        the normal case, not an edge case),
+                      **events[]** (append-only timeline — see §5),
                       **accTransfer** {flag, fromPartner} (also writes
                         company partnerHistory),
                       **verification** {done, method:call|email, ts, or
                         auto-mark "proceeded without verification"},
                       requiredDocs[] {type, status, expiryDate,
-                        storageRef}, assignedBackendAgent
+                        storageRef}, assignedBackendAgent (specialty-
+                        matched per category, rotation advances per
+                        SUBMISSION created, not per bundle)
 serviceRequests/{id}  **VAS module**: companyId, accountNo, requestType,
                       activityNo, status, notes, events[], raisedBy
 escalations/{id}      companyId, accountNo, **issueType** (configurable:
@@ -201,11 +225,25 @@ auditLog/{id}         who, what, docRef, ts (gateway-written)
   assign → counts to assignee's target; source tag per-lead only).
 - **External sources**: data entities only, never logins.
 
-## 5. Submissions — Status + Event Timeline (replaces 5 fixed stages)
+## 5. Submissions — One Line Item Per Submission Doc (replaces 5 fixed
+stages AND v2.0's original items[] array)
 
-Coarse status: pendingVerification → submittedToDu → inProgress →
-activated | rejected. hasDuAccount = informational badge (no skip
-logic). Append-only typed events (actor, ts, payload):
+One submission document = one product line (with qty), not a bundle.
+The agent's Submit-to-Backend form can carry multiple product lines in
+one sitting; each line becomes its OWN submission doc, all sharing a
+common bundleId. The agent's Pipeline/submissions view groups siblings
+by bundleId into one visual package, but each submission underneath has
+its own coarse status, its own events[] timeline, and its own
+assignedBackendAgent. Rationale: the real master tracker is one row per
+product order — du issues activity numbers, work orders, and
+activation dates per order, and partial activation of a bundle (one
+line activated, another still pending) is the normal case, not an edge
+case.
+
+Coarse status (per submission, not per bundle): pendingVerification →
+submittedToDu → inProgress → activated | rejected. hasDuAccount =
+informational badge (no skip logic). Append-only typed events (actor,
+ts, payload), also per submission:
 
 docsVerified · verificationCall {ts} · verificationEmail {ts} ·
 submittedToDu (auto-marks "proceeded without verification" if no
@@ -214,10 +252,13 @@ appointment {date, time, person} · biometric · sprObtained {note} ·
 correction {note} (backend trivial fixes) · note · activated {ts} ·
 rejected {reason from org list + note}
 
-Rejected → returns to submitting agent (fix + resubmit). Timeline
+Rejected → returns to submitting agent (fix + resubmit) — that specific
+submission only; siblings in the bundle are unaffected. Timeline
 read-only to submitting agent + their TL + manager; whole backend dept
-read/write per assignment. Doc-expiry warning at agent's desk when any
-document expires < 15 days (establishment card highlighted — SIM
+read/write per assignment (assignment is per submission — specialty-
+matched per category, rotation cursor advances once per submission
+created, not once per bundle). Doc-expiry warning at agent's desk when
+any document expires < 15 days (establishment card highlighted — SIM
 suspension). Backend tools: per-field copy + "Copy All" (du ticket
 field order — TBD from backend), "Export du Order Form" (filled
 Excel/PDF in the partner's format).
@@ -284,16 +325,22 @@ preview batches writes. Spark limits: 50K reads / 20K writes / 1GB.
 
 ## 10. Build Phases (revised)
 
-- **Session 2 (next, prompt ready)**: backup-export button FIRST →
-  merge wip-submissions → db.js gateway (orgId, audit fields, closedAt,
-  history cap, auditLog) → product soft-delete → orgId migration →
-  sameOrg() rules (migration runs BEFORE rules publish).
+- **Session 2 (complete, verified)**: merge wip-submissions → db.js
+  gateway (orgId, audit fields, closedAt, history cap) → product
+  soft-delete → orgId migration → sameOrg() rules (migration ran
+  BEFORE rules publish, as planned) → Pipeline pagination stopgap.
+  Remaining from this list, done THIS session before any Phase B
+  feature code: auditLog (gateway writes) and the backup-export button
+  (originally scoped to precede the orgId migration — migration
+  already ran and is verified safe, so this is now a forward-looking
+  prerequisite for every future migration/import, not a live gate).
 - **Phase B — schema + submissions v2**: company enrichment (contacts,
   address, accountCode, segment, expiries) + dedup by accountCode;
-  status+timeline replaces stages; per-category item fields (GAID…);
-  typeOfRequest; SPR; accTransfer; verification gate; rejection
-  reasons; doc-expiry warnings; StorageAdapter + b64 driver + pdf.js;
-  backend queue UI + event logging; copy/export tools.
+  status+timeline replaces stages (one submission = one product line,
+  see §5); per-category item fields (GAID…); typeOfRequest; SPR;
+  accTransfer; verification gate; rejection reasons; doc-expiry
+  warnings; StorageAdapter + b64 driver + pdf.js; backend queue UI +
+  event logging; copy/export tools.
 - **Phase C — stats engine** (rollups incl. AED values + families).
 - **Phase D — reports v1**: live team table, master tracker view,
   daily summary, rejection analytics, target/attainment incl. TL
