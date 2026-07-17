@@ -1,466 +1,318 @@
-# Sales Cockpit — Product Architecture Spec v1.1
+# Sales Cockpit — Product Architecture Spec v2.0
 
-Working spec for converting the du Sales Cockpit into a white-label, sellable
-B2B sales management product. Zero infrastructure cost to the vendor at all
+White-label B2B sales management product for du channel partners (generic —
+not Shaun Tech-specific). Zero infrastructure cost to the vendor at all
 client sizes. This document is the source of truth for all build phases.
 
-v1.1: validated against the actual repo (`main` @ b7c11a1). Section 0 records
-the audit findings; Phase A rewritten to match the real codebase state.
+v2.0 incorporates the full role-discovery: sales agent modes, external
+sources, backend event-timeline model, VAS service requests, KAM module
+(portfolio, escalations, billing, handover), manager/TL targets,
+commitments, and projections — plus the real report samples (daily team
+report, master tracker workbook, escalation tracker).
 
 ---
 
-## 0. Current-State Audit (repo `main` @ b7c11a1, July 2026)
+## 0. Current-State Audit (repo `main`, July 2026) — CONDENSED
 
-What exists:
-- `index.html` (329-line shell, CSS + entry script only) + 11 ES modules in
-  `js/` (~4,000 lines). **The module split is already done** (Phase 5).
-- `state.js` is the single point for Firebase init, config, constants, and
-  shared mutable state — good extraction point for `config.js`.
-- Permission-grant scaffolding (`permissions[]` + `hasPermission()` catalog)
-  shipped — reusable substrate for org-level capability config.
-- `companies` collection live with dedup/fuzzy-match/backfill;
-  `hasDuAccount` already anticipates pipeline-stage skipping.
+Full 17-finding audit lives in v1.1 history. Status after Claude Code
+Session 1 (complete, verified):
+- ✔ PII purge done (seed arrays deleted, git history rewritten with
+  git-filter-repo across all branches, force-pushed, verified clean;
+  old hashes submitted to GitHub Support for cache removal).
+- ✔ wip-submissions branch pushed (Phase 6+7 local work rescued).
+- ✔ /rules/firestore.rules = version-controlled source of truth.
+- ✔ Rule fixes published: submission read scoping (item 14), backend
+  active-check + department clearing (item 15).
+- ✔ config.js extracted (gitignored) + config.example.js committed.
+- ✔ TL Pipeline query = where('teamId'==) — fixes 30-item `in` cap +
+  orphaned-lead invisibility (items 5+9).
+- ✔ PROJECT_SPEC.md stale sections corrected.
 
-Critical gaps found (each mapped to a phase):
-1. **Unpushed work**: remote has only `main`, ending at Phase 5. The
-   submissions pipeline (Phase 6/7 Claude Code sessions: line items, doc
-   gating, backend assignment) exists only locally. Also
-   `PHASE5_SPEC_AND_HANDOFF.md` is referenced by the spec but not committed.
-   → Push immediately; commit all spec/handoff docs. (Pre-Phase-A)
-2. **No mutation gateway**: 57 direct Firestore mutation call sites across
-   7 modules. Blocks clean `orgId` stamping and rollup hooks. (Phase A)
-3. **No `orgId` anywhere** — zero occurrences in the codebase. (Phase A)
-4. **Full-collection scans**: `dashboard.js:17`, `leads.js:28` (all leads,
-   manager path), `org.js:141-143` (teams+users+leads at once). Breaks the
-   50K-read quota and UX at 200+ agent scale. (Phases C/D replace with
-   rollups + paginated scoped queries.)
-5. **`in`-query cap bug**: `leads.js:34` fetches TL leads via
-   `where('assignedTo','in',agIds)` — Firestore caps `in` at 30 values, so
-   a TL with 31+ agents silently loses leads. Replace with a
-   `where('tlId','==',uid)` query (field already written on leads).
-   (Phase A quick fix)
-6. **Security rules not version-controlled** — Firebase Console is the
-   source of truth. Unacceptable for multi-client reproducibility.
-   → `/rules/firestore.rules` in repo, Console updated only from repo.
-   (Phase A)
-7. Spec staleness: `PROJECT_SPEC.md` "Planned/Future" still lists the
-   module split as pending. Clean up so future sessions don't act on it.
-8. **PII exposure (URGENT — Phase A0)**: the 115 seed leads in `org.js`
-   (L1/L2 arrays) are real prospects — real names, business emails, and
-   personal phone numbers — committed to a PUBLIC repo, and present in git
-   history. Remediation: delete the L1/L2 arrays and `seedLeads()` (data
-   already lives in Firestore; a productized app seeds via CSV import, not
-   hardcoded data), then rewrite history with `git filter-repo` to purge
-   `org.js`'s old versions, and force-push. Sequence: push all pending
-   work FIRST, then purge, then force-push all branches.
-9. **TL visibility inconsistency (functional bug)**: `dashboard.js` fetches
-   TL leads via `where('teamId','==',CP.teamId)` but `leads.js` (Pipeline)
-   via `where('assignedTo','in',agentIds)`. Unassigned-in-team leads —
-   which member-removal deliberately creates — show in Dashboard counts
-   but are invisible in the TL's Pipeline, so TLs can never rescue
-   orphaned leads despite bulk-assign supporting "unowned". Fix together
-   with item 5: Pipeline TL query becomes `teamId ==`, matching Dashboard
-   and the security-rule scope.
-10. **String-derived analytics**: `dashboard.js closeMonthKey()` detects
-   close month by scanning `history[]` text for `'→ Closed'`. Fragile —
-   any stage rename or history-format change silently corrupts monthly
-   reporting. Interim: gateway writes a structured `closedAt` timestamp on
-   stage→Closed. Proper fix: Phase C rollups.
-11. **Product hard-delete**: products are `deleteDoc`-ed despite the
-   `active` flag existing. Must become soft-delete (`active:false`) BEFORE
-   submissions reference `productId` in line items (Phase B prerequisite).
-12. Small hygiene (fix during gateway migration): `esc()` applied to values
-   written INTO Firestore history in `org.js` (stores HTML entities as
-   data — escape at render, never at write); `confirmModal(msg)` injects
-   HTML unescaped (all current callers static — harden anyway); CSS token
-   typo `--t3:#5050780` (7 hex digits, invalid).
+Still open from audit: db.js mutation gateway + orgId stamping +
+sameOrg() rules (Session 2); rollups replace full-collection scans
+(Phase C); string-derived close-month analytics → structured closedAt
+(Session 2); product soft-delete (Session 2); backup-export button
+(Session 2, BEFORE orgId migration); hygiene one-liners (item 12).
 
-Local (unpushed) code audit — submissions build, reviewed July 2026:
-Status vs the handoff spec's day plan: Days 1–3 built (companies ✔ pushed;
-department/specialties/assignmentMode schema ✔; submission creation with
-line items, doc gating, rotation auto-assign ✔ local). Days 4–5 NOT built:
-no backend queue/stage-advancement UI, no correction loop, no
-Activated-based target calculation (dashboard.js unchanged).
-
-13. **Storage integration point**: the Blaze-blocked code is the
-   `uploadBytes` loop in `createSubmission()` (submissions.js). Replace
-   with the StorageAdapter (Section 4). Bonus with the firestore-b64
-   driver: document blobs join the SAME writeBatch as the submission doc —
-   atomic submit, no orphaned files on failure (the current
-   upload-then-commit sequence can orphan). Remove the firebase-storage
-   SDK import from state.js when on the b64 driver.
-14. **Rules — submission confidentiality hole**: read rule grants bare
-   `teamId` match for ANY role, so fellow sales agents can read each
-   other's submissions (and ID-document paths) — violates
-   PHASE5_SPEC_AND_HANDOFF.md §5 (agent, their TL, backend, manager ONLY).
-   Fix: teamId clause requires `role() == 'team_lead'`.
-15. **Rules — deactivated backend staff keep access**: backend clauses
-   check `department == 'backend'` only; soft-remove clears teamId/tlId
-   but NOT department, and rules never check `active`. Fix both: clear
-   `department` in the remove flow, and add `&& data.active != false` to
-   backend clauses (same get(), no extra read).
-16. **Rules — correction loop blocked**: submissions update is
-   manager/backend only, but Day 4's needsCorrection flow requires the
-   submitting AGENT to update (refix + resubmit). Add a narrow agent
-   update rule (own submission, blocked-item fields only) before building
-   the Day 4 UI against it.
-17. Known v1 tradeoffs (accepted, documented): assignmentCursor race
-   (concurrent submits can double-assign + lose an increment — rotation
-   skew only); cursor rule accepts any value/type from any auth user;
-   showLeadModal assumes one submission per lead (docs[0], Submit hidden
-   after first) — revisit for repeat orders.
-
-Note on the Firebase API key in `state.js`: web API keys are public by
-design (security lives in the rules), so this is not a leak — but the
-config block still moves to per-deployment `config.js` for white-labeling.
+Infrastructure: Firestore region confirmed `me-central2` (Dammam) — no
+latency issue. RULE: every client project must be created in
+me-central1/me-central2 (region is immutable after creation).
 
 ---
 
 ## 1. Business & Deployment Model
 
-**Model: White-label, per-client deployment.**
+White-label, per-client deployment. One product codebase; each client
+gets their own Firebase project + static hosting + one config.js
+(firebaseConfig, orgId, branding, storageDriver, featureFlags).
 
-- One product codebase (this repo) = the licensed product core.
-- Each client receives:
-  - Their own Firebase project (created under their Google account, or
-    created by vendor and ownership-transferred).
-  - Their own static hosting deployment (GitHub Pages / Netlify / Cloudflare
-    Pages — all free).
-  - One `config.js` file: Firebase keys, `orgId`, branding, feature flags,
-    storage driver selection.
-- Cost structure:
-  - Clients ≤ ~30 agents: Firebase Spark (free) is sufficient. Total infra
-    cost: $0 for everyone.
-  - Clients 50–300 agents: client upgrades *their own* project to Blaze
-    (~$20–60/month at this scale). Vendor cost remains $0.
-- Data custody: all client data, including ID documents (Emirates ID, Trade
-  License, Ejari), lives in the client's own Google Cloud project. Vendor
-  never stores or transports client PII. This is a core sales proposition.
-- Future path: the `orgId`-scoped data model (Section 3) allows a later
-  pivot to central multi-tenant SaaS without schema migration.
-
----
+- ≤ ~30 agents: Spark (free) suffices → $0 for everyone.
+- 50–300 agents: client upgrades THEIR project to Blaze (~$20–60/mo).
+- Data custody: all client data (incl. Emirates ID / Trade License
+  images) lives in the client's own Google Cloud project. Vendor never
+  holds client PII — core sales proposition.
+- Client-size variance is why central SaaS was rejected (shared 50K
+  reads/day dies at one 300-agent client). orgId model keeps a later
+  SaaS pivot open without schema migration.
+- Onboarding runbook: create project in me-central1/2 → enable
+  Auth+Firestore → publish rules from /rules/ → paste config.js →
+  deploy → seed org + manager account. Phase F rehearses this.
 
 ## 2. Codebase Structure
 
-The ES module split already exists (see Section 0) — this section defines
-the *target* structure, reached incrementally from the current `js/` layout,
-not a rewrite. Native ES modules, **no build step** (must remain deployable
-as static files on GitHub Pages). Current modules map as: `state.js` splits
-into `config.js` + `db.js` + constants; `org.js` (860 lines, largest) splits
-into `teams.js` + org admin; the rest keep their names.
+Native ES modules, no build step (GitHub Pages-compatible). Current 11
+modules + submissions.js. Target additions:
 
 ```
-/index.html          — shell: layout containers, module script tag only
-/config.js           — PER-DEPLOYMENT file (gitignored template committed
-                       as config.example.js): firebaseConfig, orgId,
-                       branding {appName, logoUrl, primaryColor},
-                       storageDriver: "firestore-b64" | "firebase-storage",
-                       featureFlags {}
-/src/
-  app.js             — bootstrap, router, module loader
-  auth.js            — Firebase Auth, session, role resolution
-  authz.js           — role/permission helpers (manager, team_lead, agent,
-                       backend)
-  db.js              — Firestore init, shared query helpers, orgId injection
-  storage/
-    index.js         — StorageAdapter interface: put(), get(), delete(),
-                       list(); driver chosen from config.storageDriver
-    driver-firestore-b64.js   — Base64-in-Firestore driver (free tier)
-    driver-firebase-storage.js — native Firebase Storage driver (Blaze)
-  documents.js       — upload UI, client-side compression pipeline,
-                       PDF→image conversion (pdf.js), retention policy
-  leads.js           — leads CRUD, assignment, history
-  submissions.js     — multi-stage pipeline, bundled products, doc gating,
-                       backend auto-assignment
-  companies.js       — Company entity CRUD
-  products.js        — org-scoped product catalog CRUD
-  scripts.js         — sales scripts feature
-  teams.js           — teams, TL sub-groups, targets
-  stats.js           — write-time rollup counter maintenance (Section 6)
-  reports.js         — reports engine + report registry (Section 7)
-  export.js          — SheetJS (xlsx) + print-CSS/jsPDF exporters
-  ui/                — shared components, modals, tables, toasts
-/rules/
-  firestore.rules    — versioned security rules
-  storage.rules      — versioned Storage rules (Blaze deployments only)
+/config.js            per-deployment (gitignored)
+/rules/firestore.rules
+/js/
+  db.js               mutation gateway: orgId stamp, audit fields,
+                      rollup hooks, auditLog writes  [Session 2]
+  storage/            adapter: driver-firestore-b64 | firebase-storage
+  documents.js        compression, pdf.js page→image, expiry capture
+  submissions.js      creation (exists) + timeline/status engine
+  backendqueue.js     backend dept queue + event logging UI
+  vas.js              VAS service-request tracker
+  kam.js              portfolio, 360° company view, handover
+  escalations.js      escalation tracker
+  billing.js          bill-status log + reminders + risk flags
+  sources.js          freelancer/subcontractor registry
+  commitments.js      TL pledges vs actuals
+  stats.js            rollup counters
+  reports.js          filter-grid report engine + registry
+  projections.js      run-rate / trend forecasts
+  import.js           CSV/Excel import w/ mapping + preview (SheetJS)
+  export.js           Excel (SheetJS) + PDF export; du order form
 ```
 
-Rules for Claude Code sessions:
-- Surgical edits only, per existing convention. Modules are small enough
-  that labelled replace blocks stay reviewable.
-- Every Firestore mutation goes through `db.js` helpers so `orgId` stamping
-  and rollup-counter updates (Section 6) cannot be bypassed.
+Convention: surgical labelled-replace edits only; one module per
+commit; ARCHITECTURE.md + PROJECT_SPEC.md are sources of truth.
 
----
+## 3. Tenancy & Data Model (additions in **bold**)
 
-## 3. Tenancy & Data Model
-
-Every document in every collection carries `orgId: string`. Non-negotiable,
-including in single-tenant deployments.
+Every doc carries orgId (Session 2 migration). sameOrg() rule pattern
+per v1.1 §3 (users-doc lookup; Spark-compatible).
 
 ```
-orgs/{orgId}
-  name, branding {}, departments [], commissionRules {},
-  featureFlags {}, docRetentionDays (default 90),
-  requiredDocsByProductCategory {}      // doc-gating config
-
-users/{uid}         orgId, role, tlId, teamId, department, active, targets
-teams/{teamId}      orgId, tlId, name, target
-companies/{id}      orgId, name, trn, tradeLicenseNo, expiry dates,
-                    contacts [], accountOwnerUid
-leads/{id}          orgId, companyId?, stage, assignedTo, tlId, teamId,
-                    history []
-submissions/{id}    orgId, companyId, agentUid, tlId, stage,
-                    lineItems [{productId, qty, term, mrc}],
-                    requiredDocs [{type, status: attested|uploaded|verified,
-                                   storageRef?}],
-                    backendAssignee, sla {enteredStageAt}, history []
-submissions/{id}/documents/{docId}      // firestore-b64 driver only
-                    orgId, type, pageIndex, mime, b64, bytes, uploadedBy,
-                    createdAt
-products/{id}       orgId, category, name, mrc, otc, specs {}, active
-scripts/{id}        orgId, channel, status, authorUid
-stats/{statId}      orgId, period, scope, counters {}   // Section 6
+orgs/{orgId}          config: branding, departments, docRetentionDays,
+                      requiredDocsByProductCategory,
+                      **typeOfRequestList** [NEW,FNP,MNP,Migration],
+                      **rejectionReasons** [], **escalationTypes** [],
+                      **vasRequestTypes** [], **vasStatuses** [],
+                      **kamHandover** {mode:auto|manual, rule:
+                        leastLoaded|roundRobin, rampCapPerWeek},
+                      **itemFieldsByCategory** {mobile:[msisdn,simSerial,
+                        passcode,commitmentPlan,handset], fiber:[gaid]},
+                      **productFamilies** [BSP, Fixed, …] (Ashok to
+                        finalize groupings)
+users/{uid}           role, teamId, tlId, department, specialties,
+                      available, monthlyTarget, **personalTarget**
+                      (TL only, nullable), permissions[]
+teams/{id}            department, assignmentMode, assignmentCursor,
+                      permissions[]
+companies/{id}        name, normalizedName, industry, city,
+                      **accountCode**, **segment** (SOHO|SME),
+                      **contacts** {authorizedPerson, phone, altPhone,
+                        technicalName, email},
+                      **addressBlock** {building, street, city, emirate,
+                        poBox, full},
+                      hasDuAccount (informational badge only),
+                      **docExpiries** {tradeLicense, establishmentCard,
+                        eid} (establishment card = SIM-suspension risk),
+                      **partnerHistory** [{type:gained|lost, partner,
+                        date, note}], **accountOwner** (KAM uid),
+                      **billing** {lastConfirmedPaidMonth, status:
+                        ok|pending|overdue, log:[{month, status,
+                        reminders:[{date, channel}]}]},
+                      **riskFlags** {docExpiry, billOverdue, churnList}
+leads/{id}            + **sourceId** (external source), **commission**
+                      {amount, paidTo, sourceRef?, note, enteredBy —
+                      TL/manager entry only}, closedAt (structured)
+sources/{id}          **type: freelancer|subcontractor, name, contact,
+                      terms, active** (manager-only; never get logins)
+submissions/{id}      leadId, companyId, agentId, teamId, tlId,
+                      **status: pendingVerification|submittedToDu|
+                        inProgress|activated|rejected** (coarse),
+                      **events[]** (append-only timeline — see §5),
+                      items[] {productId, qty, mrc, **typeOfRequest**,
+                        **contractTerm**, **categoryFields** (gaid /
+                        msisdn / simSerial / passcode — optional),
+                        **sprFlag + sprNote**},
+                      **accTransfer** {flag, fromPartner} (also writes
+                        company partnerHistory),
+                      **verification** {done, method:call|email, ts, or
+                        auto-mark "proceeded without verification"},
+                      requiredDocs[] {type, status, expiryDate,
+                        storageRef}, assignedBackendAgent
+serviceRequests/{id}  **VAS module**: companyId, accountNo, requestType,
+                      activityNo, status, notes, events[], raisedBy
+escalations/{id}      companyId, accountNo, **issueType** (configurable:
+                      account merger, waiver, .ae domain, CNAP, email
+                      change, prepaid…), **severity**, contactPerson,
+                      contactNumber, status (Open|InProgress|
+                      WaitingCustomer|WaitingDu|Resolved),
+                      **updates[]** (dated log), vasActivityNo?,
+                      openedAt, resolvedAt (→ resolution time)
+commitments/{id}      **tlId, agentId, period, metric: revenueAED|units,
+                      scope: product|family|category + ref, value**;
+                      actuals computed from rollups
+datasets/{id}         **manager-imported du data** (churn lists, cross-
+                      sell): parsed rows, mapping, sharedWith
+                      [kam, backend]; churn rows match companies by
+                      accountCode → set riskFlags.churnList
+stats/{...}           rollups — see §7
+auditLog/{id}         who, what, docRef, ts (gateway-written)
 ```
 
-Security rule pattern (Spark-compatible — no custom claims / Cloud
-Functions):
+## 4. Roles & Permissions
 
-```
-function userDoc()  { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
-function sameOrg()  { return userDoc().orgId == resource.data.orgId; }
-function isRole(r)  { return userDoc().role == r; }
-```
+- **Sales agents** (telecaller / outdoor / hybrid / BD — mode is a
+  label, ONE workflow): own leads, own pipeline, submit to backend,
+  see own submissions' timelines read-only, own stats, own commissions.
+- **Team lead (sales)**: full authority over assigned agents; team-
+  scoped data ONLY (leads, reports, timelines of team submissions,
+  commissions of own sub-group); records commitments; optional
+  personalTarget (set by manager). Team target = Σ agent targets +
+  personalTarget (if set). Team attainment counts ALL team closes incl.
+  TL's own; personal attainment counts only TL-owned deals.
+- **Backend**: whole dept sees all submissions; processes assigned
+  cases (specialty match, fallback = any available backend agent;
+  backend TL = coordinator, reassigns); verifies docs (call/email
+  event) or rejects with reason; logs timeline events; trivial fixes
+  logged as correction events; measured on submissions, activations,
+  submission→activation time; sees sales performance data across all
+  teams (data-keeper role — no restriction); generates all reports and
+  projections.
+- **KAM**: portfolio model (accountOwner); works existing clients
+  (cross-/upsell via normal pipeline), handles escalations + VAS,
+  tracks bills, monitors doc-expiry/churn risk; needs company 360°
+  view (services active = activated submissions, contract expiry =
+  activationDate + contractTerm, products in use, transfer history).
+  Handover: on activation, account → unassigned KAM queue (manual) or
+  auto-assign per org rule (leastLoaded default + rampCapPerWeek;
+  roundRobin option); manager can always reassign; ownership changes =
+  manager-only. No-KAM partners: backend or designated agent (via
+  permission grant) covers escalations/VAS/billing.
+- **Manager**: everything, everywhere; flexible report grid (scope ×
+  product dimension × time); sets all targets incl. TL personal;
+  enters/edits commissions; manages sources; imports du data + CSV
+  leads; assigns outsourced leads (keep → "Outsourced Revenue" line;
+  assign → counts to assignee's target; source tag per-lead only).
+- **External sources**: data entities only, never logins.
 
-Every `allow` clause requires `sameOrg()` plus the existing role logic.
-Writes additionally validate `request.resource.data.orgId == userDoc().orgId`
-so a client cannot write into another org even with a modified client.
+## 5. Submissions — Status + Event Timeline (replaces 5 fixed stages)
 
----
+Coarse status: pendingVerification → submittedToDu → inProgress →
+activated | rejected. hasDuAccount = informational badge (no skip
+logic). Append-only typed events (actor, ts, payload):
 
-## 4. Document Storage Subsystem
+docsVerified · verificationCall {ts} · verificationEmail {ts} ·
+submittedToDu (auto-marks "proceeded without verification" if no
+verification event exists) · activityNo {value} · workOrderNo {value} ·
+appointment {date, time, person} · biometric · sprObtained {note} ·
+correction {note} (backend trivial fixes) · note · activated {ts} ·
+rejected {reason from org list + note}
 
-### 4.1 Upload pipeline (all drivers)
+Rejected → returns to submitting agent (fix + resubmit). Timeline
+read-only to submitting agent + their TL + manager; whole backend dept
+read/write per assignment. Doc-expiry warning at agent's desk when any
+document expires < 15 days (establishment card highlighted — SIM
+suspension). Backend tools: per-field copy + "Copy All" (du ticket
+field order — TBD from backend), "Export du Order Form" (filled
+Excel/PDF in the partner's format).
 
-1. Accept: JPEG/PNG/HEIC images and PDF files.
-2. Images → canvas resize (max edge 1200px) → JPEG quality 0.72 →
-   target ≤ 300KB per image.
-3. PDFs → pdf.js renders each page to canvas at ~150 DPI → same JPEG
-   compression → one stored object per page. Page cap: 10 (configurable).
-   Rationale: verification is visual; page images are equivalent to the
-   original for backend checking, and this keeps PDFs inside the free
-   pipeline.
-4. Output of pipeline: array of {pageIndex, mime, blob, bytes} handed to
-   the StorageAdapter.
+## 6. Document Storage
 
-### 4.2 Driver A — `firestore-b64` (free tier, default)
+Unchanged from v1.1: StorageAdapter; firestore-b64 driver (free tier)
+— client-side canvas compression ≤300KB/page, pdf.js renders PDF pages
+→ JPEGs, blobs join the submission's writeBatch (atomic); retention
+sweep after terminal status (org.docRetentionDays), attestation +
+expiry dates kept forever. firebase-storage driver for Blaze clients.
+Physical/NAS storage rejected (no server, security, breaks white-
+label). du data files: not stored — parsed via import.js; extracted
+rows are the asset.
 
-- Each page stored as Base64 string in
-  `submissions/{id}/documents/{docId}` (one Firestore doc per page,
-  ≤ ~400KB after Base64 inflation; hard ceiling 900KB per doc).
-- Security: inherited from Firestore rules — same auth, same role scoping
-  as the submission itself. No public URLs exist. This is enforced access
-  control, not obscurity.
-- Capacity math: 1GB free ≈ ~3,000–4,000 stored pages. With retention
-  (below), effectively indefinite for clients ≤ ~30 agents.
-- Retention policy: when a submission reaches a terminal stage
-  (activated/rejected), a client-side sweep (runs on manager login) deletes
-  `documents/*` blobs older than `org.docRetentionDays`, leaving
-  `requiredDocs[].status = "verified"` as the permanent attestation record.
+## 7. Rollup Counters
 
-### 4.3 Driver B — `firebase-storage` (Blaze deployments)
+Write-time increments via gateway, same batch as the mutation.
+Dimensions per day + month, per scope (org | team | tl | agent |
+source | backendAgent), per product + category + family:
+submissionsCount, submissionsValueAED, activationsCount,
+activationsValueAED, rejectionsCount, rejectionReasons{},
+unitsByProduct/Family{}, inProgressCount/Value, stage-time sums
+(submission→activation), escalations opened/resolved + resolution-time
+sums, VAS counts. Blank metrics render as 0.
 
-- Path: `orgs/{orgId}/submissions/{subId}/{docId}/{page}.jpg`.
-- Storage rules mirror Firestore access logic via `firestore.get()`
-  cross-service lookups (the rules already drafted in Phase 7 — must be
-  live-tested before any client deployment relies on them).
-- Same StorageAdapter interface; switching drivers is a one-line config
-  change and requires no changes in feature code.
+## 8. Reports Catalog v2 (registry; all views export Excel/PDF; scoped:
+manager=all, TL=own team, agent=self, backend=all)
 
-### 4.4 Sizing guidance per client
+Validated against real samples:
+1. **Live daily team table** (replaces the 5:51pm WhatsApp screenshot):
+   per-agent MTD submissions/activations in AED + counts, team totals;
+   share/export button (the ritual survives, the compiling dies).
+2. **Master tracker view** (Sheet 1 as a live filterable grid; activity
+   no. / WO columns auto-filled from timeline events — fixes the
+   22/317 and 11/317 fill rates in the real file).
+3. **Daily summary** (Sheet 2 automated): today's submissions +
+   activations + in-progress pipeline, count + AED, split by product
+   family (BSP/Fixed).
+4. **Rejection analytics** — THE money report (62% rejection rate in
+   real data): reasons × agent × doc type × time; deficiency rate.
+5. Target vs achievement (agent/TL/team/dept; incl. TL personal
+   tracker); leaderboards; product mix; funnel conversion.
+6. **Commitments vs actuals** (per TL, per agent, per period).
+7. **Projections**: month-end run-rate, 3-month weighted baseline,
+   trend arrow (up/flat/down) per agent/TL/team/dept; methodology
+   labeled on-report; TL=own scope, manager+backend=all.
+8. Retention pack: contract-expiry pipeline (30/60/90d), churn/lost
+   accounts, **expiring documents across activated accounts**
+   (establishment cards first), **bill-risk list**, transfer
+   won/lost by partner, upsell radar, **unassigned-accounts aging**
+   (anti-hoarding), portfolio load per KAM.
+9. Escalation reports: open by status/severity/type, resolution time,
+   recurrence by company (training use).
+10. VAS tracker view. 11. Outsourced revenue + per-source production +
+   payout statements (commission ledger). 12. Backend ops: queue by
+   status, workload per backend agent, TAT, SLA breaches.
 
-| Client size    | Plan   | Driver            | Est. client cost |
-|----------------|--------|-------------------|------------------|
-| ≤ 30 agents    | Spark  | firestore-b64     | $0               |
-| 30–100 agents  | Blaze  | firebase-storage  | ~$5–25 /mo       |
-| 100–300 agents | Blaze  | firebase-storage  | ~$20–60 /mo      |
+## 9. Quota Discipline
 
----
+Unchanged: no unbounded scans (reports read rollups; drill-downs
+date-scoped + paginated); reference data cached per session; import
+preview batches writes. Spark limits: 50K reads / 20K writes / 1GB.
 
-## 5. Quota Discipline (Spark survival rules)
+## 10. Build Phases (revised)
 
-Spark limits: 50K reads / 20K writes per day, 1GB storage.
+- **Session 2 (next, prompt ready)**: backup-export button FIRST →
+  merge wip-submissions → db.js gateway (orgId, audit fields, closedAt,
+  history cap, auditLog) → product soft-delete → orgId migration →
+  sameOrg() rules (migration runs BEFORE rules publish).
+- **Phase B — schema + submissions v2**: company enrichment (contacts,
+  address, accountCode, segment, expiries) + dedup by accountCode;
+  status+timeline replaces stages; per-category item fields (GAID…);
+  typeOfRequest; SPR; accTransfer; verification gate; rejection
+  reasons; doc-expiry warnings; StorageAdapter + b64 driver + pdf.js;
+  backend queue UI + event logging; copy/export tools.
+- **Phase C — stats engine** (rollups incl. AED values + families).
+- **Phase D — reports v1**: live team table, master tracker view,
+  daily summary, rejection analytics, target/attainment incl. TL
+  personal.
+- **Phase E — KAM + ops modules**: portfolio + handover + 360° view;
+  escalations; billing; VAS; sources + commissions; commitments;
+  du-data import; retention/risk reports; projections.
+- **Phase F — productization proof**: second project (me-central1/2),
+  demo org, onboarding runbook. **Phase G**: Blaze track (firebase-
+  storage driver live test) for first large client.
+- Cross-cutting (from security/observability review): read-scoping
+  overhaul + denormalized names (before first external sale), App
+  Check, Sentry, diagnostics panel, version stamping, import preview.
 
-- No unbounded collection reads. Every list query is scoped: date range +
-  role scope (agent sees own, TL sees sub-group, manager sees org) + limit
-  with pagination.
-- Reports never scan raw collections by default — they read rollup docs
-  (Section 6). Drill-downs query raw data only on explicit user action,
-  date-scoped.
-- Cache immutable reference data (products, org config) in memory per
-  session; subscribe with `onSnapshot` only where live updates matter
-  (queues, pipelines).
+## 11. Commercial Packaging
 
----
-
-## 6. Rollup Counters (stats engine)
-
-Write-time aggregation so reports cost ~10 reads instead of ~10,000.
-
-- Every mutation that changes reportable state (lead stage change,
-  submission stage change, activation, rejection, activity log) also
-  updates counter docs in the same batched write via `stats.js`:
-
-```
-stats/{orgId}_{YYYY-MM}_{scope}
-  scope ∈ org | team:{teamId} | agent:{uid} | product:{productId}
-  counters: {
-    leadsNew, leadsQualified, submissions, activations, rejections,
-    mrcSubmitted, mrcActivated, unitsByCategory {},
-    stageEntries {stage: count}, stageDurationsMs {stage: totalMs},
-    rejectionReasons {reason: count}, activityCounts {type: count}
-  }
-```
-
-- Daily docs (`YYYY-MM-DD`) for flash/leaderboard reports; monthly docs for
-  everything else. Increments via `FieldValue.increment()` — idempotency
-  guarded by writing counter updates in the same batch as the state change.
-- Stage TAT: on every stage transition, add `(now - enteredStageAt)` to
-  `stageDurationsMs[previousStage]` and increment `stageEntries`; average =
-  duration / entries.
-
----
-
-## 7. Reports Catalog (registry in reports.js)
-
-Each report = {id, audience, source: rollup|raw, filters, columns,
-exporters}. Ship in this order.
-
-**Manager**
-1. Target vs Achievement — agent/TL/team; MTD, QTD, YTD; rollups.
-2. Leaderboard Flash — daily/weekly; rollups (daily docs).
-3. Product Mix — units + MRC by product/category, bundle attach rate; rollups.
-4. Funnel Conversion — lead→qualified→submitted→activated, per-stage
-   drop-off %; rollups.
-5. Pipeline Forecast — weighted open pipeline vs target gap; raw
-   (date-scoped) + rollups.
-6. Rejection & Doc-Deficiency Analysis — reasons, deficiency rate by agent;
-   rollups.
-
-**Team Lead**
-7. Daily Activity per Agent — calls/visits/follow-ups/new leads; rollups.
-8. Lead Aging — untouched > X days; raw, scoped to sub-group.
-9. Agent Pacing — run-rate vs month-end target; rollups.
-
-**Backend/Ops**
-10. Queue Status — pending by stage, workload per backend agent; raw
-    (live onSnapshot, tightly scoped).
-11. SLA / TAT Report — avg time per stage, aging buckets, breach list;
-    rollups + raw for breach detail.
-
-**Retention (product differentiator)**
-12. Contract Expiry Pipeline — renewals due 30/60/90 days; raw over
-    `companies`/`submissions` term data.
-13. Churn Report — lost accounts, reasons, MRC value; rollups.
-14. At-Risk Accounts — no activity ≥ N days, complaint flag; raw, scoped.
-15. Upsell Radar — single-product companies → bundle candidates; raw.
-
-**Finance**
-16. Commission Statement — per agent from org commissionRules × activated
-    MRC; rollups.
-17. Activation Report — submitted vs activated vs billed; rollups.
-
-All reports export via `export.js`: Excel (SheetJS) and PDF (print CSS /
-jsPDF). Client-side only, free.
-
-Note: validate this catalog against the real report samples and
-B2B-telecom-specific documents when provided; adjust registry, not
-architecture.
-
----
-
-## 8. Build Phases
-
-**Phase A0 — Repo hygiene + PII purge (do first, same day)**
-1. Push all local work (submissions pipeline) to `wip-submissions`; commit
-   `PHASE5_SPEC_AND_HANDOFF.md`, `ARCHITECTURE.md`, and any local-only docs.
-2. Delete the L1/L2 seed arrays + `seedLeads()` + the seed banner from
-   `org.js` (audit item 8) and commit.
-3. Rewrite git history (`git filter-repo` on `org.js` blobs, or BFG) to
-   purge the PII from all history, then force-push all branches. Verify on
-   github.com that old `org.js` versions no longer contain the data.
-4. Pull current Firestore rules from the Console into
-   `/rules/firestore.rules` verbatim.
-5. Fix the stale "Planned/Future" section of `PROJECT_SPEC.md`.
-
-**Phase A — Foundation refactor**
-1. Extract `config.js` from `state.js` (firebaseConfig, orgId, branding,
-   storageDriver, feature flags); commit `config.example.js`, gitignore the
-   real one per deployment.
-2. Build the `db.js` mutation gateway and migrate all 57 direct mutation
-   call sites (org.js, leads.js, scripts.js, products.js, companies.js,
-   auth.js, state.js) through it. Gateway responsibilities: `orgId`
-   stamping, audit fields, and (Phase C) rollup hooks.
-3. `orgId` migration: one-off manager-session script stamps `orgId` on all
-   existing docs across users/teams/leads/companies/channels/scripts/
-   products; then rules updated with `sameOrg()` and republished from the
-   now-version-controlled rules file.
-4. Quick fixes while touching these files: replace the `leads.js:34`
-   `in`-query with `where('teamId','==',CP.teamId)` — one change fixes
-   both the 30-item `in` cap (item 5) AND the TL orphaned-lead visibility
-   bug (item 9), and matches Dashboard + the security-rule scope; make
-   product delete soft (`active:false`, item 11); gateway writes
-   structured `closedAt` on stage→Closed (item 10); the hygiene
-   one-liners from item 12; add `limit()` + pagination to manager
-   full-collection lead scans as a stopgap until Phase C.
-5. Regression pass on all role flows (manager / TL / agent) — the Phase 5
-   permission-audit checklist is the test script.
-
-**Phase B — Documents + submissions completion**
-1. StorageAdapter + firestore-b64 driver; image compression; pdf.js
-   page-to-image. Integration point: replace the `uploadBytes` loop in
-   `createSubmission()` (audit item 13) — blobs join the submission's own
-   writeBatch (atomic submit). `files[].storagePath` becomes a generic
-   `storageRef` the adapter resolves per driver.
-2. Rule fixes from audit items 14–16 (submission read scoping, active
-   check + department clearing, agent correction-loop update rule) —
-   publish from /rules/, live-test with real accounts per role.
-3. Build Days 4–5 from the handoff spec: backend queue tab +
-   per-item stage advancement (activityRef/workOrderRef gates,
-   needsCorrection/rejected branch, resume at pausedAtStage), then
-   Activated-based target calculation on the Dashboard (second
-   calculation keyed off items[].activatedAt — kept separate from
-   Closed-based numbers, per handoff spec §2a).
-4. Retention sweep for document blobs (terminal-stage purge after
-   org.docRetentionDays, attestation record kept).
-Completes the blocked Phase 7 work with zero cost.
-
-**Phase C — Stats engine**
-`stats.js` rollups wired into every existing mutation path; backfill
-script for historical data.
-
-**Phase D — Reports v1**
-Registry + manager reports 1–6 + exports.
-
-**Phase E — Reports v2**
-TL, Backend, Retention, Finance reports (7–17).
-
-**Phase F — Productization proof**
-Second Firebase project + second deployment from same repo with only a new
-`config.js`; seed a demo org; this deployment doubles as the sales demo
-environment. Write the client-onboarding runbook (create project → enable
-Auth/Firestore → paste config → deploy → seed org + manager account).
-
-**Phase G — Blaze track (first large client)**
-firebase-storage driver + live-test storage.rules; quota load check.
-
----
-
-## 9. Commercial Packaging (sketch)
-
-- Tiered license by agent count (e.g., Starter ≤15 / Growth ≤50 /
-  Enterprise ≤300), priced as setup fee + monthly license & support.
-- Client owns their Firebase project and data; vendor licenses software +
-  provides updates (git pull / release tags) and support.
-- Demo environment = Phase F deployment.
+Tiered license by agent count (Starter ≤15 / Growth ≤50 / Enterprise
+≤300): setup fee + monthly license & support. Client owns project +
+data; vendor licenses software + updates + support. Differentiators to
+lead the pitch: rejection analytics, suspension-risk early warning
+(docs + bills), live daily numbers without compiling, du order-form
+export, projections/commitments, escalation memory.
