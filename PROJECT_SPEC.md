@@ -1,5 +1,5 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **ARCHITECTURE.md Phase A0/A (multi-tenancy foundation) shipped** — `js/db.js` mutation gateway built and every module migrated through it, one-off `orgId` backfill run live across all 259 existing docs, and `rules/firestore.rules` rewritten with the `sameOrg()`/`sameOrgWrite()` org-scoping pattern (published to the Firebase Console and confirmed working after a critical bootstrap-bug fix — see Firestore Security Rules and Phase A0/A below). **`wip-submissions` merged into `main`** — companies, backend-department schema, and submission creation (Phases 5-7 of the original handoff numbering) are all now on `main`. Submission file upload is still blocked pending a Storage decision (Blaze plan cost — see ARCHITECTURE.md Section 4). **`ARCHITECTURE.md` is now the authoritative spec for all future work** (product architecture, its own Phase A0-G build plan, and the current-state audit) — this file stays as historical/reference documentation for what's already shipped.
+**Last updated:** July 2026 | **ARCHITECTURE.md v2.0 Phase B (submissions v2) shipped** — `js/submissions.js` rewritten around one-doc-per-product-line + `bundleId` (replaces the old 5-fixed-stage `items[]` design), the `appendEvent` timeline engine, company enrichment + scalable accountCode/type-ahead lookups (no more full-collection company scans), `auditLog` gateway writes, and a real batch-chunking bug fix (auditLog was silently doubling writes-per-op past Firestore's 500-write cap). See Phase B below for the full list. Phase A0/A (multi-tenancy foundation — `js/db.js` gateway, `orgId` migration, `sameOrg()` rules) shipped in the prior session, unchanged since. **`ARCHITECTURE.md` is the authoritative spec for all future work** — this file stays as historical/reference documentation for what's already shipped.
 
 ---
 
@@ -27,37 +27,54 @@ index.html          — HTML shell + all CSS, loads js/main.js as the sole entry
 js/state.js          — Firebase init (db/auth/auth2), SEED_EMAILS, STAGES, SP, mutable CU/CP/TAB
                         (exported as live bindings; only state.js's own setUser()/setTab() may
                         reassign them — every other module just imports and reads)
-js/db.js             — NEW (Phase A) — single Firestore mutation gateway: dbAdd/dbSet/dbUpdate/
-                        dbDelete/newBatch/batchAdd/batchSet/batchUpdate/batchDelete. Every module's
-                        direct addDoc/setDoc/updateDoc/deleteDoc/writeBatch call has been migrated
-                        through this file (see Phase A0/A below). Stamps `orgId` from config.js on
-                        every create, centralises createdBy/createdAt/lastEditedBy/lastEditedAt,
-                        auto-writes a structured `closedAt` on `stage`→`'Closed'`, caps `history[]`
-                        at 100 entries (keeps the tail). `opts.skipAudit:true` escape hatch for the
-                        handful of call sites bound by a narrow `affectedKeys().hasOnly([...])` rule
-                        (teams.assignmentCursor rotation, scripts.pendingApproval withdraw/suggest/
-                        reject, and the orgId migration itself — see below).
+js/db.js             — single Firestore mutation gateway: dbAdd/dbSet/dbUpdate/dbDelete/newBatch/
+                        batchAdd/batchSet/batchUpdate/batchDelete/logBulkAudit. Every module's
+                        direct addDoc/setDoc/updateDoc/deleteDoc/writeBatch call is migrated
+                        through this file. Stamps `orgId` from config.js on every create,
+                        centralises createdBy/createdAt/lastEditedBy/lastEditedAt, auto-writes a
+                        structured `closedAt` on `stage`→`'Closed'`, caps `history[]` at 100
+                        entries, writes one `auditLog` doc per mutation in the SAME batch.
+                        `opts.skipAudit:true` skips BOTH the audit fields AND the auditLog write —
+                        used for narrow `affectedKeys().hasOnly([...])`-bound call sites, the orgId
+                        migration, auth.js's self-registration bootstrap (CU/CP still null there),
+                        and every bulk-op loop (see `logBulkAudit()`'s own doc comment — N ops
+                        would otherwise double to 2N writes and blow Firestore's 500-write batch
+                        cap). `logBulkAudit(description, count)` writes ONE summary entry for an
+                        entire bulk run in place of the per-op trail it can't afford.
 js/helpers.js         — v, esc, now, fmtDate, disable, enable, toast, modal, closeModal,
                         confirmModal, stagePill, calculateTLTarget, buildMsFilter, wireMsFilter
 js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routing, change-password
 js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData,
                         Companies card (list/edit/backfill), permission-checklist wiring,
-                        runOrgIdMigration (NEW, Phase A — one-off manager-triggered orgId
-                        backfill, banner+button UX matching repairLeadTeamData, safe to re-run)
-js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal
-                        (add-lead includes the company search/fuzzy-match picker), and the
-                        Submit to Backend modal (shown on Closed leads with a companyId).
-                        Pipeline tab is server-side paginated (NEW, Phase A — see Phase A0/A
-                        below), 25 leads/page, numbered page buttons; requires 5 Firestore
-                        composite indexes (created, see Firestore Security Rules below).
-js/companies.js       — normalizeCompanyName, findFuzzyMatch, fetchCompanies,
-                        findOrCreateCompany, backfillCompanies — the one shared
-                        implementation used by both the lead picker and the backfill
+                        runOrgIdMigration (one-off manager-triggered orgId backfill, banner+button
+                        UX matching repairLeadTeamData, safe to re-run), runBackupExport
+                        (manager-only, downloads one timestamped JSON of every org-scoped
+                        collection), commitBulkOps (shared chunked-bulk-commit helper for this
+                        file's 4 cascades — team delete, member removal, hard-delete,
+                        department-change — CHUNK 200 + skipAudit + one summary logBulkAudit call)
+js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal (type-ahead
+                        company picker via companies.js's searchCompanies — see below), Submit to
+                        Backend modal (bundle creation, one submission doc per product line), and
+                        the read-only Submission Timeline view (showSubmissionTimelineModal).
+                        Pipeline tab is server-side paginated, 25 leads/page, numbered page
+                        buttons; requires 5 Firestore composite indexes (created, see Firestore
+                        Security Rules below).
+js/companies.js       — normalizeCompanyName, findFuzzyMatch (operates ONLY on an already-fetched
+                        ≤10-doc candidate set, never a full scan), fetchCompanies (raw full scan —
+                        ONLY for backfillCompanies + the Org tab Companies card, never a picker),
+                        searchCompanies (type-ahead: debounced prefix-range query on
+                        normalizedName + parallel accountCode check), findCompanyByAccountCode
+                        (single targeted read), findOrCreateCompany (two targeted reads —
+                        accountCode then normalizedName — never a full scan), backfillCompanies
 js/permissions.js     — PERMISSIONS catalog, hasPermission(), searchable checklist
                         HTML/wiring for Edit Team/Edit User modals
-js/submissions.js     — computeRequiredDocs, pickBackendAgent (rotation-based auto-assign),
-                        createSubmission (uploads files, resolves per-item stage/assignment,
-                        writes the submission doc) — pure logic; the modal UI lives in leads.js
+js/submissions.js     — computeRequiredDocs, docExpiryWarnings (company docExpiries within 15
+                        days, establishment card flagged specially), pickBackendAgent
+                        (rotation-based auto-assign with a fallback to any available agent if no
+                        specialty matches), createSubmissions (plural — one doc per product line,
+                        shared bundleId, no file upload this session), appendEvent (the event/
+                        status-transition engine — every timeline write goes through this) —
+                        pure logic; the modal UI lives in leads.js
 js/dashboard.js       — Dashboard tab
 js/scripts.js         — Scripts tab, channels, approval workflow
 js/products.js        — Products tab, seed catalog, discounts, waivers, PRODUCT_CATEGORIES
@@ -221,79 +238,146 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
 {
   name,                            // display name
   normalizedName,                  // lowercase, diacritics/punctuation stripped, whitespace
-                                    // collapsed — the dedup key (see normalizeCompanyName())
+                                    // collapsed — the SECOND dedup key (see normalizeCompanyName())
+  accountCode,                     // NEW — the FIRST/stronger dedup key (exact du account
+                                    // reference; two different companies could coincidentally
+                                    // share a similar name, never a real account code)
+  segment: 'SOHO' | 'SME' | null,
+  contacts: { authorizedPerson, phone, altPhone, technicalName, email },
+  addressBlock: { building, street, city, emirate, poBox, full },
   industry, city,
-  hasDuAccount: boolean,           // drives whether a future submission skips Account Creation
+  hasDuAccount: boolean,           // informational badge ONLY — no longer drives any submission
+                                    // skip logic (ARCHITECTURE.md §5)
+  docExpiries: { tradeLicense, establishmentCard, eid },  // dates; establishment card expiry
+                                    // triggers a SIM-suspension-risk warning at submit time
+  partnerHistory: [ {type:'gained'|'lost', partner, date, note} ],  // append-only; an accTransfer
+                                    // on a submission auto-appends a 'gained' entry here
+  accountOwner: userId | null,     // KAM uid — KAM role/module doesn't exist yet (Phase E);
+                                    // exposed as a plain user picker in the meantime
+  billing: { lastConfirmedPaidMonth, status:'ok'|'pending'|'overdue', log:[] },  // skeleton only
+                                    // — log[] isn't populated/managed by any UI yet
+  riskFlags: { docExpiry, billOverdue, churnList },  // NOT exposed in any edit UI — system-computed
+                                    // (doc-expiry proximity, billing status, churn-list import),
+                                    // none of which is built yet
   createdBy, createdAt,
-  mergedInto: null | companyId,    // soft-merge marker — not yet used, merge UI not built (v1
-                                    // cut per PHASE5_SPEC_AND_HANDOFF.md section 3/4)
+  mergedInto: null | companyId,    // soft-merge marker — not yet used, merge UI not built
   lastEditedBy, lastEditedAt
 }
 ```
-- Dedup key is `normalizedName` equality (exact), not the fuzzy check — fuzzy match
-  (Levenshtein, `js/companies.js`) is only a "did you mean X?" nudge on entry, shown inline
-  in the Add Lead modal, not a hard block.
+All the enrichment fields above (everything from `accountCode` through `riskFlags` except
+`industry`/`city`) are **optional/nullable** — existing docs stay valid without them, only
+populated once someone opens the Edit Company modal (Org tab, manager-only, `edit_companies`
+permission-gated) and fills them in.
+
+- **Dedup, two targeted reads, never a full scan** (`findOrCreateCompany`, ARCHITECTURE.md §9 —
+  a real partner can carry 1,000-3,000+ companies): `where('accountCode','==',code) limit(1)`
+  first (stronger identity signal), then `where('normalizedName','==',norm) limit(1)`. Neither
+  needs a composite index.
+- **Type-ahead search** (`searchCompanies`, every company picker): debounced (300ms), min 2 chars,
+  a single-field prefix-range query on `normalizedName` (`limit(10)`, no composite index) plus a
+  parallel exact `accountCode` lookup when the typed term contains a digit. The Add Lead modal
+  surfaces two independent nudges — a fuzzy "did you mean X?" (operates ONLY on the ≤10 already-
+  fetched suggestions, never a full scan) and an exact "this account code already exists" match.
+- `fetchCompanies()` (the raw full scan) still exists for exactly two deliberate, documented
+  exceptions: `backfillCompanies()` (one-off, manager-only, safe to re-run) and the Org tab's
+  Companies card listing (not yet paginated — a known, not-yet-addressed gap, same category as
+  the Pipeline tab was before its own pagination stopgap).
 - One-time backfill (`backfillCompanies()`, triggered by the manager-only "🏢 Backfill
   Companies" button in the Org tab when any lead has `company` set but no `companyId`) groups
   existing leads by `normalizedName`, creates one company doc per unique group, writes
   `companyId` back onto each lead. Safe to re-run — skips names that already resolve to an
-  existing company.
+  existing company. Bulk writes use `skipAudit:true` + one summary `auditLog` entry (see Firestore
+  Security Rules below) — CHUNK reduced to 200.
 - Manager-only "Companies" card in the Org tab lists all companies (name, industry, city,
-  du Account, linked lead count) with an Edit action (industry/city/hasDuAccount). No merge
-  tool yet — deliberately deferred, per spec, until duplicate volume is visible in practice.
+  du Account, linked lead count) with an Edit action exposing every enrichment field above. No
+  merge tool yet — deliberately deferred until duplicate volume is visible in practice.
 - Blocking prerequisite for the backend-department/submissions/reports/document-expiry work —
   see `PHASE5_SPEC_AND_HANDOFF.md`.
 
-### `submissions` (Phase 7) — agent → backend handoff
+### `submissions` (v2, ARCHITECTURE.md §3/§5) — agent → backend handoff
+**Schema amendment: one submission DOC = one product line, not an items[] array.** A single
+Submit-to-Backend form composing N product lines creates N submission docs, all sharing a
+client-generated `bundleId`. The agent's Pipeline/lead-modal view groups siblings by `bundleId`
+into one visual package, but each doc has its own status, events[] timeline, and
+`assignedBackendAgent` — matches the real master tracker's one-row-per-order shape and lets one
+line activate while a sibling is still pending (the normal case, not an edge case).
 ```
 {
+  bundleId,                        // links sibling submissions from the same form — NOT itself a doc
   leadId, companyId,
   agentId, agentName,
   teamId, tlId,                     // sales team/TL credit, snapshotted at submit time
-  items: [
-    {
-      itemId, productId, productName, category, subType,  // productName/category/subType are
-                                     // SNAPSHOTS — a later catalog change must not rewrite history
-      dealValue,
-      stage: 'Account Creation' | 'Financial Approval' | 'Activity' | 'Work Order' | 'Activated',
-      activityRef: null|string, workOrderRef: null|string,   // required before advancing past
-                                     // Activity/Work Order — not yet enforced (Phase 8, stage
-                                     // advancement UI doesn't exist yet)
-      blocked: null | 'needsCorrection' | 'rejected', pausedAtStage: null|stageName, correctionNote,
-      stageHistory: [ { ts, actorId, actorName, stage, note } ],
-      assignedBackendAgent: userId|null, activatedAt: null|timestamp
-    }
-  ],
-  requiredDocs: [ docType, ... ],   // MANDATORY_DOC_TYPES + any per-product requiredDocuments,
-                                     // computed at submit time and stored (not re-derived later)
-  files: [ { docType, name, storagePath, uploadedAt, uploadedBy, size, type } ],
-  submittedAt, submittedBy, createdAt, lastEditedBy, lastEditedAt
+  productId, productName, category, // productName/category are SNAPSHOTS — a later catalog
+                                     // change must not rewrite history
+  qty, mrc,                         // mrc = monthly recurring charge (replaces the old dealValue)
+  typeOfRequest,                    // one of ORG_DEFAULTS.typeOfRequestList (NEW/FNP/MNP/Migration)
+  contractTerm,                     // months, from the selected pricingOption
+  categoryFields: {},               // ORG_DEFAULTS.itemFieldsByCategory[category] — ALL optional
+                                     // (fiber categories: gaid; Mobile: msisdn/simSerial/passcode/
+                                     // commitmentPlan/handset)
+  sprFlag, sprNote,                 // Special Pricing Request
+  accTransfer: { flag, fromPartner }, // bundle-level; when flagged, ALSO appends a partnerHistory
+                                     // 'gained' event to the company (same batch, atomic)
+  status: 'pendingVerification' | 'submittedToDu' | 'inProgress' | 'activated' | 'rejected', // coarse, PER SUBMISSION
+  events: [ { type, actorId, actorName, ts, payload } ],  // append-only timeline, see below
+  verification: { done, method: 'call'|'email'|null, ts } | null,  // structured summary,
+                                     // maintained alongside events[] so the UI doesn't need to
+                                     // scan the timeline to show verified-or-not
+  requiredDocs: [ { type, status:'attested', expiryDate } ],  // doc checklist + expiry dates only
+                                     // this session — NO file upload yet (StorageAdapter is next
+                                     // session); computed at submit time (union across the whole
+                                     // bundle) and stored, not re-derived later
+  assignedBackendAgent: userId|null,
+  createdAt, lastEditedBy, lastEditedAt
 }
 ```
-- `SUBMISSION_STAGES` and `MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)']`
-  live in `js/state.js`. Per-product extras (`products.requiredDocuments: [{docType,label}]`) are
-  empty/TBD until Ashok defines them — `computeRequiredDocs()` already reads the field, so no
-  code change is needed when he does.
-- Every item starts at `Financial Approval` instead of `Account Creation` when
-  `companies.hasDuAccount === true` at submit time.
-- **Assignment (v1, `js/submissions.js` pickBackendAgent):** candidates are backend-department
-  agents in the team who are `available !== false` and either have no `specialties` (generalist)
-  or list the item's category. Zero matches → `assignedBackendAgent: null` (shared queue). One
-  match → assigned directly. Multiple matches → simple rotation via `teams.assignmentCursor`
-  (incremented per auto-assignment, not a load-balancer — see spec section 1). Manual-mode teams
-  leave every item unassigned for the TL to assign by hand (that UI is Phase 8).
-- **v1 simplification, not yet in the spec's own words:** assignment only considers the first
-  team with `department:'backend'` found in `teams` — multi-backend-team routing isn't designed
-  yet. If no backend team exists, every item is simply left unassigned.
-- **Submit to Backend UI** (`js/leads.js` showSubmitModal) appears on a Closed lead with a
-  `companyId`, for the assigned agent or manager, once no submission already exists for that
-  lead (1 lead → at most 1 submission, v1 assumption). Gates the Submit button until every
-  `requiredDocs` entry has a tagged uploaded file and at least one product line item is added.
-- Files upload directly to Firebase Storage (`js/state.js` exports `storage`/`ref`/`uploadBytes`)
-  under `submissions/{submissionId}/{timestamp}_{filename}` — only `storagePath` is stored, no
-  download URL (nothing needs to display/download a file yet; that's Phase 8).
-- **No backend-side queue view, stage advancement, or correction loop yet** — this is Phase 8.
-  Right now a submission can be created and assigned but nothing reads it back.
+- `SUBMISSION_STATUSES` (replaces the old `SUBMISSION_STAGES`) and
+  `MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)']` live in
+  `js/state.js`, alongside the new `ORG_DEFAULTS` (typeOfRequestList, rejectionReasons,
+  itemFieldsByCategory) — hardcoded for now, shaped to match a future `orgs/{orgId}` config doc.
+- `hasDuAccount` skip logic is **gone** — every submission starts at `pendingVerification`
+  regardless; `hasDuAccount` is purely an informational badge now.
+- **Event engine (`js/submissions.js appendEvent`)** — every timeline entry goes through here,
+  never a direct `dbUpdate`. Event types: `docsVerified`, `verificationCall`, `verificationEmail`,
+  `submittedToDu`, `activityNo{value}`, `workOrderNo{value}`, `appointment{date,time,person}`,
+  `biometric`, `sprObtained{note}`, `correction{note}`, `note{text}`, `activated`,
+  `rejected{reason,note}`, `resubmit{note}`. Status transitions ride the same call:
+  `submittedToDu`/`activated`/`rejected`/`resubmit` set status directly; `submittedToDu` with no
+  prior verification auto-appends a `proceededWithoutVerification` event; any other event bumps
+  `submittedToDu` → `inProgress` (first real backend touch implies work has started); `rejected`
+  requires `payload.reason` from `ORG_DEFAULTS.rejectionReasons`.
+- **Assignment (`js/submissions.js pickBackendAgent`, per SUBMISSION not per bundle):** candidates
+  are available backend-department agents in the team who either have no `specialties`
+  (generalist) or list the item's category. **No match at all (not even a generalist) now falls
+  back to ANY available backend agent** — a specialty mismatch should never leave a submission
+  unassigned when staff exist to work it. Zero available agents (or no backend team) → unassigned
+  (shared queue). Rotation cursor (`teams.assignmentCursor`) advances once per submission created.
+- **v1 simplification, unchanged:** assignment only considers the first team with
+  `department:'backend'` found in `teams` — multi-backend-team routing isn't designed yet.
+- **Submit to Backend UI** (`js/leads.js showSubmitModal`) appears on a Closed lead with a
+  `companyId`, for the assigned agent or manager, once no submission already exists for that lead
+  (v1 tradeoff, unchanged — repeat orders on the same lead are a future revisit). Per-line product
+  + term + qty + MRC + typeOfRequest + category fields + SPR; bundle-level account-transfer flag
+  and document-expiry attestation (checklist + expiry date, no file). A doc-expiry warning banner
+  (`docExpiryWarnings(company)`) surfaces the company's on-file `docExpiries` entries expiring
+  within 15 days, establishment card flagged specially (SIM-suspension risk).
+- **Read-only Submission Timeline** (`js/leads.js showSubmissionTimelineModal`) — groups a lead's
+  submissions by `bundleId`, shows each line's status + full events[] history. Visible to the
+  submitting agent, their TL, and manager (matches the submissions read rule's scoping). Backend's
+  own queue/action UI (where events would actually get logged through a real screen, not a
+  console call) is **not built yet** — that's the next Phase B session.
+- **No file upload yet** — `requiredDocs[].status` is always `'attested'` (self-attested by the
+  agent, not verified/uploaded). The StorageAdapter (`firestore-b64` driver + pdf.js) that adds
+  real file bytes is explicitly deferred to the next session.
+- **Firestore LIST-query gotcha (found during regression):** Firestore rejects a `list` query
+  outright unless it can prove every possible matched document satisfies the read rule — it does
+  NOT filter per-document the way a single `get()` effectively does. The submissions read rule is
+  an OR of role-scoped clauses (manager | `agentId==self` | team_lead+`teamId` match | backend); a
+  bare `where('leadId','==',id)` query is only provable for manager, whose clause doesn't depend on
+  `resource.data` at all. Every other role's query must ALSO include the same field the rule
+  checks (`teamId==CP.teamId` for team_lead, `agentId==CU.uid` for agent) to match that specific
+  OR-clause exactly. Cost this session a real regression bug (team_lead/agent got
+  `permission-denied` reading their own data) before being caught and fixed.
 
 ---
 
@@ -467,15 +551,17 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 | `channels` | Any auth | Create: any auth (seed guard); update/delete: manager only |
 | `scripts` | Any auth | Manager unrestricted; TL own scripts direct, manager scripts suggest-only via `pendingApproval` (`affectedKeys().hasOnly(['pendingApproval'])`) |
 | `products` | Any auth | Manager only |
-| `submissions` (Phase 7) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId`/`submittedBy` to self; update: manager or backend-department (broad for now — Phase 8's actual stage-advancement UI will narrow this once the real update shape is known) |
+| `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted (broad for now — narrows once the real backend queue UI's update shape is known), OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
+| `auditLog` | Manager only | Create: any auth, `sameOrgWrite()` (the gateway writes these on every mutation); update/delete: **never**, always `false` — append-only |
 
 **Key implementation notes:**
 - `role()` helper does a `get()` on `users/{auth.uid}` — cached within a single rule evaluation, so calling it multiple times across helper functions doesn't multiply read cost.
 - `deleteRequest` field is intentionally **not** in the TL update rule's blocked-fields list — a TL writing a delete request, or a manager clearing one, needs no rule changes beyond what already exists.
 - `companyId` needed no new `leads` rule — it's not an admin-locked field.
 - The `companies` rule (like every other collection's) is handed to Ashok as a full-file paste-in for the Firebase Console from `rules/firestore.rules` (see the version-control note above) — confirm it's been published before relying on non-manager company creation working in production.
-- **Caught during Phase 7 rule review:** `createSubmission()` writes `teams.assignmentCursor` as part of the submitting agent's own batch — the existing manager-only `teams` write rule would have silently failed that update for any non-manager agent. Fixed by adding a narrowly-scoped `affectedKeys().hasOnly(['assignmentCursor'])` exception, the same pattern already used for `scripts.pendingApproval`.
-- **Storage rules (separate ruleset, Storage → Rules in Firebase Console):** write is allowed for any authenticated user restricted to PDF/image content-type and a 10MB cap — not gated on the submission doc's existence, because files upload *before* the Firestore submission doc is written (see `createSubmission()`). Read is gated via `firestore.get()` cross-service calls against the submission doc (manager/submitting agent/their TL/backend department) — **not yet exercised by any UI** (no file-viewing screen exists until Phase 8), so treat the read rule as best-effort until then.
+- **Caught during the submissions v1 rule review:** `createSubmission()` writes `teams.assignmentCursor` as part of the submitting agent's own batch — the existing manager-only `teams` write rule would have silently failed that update for any non-manager agent. Fixed by adding a narrowly-scoped `affectedKeys().hasOnly(['assignmentCursor'])` exception, the same pattern already used for `scripts.pendingApproval`.
+- **Storage rules — N/A for now.** All Storage SDK code (`uploadBytes` etc.) was removed from `js/submissions.js` this session; there is no active file-upload path until the StorageAdapter (`firestore-b64` driver) lands next session. The old Storage ruleset note from the v1 build is stale and removed here.
+- **Firestore LIST-query gotcha (found during this session's regression, see the submissions data model section above for full detail):** a `list` query is rejected outright unless Firestore can prove EVERY possible matched doc satisfies the read rule, unlike a single `get()`. A bare `where('leadId','==',id)` query only provable for manager; team_lead/agent queries must ALSO include the same field their rule clause checks (`teamId`/`agentId` respectively) to match that specific OR-branch. This is a general Firestore rules lesson, not specific to submissions — any future collection with a role-scoped OR-clause read rule needs the same query-side treatment.
 
 ---
 
@@ -603,9 +689,57 @@ Per `ARCHITECTURE.md`'s white-label pivot (Sections 0, 2, 3, 8).
   TL+all, TL+stage, agent+all, agent+stage — manager+all needs no index, pure single-field sort);
   created via the Console's auto-generated links this session, all confirmed `Enabled`. Verified
   live for manager and team_lead roles (pagination, stage tabs, search, team filter, page caching).
-- **Not started yet:** Phase B (Storage driver decision — `storageDriver: 'firestore-b64'` is
-  chosen in `config.js` but not yet implemented) and everything after it in `ARCHITECTURE.md`'s
-  Phase A-G plan.
+### Phase B (in progress) — Submissions v2 + scalable lookups
+Per `ARCHITECTURE.md` v2.0's schema amendment (§3/§5) and quota-discipline section (§9).
+- **Batch-chunking bug fix** — `auditLog` (built this session, see above) writes one doc per
+  mutation IN THE SAME BATCH as the mutation itself, silently doubling writes-per-op. The old
+  400-op chunk size across every bulk path (`backfillCompanies`, `leads.js` bulk-assign, org.js's
+  4 cascades — team delete, member removal, hard-delete, department-change — plus
+  `repairLeadTeamData` and the already-run `orgId` migration) would have committed 800 writes and
+  thrown past Firestore's 500-write cap on any run over ~250 items. Two of the org.js cascades had
+  NO chunking at all before this — a latent bug even pre-auditLog. Fixed everywhere: every bulk
+  op now passes `skipAudit:true` per-op + writes ONE summary `auditLog` entry per run
+  (`action:'bulk', count, description`) via a new shared `logBulkAudit()` helper; CHUNK reduced to
+  200 across the board.
+- **`js/submissions.js` rewritten** (dedicated rewrite, not a patch) — see the `submissions` data
+  model section above for the full schema. `createSubmissions()` (plural) creates one doc per
+  product line sharing a `bundleId`; `appendEvent()` is the event/status-transition engine;
+  `pickBackendAgent()` gained a fallback-to-any-available-agent when no specialty matches;
+  `docExpiryWarnings()` surfaces company doc-expiry risk at submit time. All Storage/`uploadBytes`
+  code removed — deferred to the next session's StorageAdapter.
+- **Rules**: `submissions` update rule now includes the agent correction-loop
+  (`agentId==self && status=='rejected' → 'pendingVerification'` only) alongside manager/backend
+  unrestricted; added a manager-only delete rule (explicit product decision: no exception for the
+  creator, so a suspected-fake upload stays in the system for review rather than being
+  self-deletable).
+- **Company enrichment + scalable lookups** — see the `companies` data model section above for
+  the full field list and the `findOrCreateCompany`/`searchCompanies` rework. `fetchCompanies()`'s
+  full scan is banned from every company picker going forward (ARCHITECTURE.md §9); the two
+  remaining deliberate exceptions (`backfillCompanies`, Org tab Companies card) are documented in
+  `js/companies.js` itself.
+- **Submit to Backend UI reworked** for bundle creation + a new read-only Submission Timeline view
+  — see the `submissions` data model section above.
+- **Real bugs found and fixed during live regression, not just written and assumed correct:**
+  (1) two UI state-loss bugs in the Submit modal — selecting a product then triggering any other
+  re-render (e.g. removing a line) reset the product picker and lost the populated term dropdown/
+  category fields; the account-transfer partner name typed in was silently wiped by the next
+  unrelated re-render (e.g. attesting a document's expiry date) — both traced to `render()` fully
+  replacing the modal's innerHTML with no persisted state for those fields, both fixed by tracking
+  them in closures instead of reading the DOM after the fact. (2) A genuine Firestore LIST-query
+  gotcha (documented in the Firestore Security Rules section above) broke team_lead's and agent's
+  own "View Timeline" button — worked fine for manager, `permission-denied` for everyone else,
+  caught only because Step 8's regression pass tested with real non-manager identities instead of
+  trusting the rule text.
+- **Full regression, all three roles, real identities (not manager-only)**: create-submission
+  through the actual UI (multi-line bundle, different product categories, SPR, account transfer,
+  doc attestation) as manager and as agent; team_lead's and agent's own "View Timeline" access;
+  the full agent correction-loop lifecycle as the actual agent — correctly denied rejecting their
+  own submission, correctly denied jumping straight to `activated` on a rejected one, correctly
+  allowed to resubmit (`rejected` → `pendingVerification`) their own. All test data cleaned up
+  afterward, verified back at baseline (115 leads, 114 companies, 0 submissions).
+- **Not started yet:** the backend queue/action UI (a real screen for verify/reject/activate,
+  instead of console calls to `appendEvent`) and the StorageAdapter (real file bytes) — both next
+  session, per `ARCHITECTURE.md` §10's Phase B scope.
 
 ---
 
