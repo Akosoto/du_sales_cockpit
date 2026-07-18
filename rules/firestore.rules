@@ -180,8 +180,10 @@ service cloud.firestore {
     }
 
     // ── SUBMISSIONS ──────────────────────────────────
-    // Agent → backend handoff (Phase 7). See js/submissions.js and
-    // PHASE5_SPEC_AND_HANDOFF.md section 1 for the full schema.
+    // Agent → backend handoff. v2 schema (ARCHITECTURE.md §3/§5): one doc per
+    // product line (bundleId links siblings), coarse status + events[]
+    // timeline, replacing the old 5-fixed-stage items[] design. See
+    // js/submissions.js.
     match /submissions/{s} {
       // Audit item 14: the teamId clause used to match ANY role on the same
       // team, letting fellow sales agents read each other's submissions
@@ -195,18 +197,27 @@ service cloud.firestore {
         isActiveBackend()
       );
 
+      // submittedBy dropped (v2 schema has no such field — agentId already
+      // identifies the submitting agent; the 'created' event in events[]
+      // carries the same actorId as an audit record).
       allow create: if isAuth() && sameOrgWrite()
-        && request.resource.data.agentId == request.auth.uid
-        && request.resource.data.submittedBy == request.auth.uid;
+        && request.resource.data.agentId == request.auth.uid;
 
-      // Broad for now — manager or anyone in the active backend department.
-      // Will be narrowed once Phase 8's actual stage-advancement update
-      // shape is known. (Audit item 16 — the agent correction-loop update
-      // rule — is intentionally NOT added yet; designed together with the
-      // Phase B correction UI, not now.)
+      // Manager and active backend dept: unrestricted (status/events[]/
+      // assignedBackendAgent all covered — will be narrowed once the backend
+      // queue UI's actual update shape is known, not this session).
+      //
+      // Submitting agent's correction-loop (audit item 16, built now): may
+      // update their OWN submission ONLY while it's status=='rejected', and
+      // ONLY to move it back to 'pendingVerification' (append a 'resubmit'
+      // event with the docs/fields fix) — cannot self-activate, cannot touch
+      // any other status, cannot touch someone else's submission.
       allow update: if isAuth() && sameOrg() && (
         role() == 'manager' ||
-        isActiveBackend()
+        isActiveBackend() ||
+        (resource.data.agentId == request.auth.uid
+          && resource.data.status == 'rejected'
+          && request.resource.data.status == 'pendingVerification')
       );
     }
 
