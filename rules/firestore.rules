@@ -219,6 +219,13 @@ service cloud.firestore {
           && resource.data.status == 'rejected'
           && request.resource.data.status == 'pendingVerification')
       );
+
+      // Manager-only, deliberately narrow: no delete for backend/agent, even
+      // the submitting agent — order records stay in the system for review
+      // (e.g. a suspected-fake document upload) rather than being quietly
+      // removable by whoever created them. Matches the delete pattern
+      // already used for leads/companies/teams/scripts/products.
+      allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
     // ── AUDIT LOG (ARCHITECTURE.md §3) ──────────────
