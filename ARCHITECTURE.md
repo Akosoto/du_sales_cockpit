@@ -323,6 +323,36 @@ Unchanged: no unbounded scans (reports read rollups; drill-downs
 date-scoped + paginated); reference data cached per session; import
 preview batches writes. Spark limits: 50K reads / 20K writes / 1GB.
 
+**Fetch-all-companies patterns are banned.** Design assumption: a real
+partner can carry 1,000-3,000+ company records — the same read-cost math
+that forced the Pipeline tab's pagination stopgap applies here. Every
+company picker (lead modal, and any future one) must use targeted
+queries, never `fetchCompanies()`'s full scan:
+- **Dedup** (`findOrCreateCompany`): two targeted reads, `limit(1)` each
+  — `where('accountCode','==',code)` first (stronger identity signal
+  than name), then `where('normalizedName','==',norm)`. Two reads
+  regardless of collection size, vs. one read per existing company
+  under the old pattern.
+- **Type-ahead** (`searchCompanies`): debounced (300ms), min 2 chars, a
+  single-field prefix-range query on `normalizedName`
+  (`>=term`, `<=term+''`, `limit(10)`) plus a parallel exact
+  `accountCode` lookup when the term contains a digit. No composite
+  index needed for either — confirmed live, zero `failed-precondition`
+  errors across all testing.
+- **`fetchCompanies()`** (the raw full scan) still exists for exactly
+  two deliberate exceptions, both documented in `js/companies.js`
+  itself: `backfillCompanies()` (one-off, manager-only, safe to re-run)
+  and the Org tab's Companies card listing (not yet paginated — same
+  category of gap as the Pipeline tab was before its stopgap, not yet
+  addressed).
+- The Submit-to-Backend modal does NOT have its own company picker —
+  its company is fixed from the lead's existing `companyId`, and
+  `accTransfer.fromPartner` is a free-text competitor/reseller name,
+  not a reference into `companies`. "Company picker per step 7b" from
+  the session that built this was read as "if a picker is needed here,
+  build it with the type-ahead pattern," not a mandate that one must
+  exist — none was.
+
 ## 10. Build Phases (revised)
 
 - **Session 2 (complete, verified)**: merge wip-submissions → db.js
