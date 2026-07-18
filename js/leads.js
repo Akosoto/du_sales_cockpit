@@ -6,7 +6,7 @@ import {
 } from './state.js';
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
-import { fetchCompanies, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
+import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import { computeRequiredDocs, createSubmission } from './submissions.js';
 
 // ════════════════════════════════════════════════════
@@ -47,11 +47,6 @@ export async function renderPipelineTab(){
   // Load users
   const uSnap  = await getDocs(collection(db,'users'));
   const byId   = {}; uSnap.docs.forEach(d=>byId[d.id]={id:d.id,...d.data()});
-
-  // Load companies once for the Add Lead picker — fetched here (not inside
-  // the modal) so opening Add Lead is instant, matching the existing
-  // agents/byId pattern already used for this tab.
-  const companies = await fetchCompanies();
 
   function roleScopeWhere(){
     if(role==='team_lead') return [where('teamId','==',CP.teamId)];
@@ -373,7 +368,7 @@ export async function renderPipelineTab(){
     document.querySelectorAll('[data-s]').forEach(x=>x.classList.toggle('active',x===b));
     refreshView();
   }));
-  document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId, companies));
+  document.getElementById('btn-add-lead').addEventListener('click',()=>showAddLeadModal(agents, byId));
   wireMsFilter('ms-tm', teamFs,  refreshView);
   wireMsFilter('ms-tl', tlFs,    refreshView);
   wireMsFilter('ms-ag', agentFs, refreshView);
@@ -553,10 +548,11 @@ export async function showLeadModal(lead, byId, agents){
 }
 
 // ─── ADD LEAD MODAL ───
-function showAddLeadModal(agents, byId, companies){
+function showAddLeadModal(agents, byId){
   const role = CP.role;
   let selectedCompanyId = '';
   let fuzzyAcknowledged = false;
+  let lastSearchResults = []; // ≤10 docs from the last searchCompanies() call — the ONLY set findFuzzyMatch operates on (ARCHITECTURE.md §9, no full-list scans)
 
   modal('Add New Lead', `
     <div class="row2">
@@ -611,25 +607,32 @@ function showAddLeadModal(agents, byId, companies){
 
   // Company search dropdown — same visual/behavior pattern as the existing
   // multi-select filters (.ms-wrap/.ms-dd), so the global click-outside-closes
-  // handler in helpers.js already applies with no extra wiring.
+  // handler in helpers.js already applies with no extra wiring. Type-ahead
+  // (ARCHITECTURE.md §9): debounced, min 2 chars, server-side searchCompanies()
+  // — never a full-collection fetch, regardless of how many companies exist.
   const coInput = document.getElementById('nl-co');
   const coDd    = document.getElementById('nl-co-dd');
   const fuzzyBox = document.getElementById('nl-co-fuzzy');
   const acctInput = document.getElementById('nl-acct');
   const acctMatchBox = document.getElementById('nl-acct-match');
+  let coSearchDebounce;
   coInput.addEventListener('input', () => {
     selectedCompanyId = ''; fuzzyAcknowledged = false;
     fuzzyBox.style.display = 'none';
-    const q = coInput.value.trim().toLowerCase();
-    if(!q){ coDd.classList.remove('open'); coDd.innerHTML=''; return; }
-    const matches = companies.filter(c => c.name.toLowerCase().includes(q)).slice(0,8);
-    if(!matches.length){ coDd.classList.remove('open'); coDd.innerHTML=''; return; }
-    coDd.innerHTML = matches.map(c=>`<div class="ms-item" data-cid="${c.id}">${esc(c.name)}${c.industry?` <span class="text-dim text-xs">· ${esc(c.industry)}</span>`:''}</div>`).join('');
-    coDd.classList.add('open');
+    clearTimeout(coSearchDebounce);
+    const q = coInput.value.trim();
+    if(q.length < 2){ coDd.classList.remove('open'); coDd.innerHTML=''; lastSearchResults=[]; return; }
+    coSearchDebounce = setTimeout(async () => {
+      const matches = await searchCompanies(q);
+      lastSearchResults = matches;
+      if(!matches.length){ coDd.classList.remove('open'); coDd.innerHTML=''; return; }
+      coDd.innerHTML = matches.map(c=>`<div class="ms-item" data-cid="${c.id}">${esc(c.name)}${c.industry?` <span class="text-dim text-xs">· ${esc(c.industry)}</span>`:''}</div>`).join('');
+      coDd.classList.add('open');
+    }, 300);
   });
   coDd.addEventListener('click', e => {
     const item = e.target.closest('[data-cid]'); if(!item) return;
-    const c = companies.find(x=>x.id===item.dataset.cid); if(!c) return;
+    const c = lastSearchResults.find(x=>x.id===item.dataset.cid); if(!c) return;
     coInput.value = c.name; selectedCompanyId = c.id;
     acctInput.value = c.accountCode || '';
     coDd.classList.remove('open'); coDd.innerHTML='';
@@ -638,22 +641,27 @@ function showAddLeadModal(agents, byId, companies){
   });
 
   // accountCode exact-match nudge — a stronger dedup signal than name, so this
-  // surfaces independently of the name-based fuzzy-match box above.
+  // surfaces independently of the name-based fuzzy-match box above. Debounced
+  // targeted lookup, not a client-side scan.
+  let acctSearchDebounce;
   acctInput.addEventListener('input', () => {
+    clearTimeout(acctSearchDebounce);
     const code = acctInput.value.trim();
     if(!code){ acctMatchBox.style.display = 'none'; return; }
-    const match = companies.find(c => c.accountCode && c.accountCode === code);
-    if(match){
-      document.getElementById('nl-acct-match-name').textContent = match.name;
-      acctMatchBox.style.display = '';
-      document.getElementById('nl-acct-use-existing').onclick = () => {
-        coInput.value = match.name; selectedCompanyId = match.id;
+    acctSearchDebounce = setTimeout(async () => {
+      const match = await findCompanyByAccountCode(code);
+      if(match){
+        document.getElementById('nl-acct-match-name').textContent = match.name;
+        acctMatchBox.style.display = '';
+        document.getElementById('nl-acct-use-existing').onclick = () => {
+          coInput.value = match.name; selectedCompanyId = match.id;
+          acctMatchBox.style.display = 'none';
+          fuzzyBox.style.display = 'none';
+        };
+      } else {
         acctMatchBox.style.display = 'none';
-        fuzzyBox.style.display = 'none';
-      };
-    } else {
-      acctMatchBox.style.display = 'none';
-    }
+      }
+    }, 300);
   });
 
   document.getElementById('nl-btn').onclick = async () => {
@@ -663,23 +671,21 @@ function showAddLeadModal(agents, byId, companies){
     const assignTo = role==='agent' ? CU.uid : (v('nl-ag')||'');
     if(role==='team_lead' && !assignTo){ err.textContent='No agents in your sub-group yet. Ask your manager to assign agents first.'; return; }
 
-    // Resolve companyId: explicit picker selection wins; then an exact
-    // accountCode match (stronger identity signal than name — ARCHITECTURE.md
-    // §3); then an exact normalizedName match (typed the existing name
-    // without clicking it); otherwise nudge with a fuzzy "did you mean"
-    // before creating genuinely new.
+    // Resolve companyId: explicit picker selection wins; then an exact match
+    // WITHIN the already-fetched ≤10 type-ahead results (no extra query);
+    // otherwise nudge with a fuzzy "did you mean" from that same small set
+    // before creating genuinely new. findOrCreateCompany() below does its own
+    // targeted accountCode-then-normalizedName server lookup as the final
+    // safety net (e.g. if the user typed faster than the debounce, or under
+    // 2 chars), so nothing here needs to re-check the server itself.
     const acctCode = v('nl-acct');
     let companyId = selectedCompanyId;
-    if(!companyId && acctCode){
-      const byCode = companies.find(c => c.accountCode && c.accountCode === acctCode);
-      if(byCode) companyId = byCode.id;
-    }
     if(!companyId){
       const norm = normalizeCompanyName(co);
-      const exact = companies.find(c => c.normalizedName === norm);
+      const exact = lastSearchResults.find(c => c.normalizedName === norm);
       if(exact){ companyId = exact.id; }
       else if(!fuzzyAcknowledged){
-        const fuzzy = findFuzzyMatch(co, companies);
+        const fuzzy = findFuzzyMatch(co, lastSearchResults);
         if(fuzzy){
           document.getElementById('nl-co-fuzzy-name').textContent = fuzzy.name;
           fuzzyBox.style.display = '';
@@ -699,7 +705,7 @@ function showAddLeadModal(agents, byId, companies){
     disable('nl-btn','Adding…');
     try {
       if(!companyId){
-        companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy'), accountCode:acctCode}, companies);
+        companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy'), accountCode:acctCode});
       }
       // Resolve teamId from assignee's user doc (skip for manager self-assign)
       let leadTeamId = '', leadTlId = '';

@@ -1,4 +1,4 @@
-import { db, doc, getDocs, collection } from './state.js';
+import { db, doc, getDocs, collection, query, where, limit } from './state.js';
 import { dbAdd, newBatch, batchSet, batchUpdate, logBulkAudit } from './db.js';
 
 // ════════════════════════════════════════════════════
@@ -34,13 +34,17 @@ function levenshtein(a,b){
   return dp[m][n];
 }
 
-// Returns the closest existing company if the typed name is CLOSE (not exact)
-// to it — a cheap nudge to reduce future duplicates without blocking entry.
-export function findFuzzyMatch(name, companies){
+// Returns the closest match from a small already-fetched `candidates` list —
+// NEVER a full collection scan (ARCHITECTURE.md §9: a real partner can carry
+// 1,000-3,000+ companies, so fetch-all patterns are banned). `candidates`
+// should be whatever searchCompanies() just returned (≤10 docs) — this is a
+// cheap nudge ("did you mean X?") operating only on that small set, not a
+// dedup mechanism in its own right (normalizedName/accountCode equality is).
+export function findFuzzyMatch(name, candidates){
   const norm = normalizeCompanyName(name);
   if(!norm) return null;
   let best = null, bestDist = Infinity;
-  companies.forEach(c => {
+  candidates.forEach(c => {
     if(c.normalizedName === norm) return; // exact match is handled elsewhere
     const dist = levenshtein(norm, c.normalizedName||'');
     const threshold = Math.max(2, Math.round(norm.length * 0.2));
@@ -49,30 +53,70 @@ export function findFuzzyMatch(name, companies){
   return best;
 }
 
+// Full collection scan — deliberately still here for backfillCompanies()
+// (step 7d: one-off, manager-only, safe to re-run — a bounded, rare
+// operation, not a per-keystroke UI path) and the Org tab's Companies card.
+// NEVER call this for a company picker — use searchCompanies() instead.
 export async function fetchCompanies(){
   const snap = await getDocs(collection(db,'companies'));
   return snap.docs.map(d=>({id:d.id,...d.data()}));
 }
 
+// Type-ahead company search (ARCHITECTURE.md §9) — every company picker uses
+// this, never fetchCompanies(). Prefix-range query on normalizedName (min 2
+// chars, capped at 10 results) is a single-field range filter, so it needs
+// no composite index. Runs a second, parallel exact-match query on
+// accountCode when the term contains a digit (account codes are typically
+// alphanumeric-with-digits; company names rarely are) — cheap enough to
+// just also check rather than trying to guess "looks like a code" more
+// precisely.
+export async function searchCompanies(term){
+  const norm = normalizeCompanyName(term);
+  if(norm.length < 2) return [];
+  const queries = [
+    getDocs(query(collection(db,'companies'),
+      where('normalizedName','>=',norm),
+      where('normalizedName','<=',norm+''),
+      limit(10)))
+  ];
+  if(/\d/.test(term)){
+    queries.push(getDocs(query(collection(db,'companies'), where('accountCode','==',term.trim()), limit(1))));
+  }
+  const results = await Promise.all(queries);
+  const byId = {};
+  results.forEach(snap => snap.forEach(d => { byId[d.id] = {id:d.id, ...d.data()}; }));
+  return Object.values(byId);
+}
+
+// Exact accountCode lookup — a single targeted read, used by the accountCode-
+// match nudge in company pickers (distinct from searchCompanies(), which
+// searches by name with accountCode only as a side-check).
+export async function findCompanyByAccountCode(code){
+  if(!code || !code.trim()) return null;
+  const snap = await getDocs(query(collection(db,'companies'), where('accountCode','==',code.trim()), limit(1)));
+  return snap.empty ? null : {id:snap.docs[0].id, ...snap.docs[0].data()};
+}
+
 // The one shared function for turning a typed/imported name into a companyId.
-// Pass `knownCompanies` (already-fetched list) to avoid a redundant read when
-// the caller already has one, e.g. the lead modal's picker.
+// Two targeted reads instead of a full scan (ARCHITECTURE.md §9) — at most 2
+// document reads regardless of collection size, vs. the old fetchCompanies()
+// pattern which cost one read PER EXISTING COMPANY on every single lead
+// creation.
 //
 // accountCode dedup (ARCHITECTURE.md §3 company enrichment) is checked FIRST,
 // ahead of normalizedName — it's a stronger identity signal (an exact du
 // account reference) than a name match, which two genuinely different
 // companies could coincidentally share/collide on.
-export async function findOrCreateCompany(name, extra = {}, knownCompanies = null){
+export async function findOrCreateCompany(name, extra = {}){
   const norm = normalizeCompanyName(name);
-  const companies = knownCompanies || await fetchCompanies();
 
   if(extra.accountCode){
-    const byCode = companies.find(c => c.accountCode && c.accountCode === extra.accountCode);
-    if(byCode) return byCode.id;
+    const byCodeSnap = await getDocs(query(collection(db,'companies'), where('accountCode','==',extra.accountCode), limit(1)));
+    if(!byCodeSnap.empty) return byCodeSnap.docs[0].id;
   }
 
-  const existing = companies.find(c => c.normalizedName === norm);
-  if(existing) return existing.id;
+  const byNameSnap = await getDocs(query(collection(db,'companies'), where('normalizedName','==',norm), limit(1)));
+  if(!byNameSnap.empty) return byNameSnap.docs[0].id;
 
   const ref = await dbAdd('companies', {
     name: name.trim(),
