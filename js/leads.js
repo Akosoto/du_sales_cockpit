@@ -1,5 +1,5 @@
 import {
-  db, CU, CP, STAGES, MANDATORY_DOC_TYPES,
+  db, CU, CP, STAGES, MANDATORY_DOC_TYPES, ORG_DEFAULTS,
   doc, getDoc,
   collection, query, where, getDocs,
   orderBy, limit, startAfter, getCountFromServer
@@ -7,7 +7,26 @@ import {
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
-import { computeRequiredDocs, createSubmission } from './submissions.js';
+import { computeRequiredDocs, docExpiryWarnings, createSubmissions } from './submissions.js';
+
+// Submission status/event display labels + colors — shared by the Submit
+// modal's own confirmation and the read-only timeline view.
+const SUBMISSION_STATUS_LABELS = {
+  pendingVerification: 'Pending Verification', submittedToDu: 'Submitted to du',
+  inProgress: 'In Progress', activated: 'Activated', rejected: 'Rejected'
+};
+const SUBMISSION_STATUS_COLORS = {
+  pendingVerification: 'var(--amber)', submittedToDu: 'var(--blue)',
+  inProgress: 'var(--purple2)', activated: 'var(--green)', rejected: 'var(--red)'
+};
+const EVENT_LABELS = {
+  created:'Created', docsVerified:'Documents Verified', verificationCall:'Verified by Call',
+  verificationEmail:'Verified by Email', submittedToDu:'Submitted to du',
+  proceededWithoutVerification:'Proceeded Without Verification',
+  activityNo:'Activity Number', workOrderNo:'Work Order Number', appointment:'Appointment Scheduled',
+  biometric:'Biometric', sprObtained:'SPR Obtained', correction:'Correction', note:'Note',
+  activated:'Activated', rejected:'Rejected', resubmit:'Resubmitted'
+};
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -404,18 +423,26 @@ export async function showLeadModal(lead, byId, agents){
   const showAssign = role==='manager' || role==='team_lead';
 
   // Backend handoff — only relevant once a lead is Closed and has a linked
-  // company (companyId is required for submissions.hasDuAccount lookup).
-  // Only fetched for Closed leads to avoid an extra read on every lead open.
-  // Wrapped defensively: a rules/network hiccup on this lookup must never
-  // block the rest of the (unrelated) lead modal from opening.
-  let existingSubmission = null;
+  // company. Only fetched for Closed leads to avoid an extra read on every
+  // lead open. Wrapped defensively: a rules/network hiccup on this lookup
+  // must never block the rest of the (unrelated) lead modal from opening.
+  //
+  // v2 schema (ARCHITECTURE.md §5): one submission DOC per product line, so
+  // a single Submit-to-Backend form now produces MULTIPLE docs sharing one
+  // bundleId. existingSubmissions holds ALL of them for this lead — still
+  // gates the Submit button on "any bundle already exists" (v1 tradeoff,
+  // unchanged — repeat orders on the same lead are a future revisit), but
+  // the display below now shows a proper summary instead of assuming one doc.
+  let existingSubmissions = [];
   const canSubmit = lead.stage==='Closed' && lead.companyId && (role==='manager' || lead.assignedTo===CU.uid);
-  if(lead.stage==='Closed' && lead.companyId){
+  const canViewTimeline = role==='manager' || lead.assignedTo===CU.uid || (role==='team_lead' && lead.teamId===CP.teamId);
+  if(lead.stage==='Closed' && lead.companyId && canViewTimeline){
     try {
       const subSnap = await getDocs(query(collection(db,'submissions'), where('leadId','==',lead.id)));
-      if(!subSnap.empty) existingSubmission = {id:subSnap.docs[0].id, ...subSnap.docs[0].data()};
+      existingSubmissions = subSnap.docs.map(d=>({id:d.id,...d.data()}));
     } catch(e){ /* submissions rule may not be published yet — degrade gracefully */ }
   }
+  const bundleCount = new Set(existingSubmissions.map(s=>s.bundleId)).size;
 
   modal(`${esc(lead.company||'Lead')}`, `
     <div class="info-grid mb-12">
@@ -440,8 +467,8 @@ export async function showLeadModal(lead, byId, agents){
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
     ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment is manager-only; deletion requires manager approval.</div>` : ''}
     ${hasPendingDeleteReq ? `<div class="locked-note" style="background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:var(--red)">🗑 Deletion requested by <strong>${esc(lead.deleteRequest.requestedByName||'—')}</strong> on ${fmtDate(lead.deleteRequest.requestedAt)} — pending manager approval.</div>` : ''}
-    ${existingSubmission ? `<div class="locked-note" style="background:rgba(124,58,237,.1);border-color:rgba(124,58,237,.3);color:var(--purple2)">📤 Submitted to backend on ${fmtDate(existingSubmission.submittedAt)} — ${existingSubmission.items.length} item${existingSubmission.items.length!==1?'s':''}.</div>` : ''}
-    ${canSubmit && !existingSubmission ? `<button class="btn btn-primary btn-full mt-12" id="lm-submit">📤 Submit to Backend</button>` : ''}
+    ${existingSubmissions.length ? `<div class="locked-note" style="background:rgba(124,58,237,.1);border-color:rgba(124,58,237,.3);color:var(--purple2)">📤 Submitted to backend — ${bundleCount} bundle${bundleCount!==1?'s':''}, ${existingSubmissions.length} line item${existingSubmissions.length!==1?'s':''}.${canViewTimeline?' <button type=\"button\" class=\"btn btn-ghost btn-xs\" id=\"lm-view-timeline\" style=\"margin-left:8px\">View Timeline</button>':''}</div>` : ''}
+    ${canSubmit && !existingSubmissions.length ? `<button class="btn btn-primary btn-full mt-12" id="lm-submit">📤 Submit to Backend</button>` : ''}
     <p class="text-dim text-xs mt-8">Last edited by <strong>${esc(lead.lastEditedBy||'—')}</strong> · ${lead.lastEditedAt?fmtDate(lead.lastEditedAt):'—'}</p>
     <p id="lm-err" class="err"></p>
     <div class="flex gap-8 mt-12" style="flex-wrap:wrap">
@@ -453,6 +480,7 @@ export async function showLeadModal(lead, byId, agents){
     </div>`,true);
 
   document.getElementById('lm-submit')?.addEventListener('click', () => showSubmitModal(lead, byId));
+  document.getElementById('lm-view-timeline')?.addEventListener('click', () => showSubmissionTimelineModal(lead, existingSubmissions));
 
   // Show deal value when Won
   document.getElementById('ls-stage').addEventListener('change', function(){
@@ -729,9 +757,13 @@ function showAddLeadModal(agents, byId){
 }
 
 // ─── SUBMIT TO BACKEND MODAL ───
-// Agent-side handoff from a Closed lead (Phase 7). Bundles one or more
-// products into line items and gates submission on the mandatory documents
-// (js/state.js MANDATORY_DOC_TYPES + any per-product extras) being uploaded.
+// Agent-side handoff from a Closed lead (ARCHITECTURE.md §3/§5). Composes
+// one or more product lines into ONE bundle — each line becomes its own
+// submission doc (js/submissions.js createSubmissions), sharing a bundleId.
+// No file upload this session (StorageAdapter is next session) — the
+// documents section here is a checklist + expiry-date attestation only.
+const CATEGORY_FIELD_LABELS = { gaid:'GAID', msisdn:'MSISDN', simSerial:'SIM Serial', passcode:'Passcode', commitmentPlan:'Commitment Plan', handset:'Handset' };
+
 async function showSubmitModal(lead, byId){
   const [prodSnap, teamSnap, companySnap] = await Promise.all([
     getDocs(query(collection(db,'products'), where('active','==',true))),
@@ -741,87 +773,153 @@ async function showSubmitModal(lead, byId){
   const products     = prodSnap.docs.map(d=>({id:d.id,...d.data()}));
   const productsById = {}; products.forEach(p=>productsById[p.id]=p);
   const teams        = teamSnap.docs.map(d=>({id:d.id,...d.data()}));
-  const company       = companySnap.exists() ? {id:companySnap.id,...companySnap.data()} : null;
+  const company      = companySnap.exists() ? {id:companySnap.id,...companySnap.data()} : null;
   const users        = Object.values(byId);
+  const expiryWarnings = docExpiryWarnings(company);
 
   let items = [];
-  let pendingFiles = []; // { file, docType }
+  let docExpiryDates = {}; // { [docType]: 'YYYY-MM-DD' }
+  let accTransferFlag = false;
+  let accTransferFromPartner = ''; // same re-render survival issue as selectedProductId below — persisted here, not read from the DOM after the fact
+  // Persisted across render() calls — render() fully replaces the modal's
+  // innerHTML (including <select id="sm-prod">), so reading the DOM's
+  // .value AFTER a re-render would see a freshly-created, unselected
+  // element, not whatever the user actually picked.
+  let selectedProductId = '';
 
   function requiredDocs(){ return computeRequiredDocs(items, productsById); }
-  function missingDocs(){ const req = requiredDocs(); return req.filter(rd => !pendingFiles.some(f=>f.docType===rd)); }
+  function missingDocs(){ return requiredDocs().filter(rd => !docExpiryDates[rd]); }
+  function catFieldsHtml(fields){
+    return fields.length ? `<div class="row2 mt-8">
+      ${fields.map(f=>`<input type="text" id="sm-cf-${f}" placeholder="${CATEGORY_FIELD_LABELS[f]||f} (optional)">`).join('')}
+    </div>` : '';
+  }
+  // Shared between render() (so a re-render triggered by something OTHER
+  // than the product picker, e.g. removing an item, doesn't silently lose
+  // the term dropdown's populated options for a still-selected product) and
+  // the sm-prod onchange handler itself.
+  function populateTermSelect(p){
+    const termSel = document.getElementById('sm-term');
+    if(!p){ termSel.innerHTML = '<option value="">— Select product first —</option>'; termSel.disabled = true; return; }
+    termSel.disabled = false;
+    termSel.innerHTML = (p.pricingOptions||[]).map((po,i)=>`<option value="${i}">${esc(po.label)} (AED ${po.price})</option>`).join('');
+    termSel.onchange = () => {
+      const po = p.pricingOptions[Number(termSel.value)];
+      document.getElementById('sm-mrc').value = po ? po.price : '';
+    };
+    termSel.dispatchEvent(new Event('change'));
+  }
 
   function render(){
     const req      = requiredDocs();
     const missing  = missingDocs();
     const canGo    = items.length>0 && missing.length===0;
+    const selectedProduct = productsById[selectedProductId] || null;
+    const catFields = selectedProduct ? (ORG_DEFAULTS.itemFieldsByCategory[selectedProduct.category]||[]) : [];
 
     modal(`Submit to Backend — ${esc(lead.company)}`, `
+      ${expiryWarnings.length ? `<div class="locked-note" style="background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:var(--amber)">
+        ⚠ ${expiryWarnings.map(w=>`${w.isEstablishmentCard?'<strong>Establishment Card</strong> (SIM-suspension risk)':esc(w.label)} expires ${fmtDate(w.date)}`).join('; ')}
+      </div>` : ''}
       <div class="field">
         <label>Add Product</label>
         <div class="row2">
           <select id="sm-prod"><option value="">— Select product —</option>
-            ${products.map(p=>`<option value="${p.id}">${esc(p.category)} — ${esc(p.name)}</option>`).join('')}
+            ${products.map(p=>`<option value="${p.id}"${p.id===selectedProductId?' selected':''}>${esc(p.category)} — ${esc(p.name)}</option>`).join('')}
           </select>
-          <select id="sm-term" disabled><option value="">— Select product first —</option></select>
+          <select id="sm-term" ${selectedProduct?'':'disabled'}><option value="">${selectedProduct?'— Select term —':'— Select product first —'}</option></select>
         </div>
         <div class="row2 mt-8">
-          <input type="number" id="sm-dv" placeholder="Deal value (AED)">
-          <button type="button" class="btn btn-ghost" id="sm-add-item">+ Add Item</button>
+          <input type="number" id="sm-mrc" placeholder="MRC (AED/mo)">
+          <input type="number" id="sm-qty" placeholder="Qty" value="1" min="1">
         </div>
+        <div class="row2 mt-8">
+          <select id="sm-tor">${ORG_DEFAULTS.typeOfRequestList.map(t=>`<option value="${t}">${t}</option>`).join('')}</select>
+          <div></div>
+        </div>
+        <div id="sm-catfields">${catFieldsHtml(catFields)}</div>
+        <div class="mt-8" style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="sm-spr" style="width:auto;margin:0;cursor:pointer">
+          <label for="sm-spr" style="margin:0;cursor:pointer">Special Pricing Request (SPR)</label>
+        </div>
+        <input type="text" id="sm-spr-note" placeholder="SPR note" class="mt-8" style="display:none">
+        <button type="button" class="btn btn-ghost mt-8" id="sm-add-item">+ Add Item</button>
       </div>
       <div id="sm-items" class="mt-12">
         ${items.length ? items.map(it=>`<div class="pr-sub-row flex" style="justify-content:space-between;align-items:center">
-          <div><strong>${esc(it.productName)}</strong> <span class="text-dim text-xs">${esc(it.category)} · ${esc(it.subType)}</span></div>
+          <div><strong>${esc(it.productName)}</strong> <span class="text-dim text-xs">${esc(it.category)} · Qty ${it.qty} · ${esc(it.typeOfRequest)}${it.sprFlag?' · SPR':''}</span></div>
           <div class="flex gap-8">
-            <span class="text-dim text-xs">AED ${Number(it.dealValue).toLocaleString()}</span>
+            <span class="text-dim text-xs">AED ${Number(it.mrc).toLocaleString()}/mo</span>
             <button type="button" class="btn btn-danger btn-xs" data-rm-item="${it.itemId}">Remove</button>
           </div>
         </div>`).join('') : '<p class="text-dim text-xs">No products added yet.</p>'}
       </div>
       <div class="divider"></div>
-      <div class="field">
-        <label>Documents ${req.length?`<span class="text-dim text-xs">(required: ${req.join(', ')})</span>`:''}</label>
-        <input type="file" id="sm-file-input" multiple accept="application/pdf,image/*">
+      <div class="mt-8" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="sm-acctxfer" ${accTransferFlag?'checked':''} style="width:auto;margin:0;cursor:pointer">
+        <label for="sm-acctxfer" style="margin:0;cursor:pointer">Account transfer from another partner</label>
       </div>
-      <div id="sm-files" class="mt-8">
-        ${pendingFiles.map((f,i)=>`<div class="flex gap-8 mt-8" style="align-items:center">
-          <span class="text-xs" style="flex:1">${esc(f.file.name)}</span>
-          <select data-file-doctype="${i}">
-            ${req.map(rd=>`<option value="${esc(rd)}"${f.docType===rd?' selected':''}>${esc(rd)}</option>`).join('')}
-          </select>
-          <button type="button" class="btn btn-danger btn-xs" data-rm-file="${i}">Remove</button>
+      <input type="text" id="sm-acctxfer-from" placeholder="Transferring from (partner name)" value="${esc(accTransferFromPartner)}" class="mt-8" style="display:${accTransferFlag?'':'none'}">
+      <div class="divider"></div>
+      <div class="field">
+        <label>Documents ${req.length?`<span class="text-dim text-xs">(attest each with its expiry date — no file upload yet)</span>`:''}</label>
+        ${req.map(rd=>`<div class="row2 mt-8" style="align-items:center">
+          <span class="text-xs">${esc(rd)}</span>
+          <input type="date" data-doc-expiry="${esc(rd)}" value="${docExpiryDates[rd]||''}">
         </div>`).join('')}
       </div>
-      ${missing.length ? `<p class="err mt-8">Missing required document${missing.length!==1?'s':''}: ${missing.join(', ')}</p>` : ''}
+      ${missing.length ? `<p class="err mt-8">Missing expiry date for: ${missing.join(', ')}</p>` : ''}
       ${!items.length ? `<p class="err mt-8">Add at least one product.</p>` : ''}
       <p id="sm-err" class="err"></p>
       <button class="btn btn-primary btn-full mt-12" id="sm-submit-btn" ${canGo?'':'disabled'}>Submit</button>`, true);
 
+    // Populate sm-term for a product selected before this render (e.g. a
+    // re-render triggered by removing an item, not by changing the product
+    // picker itself) — the template only renders sm-term as an empty
+    // placeholder; actual options are always JS-populated.
+    if(selectedProduct) populateTermSelect(selectedProduct);
+
     document.getElementById('sm-prod').onchange = function(){
-      const p       = productsById[this.value];
-      const termSel = document.getElementById('sm-term');
-      if(!p){ termSel.innerHTML = '<option value="">— Select product first —</option>'; termSel.disabled = true; return; }
-      termSel.disabled = false;
-      termSel.innerHTML = (p.pricingOptions||[]).map((po,i)=>`<option value="${i}">${esc(po.label)} (AED ${po.price})</option>`).join('');
-      termSel.onchange = () => {
-        const po = p.pricingOptions[Number(termSel.value)];
-        document.getElementById('sm-dv').value = po ? po.price : '';
-      };
-      termSel.dispatchEvent(new Event('change'));
+      selectedProductId = this.value;
+      const p = productsById[selectedProductId];
+      // Targeted DOM patch, NOT a full render() — render() would recreate
+      // sm-term as a fresh element with no options, wiping out what
+      // populateTermSelect() is about to set.
+      document.getElementById('sm-catfields').innerHTML = catFieldsHtml(p ? (ORG_DEFAULTS.itemFieldsByCategory[p.category]||[]) : []);
+      populateTermSelect(p);
+    };
+
+    document.getElementById('sm-spr').onchange = function(){
+      document.getElementById('sm-spr-note').style.display = this.checked ? '' : 'none';
+    };
+    document.getElementById('sm-acctxfer').onchange = function(){
+      accTransferFlag = this.checked;
+      document.getElementById('sm-acctxfer-from').style.display = this.checked ? '' : 'none';
+    };
+    document.getElementById('sm-acctxfer-from').oninput = function(){
+      accTransferFromPartner = this.value;
     };
 
     document.getElementById('sm-add-item').onclick = () => {
-      const p   = productsById[v('sm-prod')];
+      const p   = productsById[selectedProductId];
       const err = document.getElementById('sm-err');
       if(!p){ err.textContent='Select a product first.'; return; }
       const po = p.pricingOptions[Number(document.getElementById('sm-term').value)];
-      const dv = v('sm-dv');
-      if(!dv){ err.textContent='Deal value is required.'; return; }
+      const mrc = v('sm-mrc');
+      if(!mrc){ err.textContent='MRC is required.'; return; }
+      const categoryFields = {};
+      (ORG_DEFAULTS.itemFieldsByCategory[p.category]||[]).forEach(f => {
+        const val = v(`sm-cf-${f}`);
+        if(val) categoryFields[f] = val;
+      });
       items.push({
         itemId: `it_${Date.now()}_${items.length}`,
         productId: p.id, productName: p.name, category: p.category,
-        subType: po ? po.label : '', dealValue: Number(dv)
+        contractTerm: po ? po.term : null, mrc: Number(mrc), qty: Number(v('sm-qty'))||1,
+        typeOfRequest: v('sm-tor')||'NEW', categoryFields,
+        sprFlag: document.getElementById('sm-spr').checked, sprNote: v('sm-spr-note')||''
       });
+      selectedProductId = ''; // clear the mini-form for the next line
       render();
     };
 
@@ -830,18 +928,8 @@ async function showSubmitModal(lead, byId){
       render();
     });
 
-    document.getElementById('sm-file-input').onchange = function(){
-      [...this.files].forEach(file => pendingFiles.push({ file, docType: req[0]||'' }));
-      render();
-    };
-
-    document.querySelectorAll('[data-file-doctype]').forEach(sel => sel.onchange = function(){
-      pendingFiles[Number(this.dataset.fileDoctype)].docType = this.value;
-      render();
-    });
-
-    document.querySelectorAll('[data-rm-file]').forEach(b => b.onclick = () => {
-      pendingFiles.splice(Number(b.dataset.rmFile), 1);
+    document.querySelectorAll('[data-doc-expiry]').forEach(inp => inp.onchange = function(){
+      docExpiryDates[this.dataset.docExpiry] = this.value;
       render();
     });
 
@@ -849,7 +937,9 @@ async function showSubmitModal(lead, byId){
       if(!canGo) return;
       disable('sm-submit-btn','Submitting…');
       try {
-        await createSubmission({ lead, company, items, files: pendingFiles, requiredDocs: req, teams, users });
+        const requiredDocsPayload = req.map(type => ({ type, expiryDate: docExpiryDates[type]||null }));
+        const accTransfer = accTransferFlag ? { flag:true, fromPartner: accTransferFromPartner.trim() } : null;
+        await createSubmissions({ lead, company, items, requiredDocs: requiredDocsPayload, accTransfer, teams, users });
         closeModal(); toast('Submitted to backend.'); renderPipelineTab();
       } catch(e){
         document.getElementById('sm-err').textContent = e.message;
@@ -859,4 +949,35 @@ async function showSubmitModal(lead, byId){
   }
 
   render();
+}
+
+// ─── SUBMISSION TIMELINE (read-only) ───
+// Visible to the submitting agent, their TL, and manager (showLeadModal's
+// canViewTimeline gate) — backend's own queue/action UI is a later session.
+// Groups the lead's submissions by bundleId; each line shows its own status
+// and full events[] timeline underneath.
+function showSubmissionTimelineModal(lead, submissions){
+  const bundles = {};
+  submissions.forEach(s => { (bundles[s.bundleId] ||= []).push(s); });
+
+  const html = Object.entries(bundles).map(([bundleId, lines]) => {
+    const submittedAt = lines.reduce((earliest,l) => !earliest || l.createdAt < earliest ? l.createdAt : earliest, null);
+    return `<div class="pr-sub-row mb-12">
+      <div style="font-weight:600;font-size:13px">📦 Bundle — ${fmtDate(submittedAt)} · ${lines.length} item${lines.length!==1?'s':''}</div>
+      ${lines.map(l => `
+        <div class="mt-8" style="padding-left:12px;border-left:2px solid var(--border2)">
+          <div class="flex gap-8" style="justify-content:space-between;align-items:center">
+            <strong style="font-size:13px">${esc(l.productName)}</strong>
+            <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
+          </div>
+          <div class="text-dim text-xs mt-4">${esc(l.category)} · Qty ${l.qty} · AED ${Number(l.mrc).toLocaleString()}/mo</div>
+          <div class="mt-8">
+            ${(l.events||[]).map(e => `<div class="text-xs text-dim">• ${fmtDate(e.ts)} — <strong>${esc(e.actorName)}</strong>: ${esc(EVENT_LABELS[e.type]||e.type)}${e.payload?.note?` — ${esc(e.payload.note)}`:''}${e.payload?.reason?` (${esc(e.payload.reason)})`:''}${e.payload?.value?` — ${esc(e.payload.value)}`:''}</div>`).join('')}
+          </div>
+        </div>
+      `).join('')}
+    </div>`;
+  }).join('') || '<p class="text-dim text-sm">No submissions yet.</p>';
+
+  modal(`Submission Timeline — ${esc(lead.company)}`, html, true);
 }
