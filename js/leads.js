@@ -438,7 +438,19 @@ export async function showLeadModal(lead, byId, agents){
   const canViewTimeline = role==='manager' || lead.assignedTo===CU.uid || (role==='team_lead' && lead.teamId===CP.teamId);
   if(lead.stage==='Closed' && lead.companyId && canViewTimeline){
     try {
-      const subSnap = await getDocs(query(collection(db,'submissions'), where('leadId','==',lead.id)));
+      // Firestore rejects a LIST query outright unless it can prove every
+      // possible matched document satisfies the read rule — it does NOT
+      // filter per-document the way a single get() effectively does. The
+      // submissions read rule is an OR of role-scoped clauses
+      // (manager | agentId==self | team_lead+teamId match | backend), so a
+      // bare where('leadId','==',...) is only provable for manager (whose
+      // clause doesn't depend on resource.data at all). Every other role
+      // needs the SAME field the rule checks ALSO present as a query
+      // constraint, matching that specific clause exactly.
+      const subConstraints = [where('leadId','==',lead.id)];
+      if(role==='team_lead') subConstraints.push(where('teamId','==',CP.teamId));
+      else if(role!=='manager') subConstraints.push(where('agentId','==',CU.uid));
+      const subSnap = await getDocs(query(collection(db,'submissions'), ...subConstraints));
       existingSubmissions = subSnap.docs.map(d=>({id:d.id,...d.data()}));
     } catch(e){ /* submissions rule may not be published yet — degrade gracefully */ }
   }
