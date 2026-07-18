@@ -48,13 +48,34 @@ export const SEED_EMAILS = {
 export const STAGES = ['New','Contacted','Interested','Proposal Sent','Closed','Lost'];
 export const SP = { 'New':'sp-new','Contacted':'sp-contacted','Interested':'sp-interested','Proposal Sent':'sp-proposal','Closed':'sp-won','Lost':'sp-lost' };
 
-// Backend submission pipeline (Phase 7+). Account Creation is skipped per-item
-// when companies.hasDuAccount is true at submit time — see js/submissions.js.
-export const SUBMISSION_STAGES = ['Account Creation','Financial Approval','Activity','Work Order','Activated'];
+// Backend submission pipeline (Phase B, ARCHITECTURE.md §5) — coarse status,
+// not the old 5 fixed stages (SUBMISSION_STAGES, removed; hasDuAccount no
+// longer skips any step, it's an informational badge only).
+export const SUBMISSION_STATUSES = ['pendingVerification','submittedToDu','inProgress','activated','rejected'];
 // Required on every submission regardless of product. Per-product extras live on
 // products.requiredDocuments (empty/TBD until Ashok defines them — no schema
 // change needed when he does).
 export const MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)'];
+
+// Org-level config defaults (ARCHITECTURE.md §3's orgs/{orgId} doc) —
+// hardcoded here for now since there's no org-config UI yet; the shape is
+// deliberately the same as what that future UI would read/write from
+// Firestore, so migrating later is a data move, not a schema change.
+export const ORG_DEFAULTS = {
+  typeOfRequestList: ['NEW','FNP','MNP','Migration'],
+  rejectionReasons: [
+    'Documents missing','Documents suspected fake','Verification failed',
+    'Expired document','Wrong/incomplete details','Duplicate order',
+    'Customer withdrew','Other'
+  ],
+  // Per-category optional fields the Submit-to-Backend form offers for a
+  // line item (ARCHITECTURE.md §3 categoryFields). Starter/Essential/Ultimate
+  // are fiber/internet plans (gaid); Mobile is SIM-based.
+  itemFieldsByCategory: {
+    Starter: ['gaid'], Essential: ['gaid'], Ultimate: ['gaid'],
+    Mobile: ['msisdn','simSerial','passcode','commitmentPlan','handset']
+  }
+};
 
 // ════════════════════════════════════════════════════
 // SHARED MUTABLE STATE
