@@ -1044,6 +1044,14 @@ async function showSubmitModal(lead, byId){
 // canViewTimeline gate) — backend's own queue/action UI is a later session.
 // Groups the lead's submissions by bundleId; each line shows its own status
 // and full events[] timeline underneath.
+// Doc-viewing is entirely on-demand, single-page get()s — NOT a list query
+// against submissionDocs, so the f0c34bd LIST-query rule-provability issue
+// doesn't apply here (Firestore evaluates a single getDoc()'s read rule
+// against that exact document correctly, for every role, unlike a
+// collection query). Access is still fully governed by the submissionDocs
+// read rule (mirrors the submissions read rule) — a role that couldn't
+// already see this timeline can't fetch these pages either, since the rule
+// is checked independently on every single get().
 function showSubmissionTimelineModal(lead, submissions){
   const bundles = {};
   submissions.forEach(s => { (bundles[s.bundleId] ||= []).push(s); });
@@ -1059,6 +1067,14 @@ function showSubmissionTimelineModal(lead, submissions){
             <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
           </div>
           <div class="text-dim text-xs mt-4">${esc(l.category)} · Qty ${l.qty} · AED ${Number(l.mrc).toLocaleString()}/mo</div>
+          ${(l.requiredDocs||[]).length ? `<div class="mt-8">
+            ${l.requiredDocs.map(rd => `<div class="text-xs mt-4" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <span>${esc(rd.type)}</span>
+              <span class="text-dim">${rd.status==='uploaded'?'📎 uploaded':'attested'}${rd.expiryDate?` · expires ${fmtDate(rd.expiryDate)}`:''}</span>
+              ${rd.storageRef ? `<button type="button" class="btn btn-ghost btn-xs" data-view-doc="${l.id}|${esc(rd.type)}">View (${rd.storageRef.pageCount} page${rd.storageRef.pageCount!==1?'s':''})</button>` : ''}
+            </div>
+            <div id="tl-docpages-${l.id}-${slugForTimeline(rd.type)}" class="mt-4"></div>`).join('')}
+          </div>` : ''}
           <div class="mt-8">
             ${(l.events||[]).map(e => `<div class="text-xs text-dim">• ${fmtDate(e.ts)} — <strong>${esc(e.actorName)}</strong>: ${esc(EVENT_LABELS[e.type]||e.type)}${e.payload?.note?` — ${esc(e.payload.note)}`:''}${e.payload?.reason?` (${esc(e.payload.reason)})`:''}${e.payload?.value?` — ${esc(e.payload.value)}`:''}</div>`).join('')}
           </div>
@@ -1068,4 +1084,26 @@ function showSubmissionTimelineModal(lead, submissions){
   }).join('') || '<p class="text-dim text-sm">No submissions yet.</p>';
 
   modal(`Submission Timeline — ${esc(lead.company)}`, html, true);
+
+  // Fetch pages ON DEMAND (not eagerly for every doc when the modal opens) —
+  // one storage.get() per page, exactly as many reads as pages actually
+  // viewed.
+  document.querySelectorAll('[data-view-doc]').forEach(btn => btn.onclick = async () => {
+    const [subId, docType] = btn.dataset.viewDoc.split('|');
+    const line = submissions.find(s => s.id === subId);
+    const rd = line?.requiredDocs.find(r => r.type === docType);
+    if(!rd?.storageRef) return;
+    const target = document.getElementById(`tl-docpages-${subId}-${slugForTimeline(docType)}`);
+    target.innerHTML = '<span class="text-dim text-xs">Loading…</span>';
+    try {
+      const pages = await Promise.all(
+        Array.from({length: rd.storageRef.pageCount}, (_,i) =>
+          storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, pageIndex: i }))
+      );
+      target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
+    } catch(e){
+      target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
+    }
+  });
 }
+function slugForTimeline(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
