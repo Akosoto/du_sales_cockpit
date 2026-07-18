@@ -1,9 +1,20 @@
 import {
-  db, CU, CP, MANDATORY_DOC_TYPES,
-  doc, collection
+  db, CU, CP, MANDATORY_DOC_TYPES, ORG_DEFAULTS,
+  doc, getDoc, collection
 } from './state.js';
-import { newBatch, batchAdd, batchUpdate } from './db.js';
+import { newBatch, batchAdd, batchUpdate, dbUpdate } from './db.js';
 import { now } from './helpers.js';
+
+// Every recognized event type (ARCHITECTURE.md §5) — 'resubmit' isn't in
+// that list's prose but IS one of the explicit status-transition types per
+// step 3's own instructions, so it's included here. 'proceededWithoutVerification'
+// is deliberately excluded — it's auto-appended by appendEvent() itself, never
+// caller-supplied.
+const EVENT_TYPES = [
+  'docsVerified','verificationCall','verificationEmail','submittedToDu',
+  'activityNo','workOrderNo','appointment','biometric','sprObtained',
+  'correction','note','activated','rejected','resubmit'
+];
 
 // ════════════════════════════════════════════════════
 // SUBMISSIONS — agent → backend handoff (ARCHITECTURE.md Section 5)
@@ -143,4 +154,65 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
 
   await bat.commit();
   return { bundleId, submissionIds: subIds };
+}
+
+// Event engine (ARCHITECTURE.md §5) — every timeline entry on a submission
+// goes through here, never a direct dbUpdate. Status transitions ride the
+// SAME call as the event that causes them:
+//   submittedToDu → status:'submittedToDu' (+ auto-appends
+//     'proceededWithoutVerification' if no verification event/field exists
+//     yet — never silently loses that signal)
+//   activated     → status:'activated'
+//   rejected      → status:'rejected' (payload.reason is REQUIRED, from
+//     ORG_DEFAULTS.rejectionReasons)
+//   resubmit      → status:'pendingVerification' (agent fixed a rejected
+//     submission; the resubmit event itself is the record of that)
+//   anything else → no explicit status change, EXCEPT: if the submission is
+//     currently 'submittedToDu', any other logged event bumps it to
+//     'inProgress' — the first real backend touch after submission implies
+//     work has started, and nothing else in the schema sets that status.
+// verification {done, method, ts} is a separate structured summary field
+// (not just a timeline entry) — set whenever a verification-type event
+// fires, so the UI can show "verified" at a glance without scanning events[].
+export async function appendEvent(submissionId, { type, payload = {} }){
+  if(!EVENT_TYPES.includes(type)) throw new Error(`Unknown event type: ${type}`);
+  if(type === 'rejected' && !payload.reason) throw new Error('A rejection reason is required.');
+  if(type === 'rejected' && !ORG_DEFAULTS.rejectionReasons.includes(payload.reason)){
+    throw new Error(`"${payload.reason}" is not a configured rejection reason.`);
+  }
+
+  const snap = await getDoc(doc(db,'submissions',submissionId));
+  if(!snap.exists()) throw new Error('Submission not found.');
+  const sub = snap.data();
+
+  const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
+  const update = { events };
+
+  if(['docsVerified','verificationCall','verificationEmail'].includes(type)){
+    update.verification = {
+      done: true,
+      method: type==='verificationCall' ? 'call' : type==='verificationEmail' ? 'email' : null,
+      ts: now()
+    };
+  }
+
+  if(type === 'submittedToDu'){
+    const alreadyVerified = sub.verification?.done || update.verification?.done;
+    if(!alreadyVerified){
+      events.push({ type:'proceededWithoutVerification', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} });
+      update.verification = { done:false, method:null, ts:null };
+    }
+    update.status = 'submittedToDu';
+  } else if(type === 'activated'){
+    update.status = 'activated';
+  } else if(type === 'rejected'){
+    update.status = 'rejected';
+  } else if(type === 'resubmit'){
+    update.status = 'pendingVerification';
+  } else if(sub.status === 'submittedToDu'){
+    update.status = 'inProgress';
+  }
+
+  await dbUpdate('submissions', submissionId, update);
+  return update.status || sub.status;
 }
