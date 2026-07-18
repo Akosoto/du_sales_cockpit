@@ -1,9 +1,10 @@
 import {
   db, CU, CP, MANDATORY_DOC_TYPES, ORG_DEFAULTS,
-  doc, getDoc, collection
+  doc, collection, runTransaction
 } from './state.js';
-import { newBatch, batchAdd, batchUpdate, dbUpdate } from './db.js';
+import { newBatch, batchAdd, batchUpdate } from './db.js';
 import { now } from './helpers.js';
+import { orgId } from '../config.js';
 
 // Every recognized event type (ARCHITECTURE.md §5) — 'resubmit' isn't in
 // that list's prose but IS one of the explicit status-transition types per
@@ -174,6 +175,20 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
 // verification {done, method, ts} is a separate structured summary field
 // (not just a timeline entry) — set whenever a verification-type event
 // fires, so the UI can show "verified" at a glance without scanning events[].
+//
+// Queryable top-level timestamps (submittedToDuAt/activatedAt/rejectedAt) are
+// stamped ALONGSIDE the corresponding status, on the FIRST transition only —
+// reports and the future contract-expiry pipeline (activatedAt + contractTerm)
+// need to query/sort on these directly; scanning events[] for every
+// submission to find "when did this activate" doesn't scale.
+//
+// Runs inside a Firestore transaction (read + append + status change +
+// auditLog write, all atomic) instead of the previous getDoc-then-dbUpdate
+// sequence — two concurrent appendEvent calls on the same submission (e.g.
+// backend logging an activityNo while the agent's own resubmit races in)
+// could otherwise read the same stale events[] and one write would silently
+// clobber the other's event. A transaction detects that conflict and
+// automatically retries the whole read+write with fresh data.
 export async function appendEvent(submissionId, { type, payload = {} }){
   if(!EVENT_TYPES.includes(type)) throw new Error(`Unknown event type: ${type}`);
   if(type === 'rejected' && !payload.reason) throw new Error('A rejection reason is required.');
@@ -181,38 +196,54 @@ export async function appendEvent(submissionId, { type, payload = {} }){
     throw new Error(`"${payload.reason}" is not a configured rejection reason.`);
   }
 
-  const snap = await getDoc(doc(db,'submissions',submissionId));
-  if(!snap.exists()) throw new Error('Submission not found.');
-  const sub = snap.data();
+  const subRef = doc(db,'submissions',submissionId);
+  let finalStatus;
 
-  const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
-  const update = { events };
+  await runTransaction(db, async (transaction) => {
+    const snap = await transaction.get(subRef);
+    if(!snap.exists()) throw new Error('Submission not found.');
+    const sub = snap.data();
 
-  if(['docsVerified','verificationCall','verificationEmail'].includes(type)){
-    update.verification = {
-      done: true,
-      method: type==='verificationCall' ? 'call' : type==='verificationEmail' ? 'email' : null,
-      ts: now()
-    };
-  }
+    const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
+    const update = { events, lastEditedBy: CP.name, lastEditedAt: now() };
 
-  if(type === 'submittedToDu'){
-    const alreadyVerified = sub.verification?.done || update.verification?.done;
-    if(!alreadyVerified){
-      events.push({ type:'proceededWithoutVerification', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} });
-      update.verification = { done:false, method:null, ts:null };
+    if(['docsVerified','verificationCall','verificationEmail'].includes(type)){
+      update.verification = {
+        done: true,
+        method: type==='verificationCall' ? 'call' : type==='verificationEmail' ? 'email' : null,
+        ts: now()
+      };
     }
-    update.status = 'submittedToDu';
-  } else if(type === 'activated'){
-    update.status = 'activated';
-  } else if(type === 'rejected'){
-    update.status = 'rejected';
-  } else if(type === 'resubmit'){
-    update.status = 'pendingVerification';
-  } else if(sub.status === 'submittedToDu'){
-    update.status = 'inProgress';
-  }
 
-  await dbUpdate('submissions', submissionId, update);
-  return update.status || sub.status;
+    if(type === 'submittedToDu'){
+      const alreadyVerified = sub.verification?.done || update.verification?.done;
+      if(!alreadyVerified){
+        events.push({ type:'proceededWithoutVerification', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} });
+        update.verification = { done:false, method:null, ts:null };
+      }
+      update.status = 'submittedToDu';
+      if(!sub.submittedToDuAt) update.submittedToDuAt = now();
+    } else if(type === 'activated'){
+      update.status = 'activated';
+      if(!sub.activatedAt) update.activatedAt = now();
+    } else if(type === 'rejected'){
+      update.status = 'rejected';
+      if(!sub.rejectedAt) update.rejectedAt = now();
+    } else if(type === 'resubmit'){
+      update.status = 'pendingVerification';
+    } else if(sub.status === 'submittedToDu'){
+      update.status = 'inProgress';
+    }
+
+    transaction.update(subRef, update);
+    // auditLog write kept intact (per step 0a) even though this bypasses
+    // db.js's dbUpdate — same shape as db.js's own auditLogEntry().
+    transaction.set(doc(collection(db,'auditLog')), {
+      who: CU.uid, what: 'submissions', action: 'update', docRef: submissionId, ts: now(), orgId
+    });
+
+    finalStatus = update.status || sub.status;
+  });
+
+  return finalStatus;
 }

@@ -10,7 +10,7 @@ import {
 import {
   getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch,
-  orderBy, limit, startAfter, getCountFromServer
+  orderBy, limit, startAfter, getCountFromServer, runTransaction
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import {
   getStorage, ref, uploadBytes
@@ -23,7 +23,7 @@ export {
   createUserWithEmailAndPassword, sendPasswordResetEmail,
   doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
   collection, query, where, getDocs, writeBatch,
-  orderBy, limit, startAfter, getCountFromServer,
+  orderBy, limit, startAfter, getCountFromServer, runTransaction,
   ref, uploadBytes
 };
 
