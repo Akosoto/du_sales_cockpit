@@ -41,9 +41,11 @@ function currentDriver(){
 // teamId — the firestore-b64 driver's schema denormalizes these from the
 // submission onto every page doc (so the read rule and query mirroring work
 // the same way as submissions), and the adapter has no other way to know
-// them without reaching into feature-layer state itself.
-export async function put({bundleId, docType, pages, agentId, teamId}){
-  return currentDriver().put({bundleId, docType, pages, agentId, teamId});
+// them without reaching into feature-layer state itself. externalBat is also
+// optional passthrough — see createSubmissions()'s doc comment (js/submissions.js)
+// for the small-upload combined-batch case this exists for.
+export async function put({bundleId, docType, pages, agentId, teamId, externalBat}){
+  return currentDriver().put({bundleId, docType, pages, agentId, teamId, externalBat});
 }
 
 export async function get(ref){

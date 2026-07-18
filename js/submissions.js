@@ -94,10 +94,27 @@ export function pickBackendAgent(category, backendAgents, cursor){
 // 'pendingVerification' regardless; hasDuAccount is purely an informational
 // badge now (ARCHITECTURE.md §5).
 //
+// Client-side random id, reused purely as the shared bundle key — no doc is
+// ever written at this path, so allocating it costs no network round-trip.
+// Exported so callers (the Submit-to-Backend modal) that need the bundleId
+// BEFORE submissions are created — to tag document pages uploaded via
+// js/storage — can generate it up front and pass it into createSubmissions().
+export function generateBundleId(){
+  return doc(collection(db,'submissions')).id;
+}
+
 // accTransfer: when items.accTransfer.flag is set, also appends a
 // partnerHistory 'gained' event to the company doc in the SAME batch —
 // atomic with the submissions themselves.
-export async function createSubmissions({ lead, company, items, requiredDocs, accTransfer, teams, users }){
+//
+// bundleId/externalBat: optional. When the Submit-to-Backend modal's total
+// upload (submissions + document pages) is small enough to safely combine
+// into ONE atomic writeBatch, it generates the bundleId itself, builds a
+// shared batch, passes both in here (and to js/storage's put() calls), and
+// commits ONCE itself — this function then adds its writes to that batch
+// WITHOUT committing. Omit both for the normal standalone case (this
+// function generates its own bundleId and commits its own batch, as before).
+export async function createSubmissions({ lead, company, items, requiredDocs, accTransfer, teams, users, bundleId: providedBundleId, externalBat }){
   const backendTeam   = teams.find(t => t.department === 'backend');
   const backendAgents = backendTeam
     ? users.filter(u => u.role === 'agent' && u.teamId === backendTeam.id)
@@ -105,13 +122,11 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
   const autoMode = backendTeam?.assignmentMode === 'auto';
   let cursor = backendTeam?.assignmentCursor || 0;
 
-  // Client-side random id, reused purely as the shared bundle key — no doc is
-  // ever written at this path, so allocating it costs no network round-trip.
-  const bundleId = doc(collection(db,'submissions')).id;
-  const requiredDocsPayload = requiredDocs.map(rd => ({ type: rd.type, status: 'attested', expiryDate: rd.expiryDate || null }));
+  const bundleId = providedBundleId || generateBundleId();
+  const requiredDocsPayload = requiredDocs.map(rd => ({ type: rd.type, status: rd.status || 'attested', expiryDate: rd.expiryDate || null, storageRef: rd.storageRef || null }));
   const accTransferPayload = accTransfer?.flag ? { flag: true, fromPartner: accTransfer.fromPartner || '' } : { flag: false, fromPartner: '' };
 
-  const bat = newBatch();
+  const bat = externalBat || newBatch();
   const subIds = [];
   items.forEach(it => {
     let assignedBackendAgent = null;
@@ -153,7 +168,7 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
     batchUpdate(bat, 'teams', backendTeam.id, { assignmentCursor: cursor }, {skipAudit:true});
   }
 
-  await bat.commit();
+  if(!externalBat) await bat.commit();
   return { bundleId, submissionIds: subIds };
 }
 

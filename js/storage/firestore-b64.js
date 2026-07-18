@@ -35,7 +35,13 @@ function blobToBase64(blob){
 
 // pages: [{pageIndex, mime, blob, bytes}] from js/documents.js's capture
 // pipeline. Returns one ref per page: [{bundleId, docType, pageIndex}, ...].
-export async function put({bundleId, docType, pages, agentId, teamId}){
+//
+// externalBat: optional — when provided, writes are added to that batch
+// WITHOUT committing (the caller commits, e.g. combined atomically with the
+// submissions themselves for a small enough upload — see
+// createSubmissions()'s own externalBat doc comment). Omit for the normal
+// standalone case (commits its own batch).
+export async function put({bundleId, docType, pages, agentId, teamId, externalBat}){
   const encoded = await Promise.all(pages.map(async page => {
     const b64 = await blobToBase64(page.blob);
     if(b64.length > HARD_CEILING_CHARS){
@@ -44,7 +50,7 @@ export async function put({bundleId, docType, pages, agentId, teamId}){
     return { ...page, b64 };
   }));
 
-  const bat = newBatch();
+  const bat = externalBat || newBatch();
   const refs = [];
   encoded.forEach(page => {
     const docId = `${bundleId}_${docType}_${page.pageIndex}`;
@@ -55,7 +61,7 @@ export async function put({bundleId, docType, pages, agentId, teamId}){
     });
     refs.push({ bundleId, docType, pageIndex: page.pageIndex });
   });
-  await bat.commit();
+  if(!externalBat) await bat.commit();
   return refs;
 }
 

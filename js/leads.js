@@ -7,7 +7,9 @@ import {
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
-import { computeRequiredDocs, docExpiryWarnings, createSubmissions } from './submissions.js';
+import { computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId } from './submissions.js';
+import { captureFile, PDF_PAGE_CAP } from './documents.js';
+import * as storage from './storage/index.js';
 
 // Submission status/event display labels + colors — shared by the Submit
 // modal's own confirmation and the read-only timeline view.
@@ -791,6 +793,12 @@ async function showSubmitModal(lead, byId){
 
   let items = [];
   let docExpiryDates = {}; // { [docType]: 'YYYY-MM-DD' }
+  // { [docType]: {fileName, pages, truncated, totalPages, thumbUrl} | {error} }
+  // — a doc WITH an attached file (pages.length truthy) gets requiredDocs
+  // status 'uploaded' at submit; without one it stays 'attested' (files are
+  // encouraged, not blocking — ARCHITECTURE.md §6 — backend rejects at
+  // verification time if one's genuinely missing).
+  let docFiles = {};
   let accTransferFlag = false;
   let accTransferFromPartner = ''; // same re-render survival issue as selectedProductId below — persisted here, not read from the DOM after the fact
   // Persisted across render() calls — render() fully replaces the modal's
@@ -805,6 +813,16 @@ async function showSubmitModal(lead, byId){
     return fields.length ? `<div class="row2 mt-8">
       ${fields.map(f=>`<input type="text" id="sm-cf-${f}" placeholder="${CATEGORY_FIELD_LABELS[f]||f} (optional)">`).join('')}
     </div>` : '';
+  }
+  // Doc type names ("Emirates ID (Front)") contain spaces/parens — not safe
+  // to use directly as an HTML id — so DOM element ids use this slug, while
+  // the readable docType string itself lives in a data- attribute.
+  function slug(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
+  function docFilePreviewHtml(entry){
+    if(!entry) return '<span class="text-dim text-xs">No file attached (optional)</span>';
+    if(entry.error) return `<span class="err text-xs">${esc(entry.error)}</span>`;
+    const thumb = entry.thumbUrl ? `<img src="${entry.thumbUrl}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
+    return `${thumb}<span class="text-xs">${esc(entry.fileName)} — ${entry.pages.length} page${entry.pages.length!==1?'s':''}${entry.truncated?` (capped at ${PDF_PAGE_CAP} — PDF has ${entry.totalPages})`:''}</span>`;
   }
   // Shared between render() (so a re-render triggered by something OTHER
   // than the product picker, e.g. removing an item, doesn't silently lose
@@ -874,10 +892,14 @@ async function showSubmitModal(lead, byId){
       <input type="text" id="sm-acctxfer-from" placeholder="Transferring from (partner name)" value="${esc(accTransferFromPartner)}" class="mt-8" style="display:${accTransferFlag?'':'none'}">
       <div class="divider"></div>
       <div class="field">
-        <label>Documents ${req.length?`<span class="text-dim text-xs">(attest each with its expiry date — no file upload yet)</span>`:''}</label>
+        <label>Documents ${req.length?`<span class="text-dim text-xs">(attest each with its expiry date; attaching a file is encouraged but not required)</span>`:''}</label>
         ${req.map(rd=>`<div class="row2 mt-8" style="align-items:center">
           <span class="text-xs">${esc(rd)}</span>
           <input type="date" data-doc-expiry="${esc(rd)}" value="${docExpiryDates[rd]||''}">
+        </div>
+        <div class="row2 mt-8" style="align-items:center">
+          <input type="file" accept="image/*,application/pdf" data-doc-file="${esc(rd)}">
+          <div id="sm-docfile-preview-${slug(rd)}">${docFilePreviewHtml(docFiles[rd])}</div>
         </div>`).join('')}
       </div>
       ${missing.length ? `<p class="err mt-8">Missing expiry date for: ${missing.join(', ')}</p>` : ''}
@@ -945,13 +967,67 @@ async function showSubmitModal(lead, byId){
       render();
     });
 
+    // Targeted preview-area update, NOT a full render() — processing runs
+    // async (canvas/pdf.js work) and touches nothing else the rest of the
+    // form depends on.
+    document.querySelectorAll('[data-doc-file]').forEach(input => input.onchange = async function(){
+      const docType = this.dataset.docFile;
+      const file = this.files[0];
+      if(!file) return;
+      const previewEl = document.getElementById(`sm-docfile-preview-${slug(docType)}`);
+      previewEl.innerHTML = '<span class="text-dim text-xs">Processing…</span>';
+      try {
+        const result = await captureFile(file);
+        const thumbUrl = URL.createObjectURL(result.pages[0].blob);
+        docFiles[docType] = { fileName: file.name, pages: result.pages, truncated: result.truncated, totalPages: result.totalPages, thumbUrl };
+      } catch(e){
+        docFiles[docType] = { error: e.message };
+      }
+      previewEl.innerHTML = docFilePreviewHtml(docFiles[docType]);
+    });
+
     document.getElementById('sm-submit-btn').onclick = async () => {
       if(!canGo) return;
       disable('sm-submit-btn','Submitting…');
+      const bundleId = generateBundleId();
+      const docTypesWithFiles = req.filter(type => docFiles[type]?.pages?.length);
+      // "Safely fits" heuristic (ARCHITECTURE.md §6's own framing, "3-4 docs
+      // x <=400KB"): combine pages + submissions into ONE atomic writeBatch.
+      // Otherwise, pages are written first (their own committed batches),
+      // submissions after — if THAT second phase fails, the already-written
+      // pages are cleaned up rather than left orphaned.
+      const totalBytes = docTypesWithFiles.reduce((s,t)=>s+docFiles[t].pages.reduce((s2,p)=>s2+p.bytes,0),0);
+      const totalPageCount = docTypesWithFiles.reduce((s,t)=>s+docFiles[t].pages.length,0);
+      const safelyFits = docTypesWithFiles.length<=4 && totalBytes<=4*400*1024 && totalPageCount<=20;
+      const combinedBat = (safelyFits && docTypesWithFiles.length) ? newBatch() : null;
+
       try {
-        const requiredDocsPayload = req.map(type => ({ type, expiryDate: docExpiryDates[type]||null }));
+        const storageRefsByType = {};
+        for(const type of docTypesWithFiles){
+          const refs = await storage.put({
+            bundleId, docType: type, pages: docFiles[type].pages,
+            agentId: CU.uid, teamId: lead.teamId||'', externalBat: combinedBat||undefined
+          });
+          storageRefsByType[type] = { bundleId, docType: type, pageCount: refs.length };
+        }
+
+        const requiredDocsPayload = req.map(type => ({
+          type, expiryDate: docExpiryDates[type]||null,
+          status: storageRefsByType[type] ? 'uploaded' : 'attested',
+          storageRef: storageRefsByType[type] || null
+        }));
         const accTransfer = accTransferFlag ? { flag:true, fromPartner: accTransferFromPartner.trim() } : null;
-        await createSubmissions({ lead, company, items, requiredDocs: requiredDocsPayload, accTransfer, teams, users });
+
+        try {
+          await createSubmissions({ lead, company, items, requiredDocs: requiredDocsPayload, accTransfer, teams, users, bundleId, externalBat: combinedBat||undefined });
+          if(combinedBat) await combinedBat.commit();
+        } catch(subErr){
+          if(!combinedBat && docTypesWithFiles.length){
+            await storage.deleteByBundle(bundleId).catch(()=>{});
+          }
+          throw subErr;
+        }
+
         closeModal(); toast('Submitted to backend.'); renderPipelineTab();
       } catch(e){
         document.getElementById('sm-err').textContent = e.message;
