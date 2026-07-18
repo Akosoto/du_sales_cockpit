@@ -3,7 +3,7 @@ import {
   collection, query, where, getDocs,
   createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from './state.js';
-import { dbAdd, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete } from './db.js';
+import { dbAdd, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions, hasPermission } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
@@ -20,6 +20,26 @@ import { orgId } from '../config.js';
 // ════════════════════════════════════════════════════
 // ORG TAB — MANAGER ONLY
 // ════════════════════════════════════════════════════
+
+// Shared chunked-bulk-commit helper for this file's cascades (team delete,
+// member removal, hard-delete, department change) — none of these were
+// chunked at all before (a single unbounded batch per cascade), which was
+// already a latent bug for a large team/agent's lead count, and became a
+// much easier bug to trigger once auditLog started doubling writes-per-op.
+// skipAudit:true per-op + one summary entry, same pattern as db.js's
+// logBulkAudit doc comment explains.
+const BULK_CHUNK = 200;
+async function commitBulkOps(ops, description){
+  for(let i=0;i<ops.length;i+=BULK_CHUNK){
+    const bat = newBatch();
+    ops.slice(i,i+BULK_CHUNK).forEach(op => {
+      if(op.kind==='delete') batchDelete(bat, op.collectionName, op.id, {skipAudit:true});
+      else batchUpdate(bat, op.collectionName, op.id, op.data, {skipAudit:true});
+    });
+    await bat.commit();
+  }
+  if(ops.length) await logBulkAudit(description, ops.length);
+}
 export async function renderOrgTab(){
   const ct = document.getElementById('content');
   const [tSnap, uSnap, lSnap, companies] = await Promise.all([
@@ -274,14 +294,13 @@ export async function renderOrgTab(){
       'Members will become unassigned. Leads are not deleted.',
       async () => {
         const ms = await getDocs(query(collection(db,'users'), where('teamId','==',b.dataset.delTeam)));
-        const bat = newBatch();
-        ms.docs.forEach(d => {
+        const ops = ms.docs.map(d => {
           const fields = {teamId:null};
           if(d.data().role==='agent') fields.tlId = null;
-          batchUpdate(bat, 'users', d.id, fields);
+          return { kind:'update', collectionName:'users', id:d.id, data:fields };
         });
-        batchDelete(bat, 'teams', b.dataset.delTeam);
-        await bat.commit();
+        ops.push({ kind:'delete', collectionName:'teams', id:b.dataset.delTeam });
+        await commitBulkOps(ops, `Deleted team "${t?.name}" — ${ms.docs.length} member(s) unassigned`);
         closeModal(); toast('Team deleted.','info'); renderOrgTab();
       });
   }));
@@ -317,16 +336,13 @@ export async function renderOrgTab(){
         }
         // Unassign their leads so they don't silently vanish from team pipeline views
         const orphSnap = await getDocs(query(collection(db,'leads'),where('assignedTo','==',delId)));
-        if(!orphSnap.empty){
-          const bat2 = newBatch();
-          orphSnap.docs.forEach(ld => {
-            batchUpdate(bat2, 'leads', ld.id, {
-              assignedTo:'', tlId:'',
-              history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u?.name||'member'} removed from team` }]
-            });
-          });
-          await bat2.commit();
-        }
+        const orphOps = orphSnap.docs.map(ld => ({
+          kind:'update', collectionName:'leads', id:ld.id, data:{
+            assignedTo:'', tlId:'', lastEditedBy:CP.name, lastEditedAt:now(),
+            history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u?.name||'member'} removed from team` }]
+          }
+        }));
+        await commitBulkOps(orphOps, `Removed "${u?.name}" — ${orphOps.length} lead(s) unassigned`);
         closeModal(); toast('Member removed.','info'); renderOrgTab();
       });
   }));
@@ -339,28 +355,28 @@ export async function renderOrgTab(){
       : 'This cannot be undone. Their leads will become unassigned. The login will stop working immediately.';
     confirmModal(`Permanently delete "${esc(u.name)}"?`, warnMsg, async () => {
       const delId = u.id;
-      const bat = newBatch();
+      const ops = [];
 
       if(isTL){
         const orphanedAgents = users.filter(x => x.role==='agent' && x.tlId===delId);
-        orphanedAgents.forEach(a => batchUpdate(bat, 'users', a.id, {tlId:null}));
+        orphanedAgents.forEach(a => ops.push({ kind:'update', collectionName:'users', id:a.id, data:{tlId:null} }));
         const tlLeadsSnap = await getDocs(query(collection(db,'leads'), where('tlId','==',delId)));
-        tlLeadsSnap.docs.forEach(ld => batchUpdate(bat, 'leads', ld.id, {tlId:''}));
+        tlLeadsSnap.docs.forEach(ld => ops.push({ kind:'update', collectionName:'leads', id:ld.id, data:{tlId:'', lastEditedBy:CP.name, lastEditedAt:now()} }));
       } else {
         if(u.tlId){
           const sibs = users.filter(x=>x.role==='agent'&&x.tlId===u.tlId&&x.active!==false&&x.id!==delId);
           const newAuto = sibs.reduce((s,x)=>s+(Number(x.monthlyTarget)||0),0);
-          batchUpdate(bat, 'users', u.tlId, {autoTarget:newAuto});
+          ops.push({ kind:'update', collectionName:'users', id:u.tlId, data:{autoTarget:newAuto} });
         }
         const orphSnap = await getDocs(query(collection(db,'leads'), where('assignedTo','==',delId)));
-        orphSnap.docs.forEach(ld => batchUpdate(bat, 'leads', ld.id, {
-          assignedTo:'', tlId:'',
+        orphSnap.docs.forEach(ld => ops.push({ kind:'update', collectionName:'leads', id:ld.id, data:{
+          assignedTo:'', tlId:'', lastEditedBy:CP.name, lastEditedAt:now(),
           history:[...(ld.data().history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Unassigned — ${u.name} deleted` }]
-        }));
+        }}));
       }
 
-      batchDelete(bat, 'users', delId);
-      await bat.commit();
+      ops.push({ kind:'delete', collectionName:'users', id:delId });
+      await commitBulkOps(ops, `Hard-deleted ${isTL?'team lead':'agent'} "${u.name}" — ${ops.length-1} related doc(s) updated`);
       closeModal(); toast(`${isTL?'Team Lead':'Agent'} deleted.`,'info'); renderOrgTab();
     }, true);
   }));
@@ -442,17 +458,19 @@ function showEditTeamModal(teamId, teams, tls, ags){
         name, permissions:getSelectedPermissions('et-perm'), department:newDept,
         ...(newDept==='backend' ? {assignmentMode: v('et-mode')||'manual'} : {})
       };
-      const bat = newBatch();
-      batchUpdate(bat, 'teams', teamId, upd);
+      // The team edit itself gets a normal, single, fully-audited write. The
+      // member-department cascade below is handled separately through the
+      // shared bulk helper (chunked + skipAudit + one summary entry) since a
+      // large team could in principle exceed the 500-write batch cap.
+      await dbUpdate('teams', teamId, upd);
       // users.department is denormalized from their team's department (like
       // teamId/tlId elsewhere) — cascade so members don't go stale if a team's
       // department changes after they were assigned.
       if(newDept !== dept){
-        [...tls, ...ags].filter(m => m.teamId===teamId).forEach(m => {
-          batchUpdate(bat, 'users', m.id, {department:newDept});
-        });
+        const memberOps = [...tls, ...ags].filter(m => m.teamId===teamId)
+          .map(m => ({ kind:'update', collectionName:'users', id:m.id, data:{department:newDept} }));
+        await commitBulkOps(memberOps, `Team "${name}" department changed to ${newDept} — ${memberOps.length} member(s) cascaded`);
       }
-      await bat.commit();
       closeModal(); toast('Team updated.'); renderOrgTab();
     } catch(e){ err.textContent=e.message; enable('et-btn','Save Changes'); }
   };
@@ -727,7 +745,7 @@ async function repairLeadTeamData(leadsToFix, byId){
   const btn = document.getElementById('btn-repair');
   if(btn){ btn.disabled = true; btn.textContent = '⏳ Repairing…'; }
   try {
-    const CHUNK = 400;
+    const CHUNK = 200;
     let fixed = 0;
     for(let i = 0; i < leadsToFix.length; i += CHUNK){
       const chunk = leadsToFix.slice(i, i + CHUNK);
@@ -735,11 +753,12 @@ async function repairLeadTeamData(leadsToFix, byId){
       chunk.forEach(l => {
         const assignee = byId[l.assignedTo];
         if(!assignee) return;
-        batchUpdate(bat, 'leads', l.id, { teamId: assignee.teamId||'', tlId: assignee.tlId||'' });
+        batchUpdate(bat, 'leads', l.id, { teamId: assignee.teamId||'', tlId: assignee.tlId||'' }, {skipAudit:true});
         fixed++;
       });
       await bat.commit();
     }
+    if(fixed) await logBulkAudit(`Repaired teamId/tlId on ${fixed} lead(s)`, fixed);
     toast(`✅ Repaired ${fixed} lead${fixed!==1?'s':''}.`);
     renderOrgTab();
   } catch(e){
@@ -790,7 +809,7 @@ async function runOrgIdMigration(){
     for(const collectionName of ORGID_MIGRATION_COLLECTIONS){
       const snap = await getDocs(collection(db, collectionName));
       const missing = snap.docs.filter(d => d.data().orgId !== orgId);
-      const CHUNK = 400;
+      const CHUNK = 200;
       for(let i=0;i<missing.length;i+=CHUNK){
         const bat = newBatch();
         missing.slice(i,i+CHUNK).forEach(d => {
@@ -800,6 +819,7 @@ async function runOrgIdMigration(){
         await bat.commit();
       }
     }
+    if(stamped) await logBulkAudit(`orgId migration: stamped ${stamped} document(s)`, stamped);
     toast(`✅ Stamped orgId on ${stamped} document${stamped!==1?'s':''}.`);
     renderOrgTab();
   } catch(e){

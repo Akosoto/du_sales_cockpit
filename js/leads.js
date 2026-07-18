@@ -4,7 +4,7 @@ import {
   collection, query, where, getDocs,
   orderBy, limit, startAfter, getCountFromServer
 } from './state.js';
-import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate } from './db.js';
+import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
 import { fetchCompanies, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import { computeRequiredDocs, createSubmission } from './submissions.js';
@@ -268,7 +268,15 @@ export async function renderPipelineTab(){
       const ids = [...selected];
       disable('bulk-assign-btn','Assigning…');
       try {
-        const CHUNK = 400;
+        // CHUNK=200 + skipAudit:true per-op: same fix as every other bulk
+        // path (js/db.js's auditLog write would otherwise double writes-per-
+        // op). Currently bounded by pagination (selection resets per page,
+        // capped at PAGE_SIZE) so this can't hit the 500-write cap today —
+        // fixed anyway so a future "select all matching filter" can't
+        // silently reintroduce it. lastEditedBy/lastEditedAt are passed
+        // explicitly so skipAudit doesn't drop them (caller-provided fields
+        // always win over the gateway's defaults, skipped or not).
+        const CHUNK = 200;
         for(let i=0;i<ids.length;i+=CHUNK){
           const bat = newBatch();
           ids.slice(i,i+CHUNK).forEach(id=>{
@@ -276,11 +284,13 @@ export async function renderPipelineTab(){
             batchUpdate(bat, 'leads', id, {
               assignedTo: targetId,
               teamId: target.teamId||'', tlId: target.tlId||'',
+              lastEditedBy: CP.name, lastEditedAt: now(),
               history: [...(lead.history||[]), { ts:now(), actorId:CU.uid, actorName:CP.name, change:`Assigned: ${byId[lead.assignedTo]?.name||'—'} → ${target.name} (bulk)` }]
-            });
+            }, {skipAudit:true});
           });
           await bat.commit();
         }
+        await logBulkAudit(`Bulk-assigned ${ids.length} lead(s) to ${target.name}`, ids.length);
         toast(`${ids.length} lead${ids.length!==1?'s':''} assigned to ${target.name}.`);
         selected.clear();
         renderPipelineTab();

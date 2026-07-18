@@ -1,5 +1,5 @@
 import { db, doc, getDocs, collection } from './state.js';
-import { dbAdd, newBatch, batchSet, batchUpdate } from './db.js';
+import { dbAdd, newBatch, batchSet, batchUpdate, logBulkAudit } from './db.js';
 
 // ════════════════════════════════════════════════════
 // COMPANIES — shared logic
@@ -127,15 +127,20 @@ export async function backfillCompanies(leadsToFix){
     leadsUpdated++;
   });
 
-  const CHUNK = 400;
+  // CHUNK=200 + skipAudit:true per-op: each op would otherwise ALSO write an
+  // auditLog doc (js/db.js), doubling writes-per-op and blowing Firestore's
+  // 500-write batch cap well below the old 400-op chunk size. One summary
+  // auditLog entry for the whole run replaces the per-op trail.
+  const CHUNK = 200;
   for(let i=0;i<allOps.length;i+=CHUNK){
     const bat = newBatch();
     allOps.slice(i,i+CHUNK).forEach(op => {
-      if(op.kind==='set') batchSet(bat, op.collectionName, op.id, op.data);
-      else batchUpdate(bat, op.collectionName, op.id, op.data);
+      if(op.kind==='set') batchSet(bat, op.collectionName, op.id, op.data, {skipAudit:true});
+      else batchUpdate(bat, op.collectionName, op.id, op.data, {skipAudit:true});
     });
     await bat.commit();
   }
+  if(allOps.length) await logBulkAudit(`backfillCompanies: ${newCompanyDocs.length} companies created, ${leadsUpdated} leads linked`, allOps.length);
 
   return { companiesCreated: newCompanyDocs.length, leadsUpdated };
 }

@@ -139,3 +139,13 @@ export function batchDelete(bat, collectionName, id, opts = {}){
   bat.delete(doc(db, collectionName, id));
   if(!opts.skipAudit) bat.set(doc(collection(db,'auditLog')), auditLogEntry(collectionName, id, 'delete'));
 }
+
+// One summary entry for an entire bulk run (backfills, cascades, imports).
+// Every batch* call in a bulk loop must pass {skipAudit:true} — N ops would
+// otherwise double to 2N writes per batch and blow Firestore's 500-write cap
+// well before N reaches the 500-op chunk sizes those loops used to assume.
+// This single record is the tradeoff: no per-doc audit trail for a bulk run,
+// but a record that one happened, by whom, affecting how many docs, exists.
+export async function logBulkAudit(description, count){
+  return dbAdd('auditLog', { who: CU.uid, what: 'bulk', action: 'bulk', count, description, ts: now() }, { skipAudit: true });
+}
