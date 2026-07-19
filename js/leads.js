@@ -13,6 +13,7 @@ import {
 } from './submissions.js';
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
 import * as storage from './storage/index.js';
+import { downloadBundlePdf } from './pdfExport.js';
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -1107,7 +1108,10 @@ function showSubmissionTimelineModal(lead, submissions){
   const html = Object.entries(bundles).map(([bundleId, lines]) => {
     const submittedAt = lines.reduce((earliest,l) => !earliest || l.createdAt < earliest ? l.createdAt : earliest, null);
     return `<div class="pr-sub-row mb-12">
-      <div style="font-weight:600;font-size:13px">📦 Bundle — ${fmtDate(submittedAt)} · ${lines.length} item${lines.length!==1?'s':''}</div>
+      <div class="flex" style="justify-content:space-between;align-items:center">
+        <div style="font-weight:600;font-size:13px">📦 Bundle — ${fmtDate(submittedAt)} · ${lines.length} item${lines.length!==1?'s':''}</div>
+        <button type="button" class="btn btn-ghost btn-xs" data-download-bundle="${bundleId}">⬇️ Download bundle PDF</button>
+      </div>
       ${lines.map(l => `
         <div class="mt-8" style="padding-left:12px;border-left:2px solid var(--border2)">
           <div class="flex gap-8" style="justify-content:space-between;align-items:center">
@@ -1195,6 +1199,19 @@ function showSubmissionTimelineModal(lead, submissions){
   document.querySelectorAll('[data-fix-resubmit]').forEach(btn => btn.onclick = () => {
     const line = submissions.find(s => s.id === btn.dataset.fixResubmit);
     if(line) showFixResubmitModal(line, () => showSubmissionTimelineModal(lead, submissions));
+  });
+
+  document.querySelectorAll('[data-download-bundle]').forEach(btn => btn.onclick = async () => {
+    const bundleId = btn.dataset.downloadBundle;
+    const lines = submissions.filter(s => s.bundleId === bundleId);
+    btn.disabled = true; btn.textContent = 'Preparing…';
+    try {
+      await downloadBundlePdf(bundleId, lines, (lead.company||'bundle').replace(/[^a-zA-Z0-9]/g,'_'));
+    } catch(e){
+      toast('Error: '+e.message, 'err');
+    } finally {
+      btn.disabled = false; btn.textContent = '⬇️ Download bundle PDF';
+    }
   });
 }
 function slugForTimeline(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }

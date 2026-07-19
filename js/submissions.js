@@ -5,6 +5,12 @@ import {
 import { newBatch, batchAdd, batchUpdate } from './db.js';
 import { now } from './helpers.js';
 import { orgId } from '../config.js';
+import * as storage from './storage/index.js';
+
+// Backend-attachable doc types (step 5b) — distinct from the
+// agent-required checklist (MANDATORY_DOC_TYPES + product-specific), these
+// are ADDITIONAL evidence backend adds after the fact.
+export const BACKEND_ATTACHMENT_TYPES = ['Affidavit', 'Email Extension', 'Other'];
 
 // Every recognized event type (ARCHITECTURE.md §5) — 'resubmit' isn't in
 // that list's prose but IS one of the explicit status-transition types per
@@ -382,4 +388,31 @@ export async function reassignSubmission(submissionId, newAgentId, oldAgentName,
     payload: { text: `Reassigned from ${oldAgentName||'Unassigned'} to ${newAgentName}` },
     extraFields: { assignedBackendAgent: newAgentId }
   });
+}
+
+// Backend attachment (step 5b, ARCHITECTURE.md §5/§6) — adds an ADDITIONAL
+// document (BACKEND_ATTACHMENT_TYPES) to EVERY sibling submission in a
+// bundle, same as how the agent's originally-submitted docs are duplicated
+// across all lines at creation. The page's agentId/teamId are the
+// ORIGINAL submitting agent's own values (read from the bundle's own
+// submissions, not the backend uploader) — the submissionDocs read rule's
+// agentId/teamId-scoped clauses (agent-self, their TL) must keep working
+// for a doc backend attaches on someone else's behalf; uploadedBy (already
+// a separate field on the page) records who actually attached it. Requires
+// the submissionDocs create rule to also allow isActiveBackend() (step
+// 5c) — a backend user's own uid otherwise never matches the page's
+// agentId the way the existing agentId==self clause expects.
+export async function attachBackendDocument({ bundleId, docType, pages }){
+  const siblingsSnap = await getDocs(query(collection(db,'submissions'), where('bundleId','==',bundleId)));
+  const lines = siblingsSnap.docs.map(d => ({id:d.id, ...d.data()}));
+  if(!lines.length) throw new Error('No submissions found for this bundle.');
+  const { agentId, teamId } = lines[0];
+
+  const refs = await storage.put({ bundleId, docType, pages, version: 1, agentId, teamId });
+  const newEntry = { type: docType, status: 'uploaded', expiryDate: null, storageRef: { bundleId, docType, version: 1, pageCount: refs.length } };
+
+  for(const line of lines){
+    const requiredDocs = [...(line.requiredDocs||[]), newEntry];
+    await appendEvent(line.id, { type: 'note', payload: { text: `Attached ${docType}` }, extraFields: { requiredDocs } });
+  }
 }

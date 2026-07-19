@@ -252,10 +252,18 @@ service cloud.firestore {
         isActiveBackend()
       );
 
-      // Uploaded at Submit-to-Backend time by the submitting agent, or by a
-      // manager (no other path creates these).
+      // Uploaded at Submit-to-Backend time by the submitting agent, at
+      // Fix & Resubmit time (also the submitting agent — a new version is a
+      // CREATE, never an edit), by a manager, or by backend department
+      // staff ATTACHING an additional document to someone else's bundle
+      // (step 5b) — that page's agentId is deliberately the ORIGINAL
+      // agent's own uid, not the backend uploader's, so the read rule's
+      // agentId/teamId clauses keep working for the agent and their TL;
+      // isActiveBackend() is what actually authorizes the backend upload
+      // itself, since request.resource.data.agentId won't equal a backend
+      // uploader's own uid.
       allow create: if isAuth() && sameOrgWrite()
-        && (request.resource.data.agentId == request.auth.uid || role() == 'manager');
+        && (request.resource.data.agentId == request.auth.uid || role() == 'manager' || isActiveBackend());
 
       // Pages are immutable — replacing a document means delete + re-upload,
       // never an in-place edit, so there is no update rule at all.

@@ -1,13 +1,16 @@
 import {
   db, CU, CP, ORG_DEFAULTS,
-  collection, getDocs, doc, getDoc
+  collection, getDocs, doc, getDoc, query, where
 } from './state.js';
 import { esc, fmtDate, toast, modal, closeModal, disable, enable, v } from './helpers.js';
 import {
   SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS,
-  claimSubmission, reassignSubmission, appendEvent
+  claimSubmission, reassignSubmission, appendEvent,
+  BACKEND_ATTACHMENT_TYPES, attachBackendDocument
 } from './submissions.js';
 import * as storage from './storage/index.js';
+import { captureFile } from './documents.js';
+import { downloadBundlePdf } from './pdfExport.js';
 
 // Client-side workflow policy (step 2) — NOT a security boundary, the
 // submissions rule already gives the whole backend department unrestricted
@@ -224,6 +227,9 @@ async function showActionPanel(sub, company, onChange){
   function render(){
     const s = current;
     modal(`Submission — ${esc(company?.name || 'Unknown Company')}`, `
+      <div class="flex mb-12" style="justify-content:flex-end">
+        <button type="button" class="btn btn-ghost btn-xs" id="ap-download-bundle">⬇️ Download bundle PDF</button>
+      </div>
       <div class="info-grid mb-12">
         <div class="info-item"><div class="lbl">Company</div><div class="val">${esc(company?.name||'—')} ${company?.hasDuAccount?'<span class="text-ok text-xs">● has du account</span>':''}</div></div>
         <div class="info-item"><div class="lbl">Account Code</div><div class="val">${esc(company?.accountCode||'—')}</div></div>
@@ -245,6 +251,14 @@ async function showActionPanel(sub, company, onChange){
       <div class="divider"></div>
       <div class="field"><label>Documents</label>
         ${(s.requiredDocs||[]).map(docRow).join('') || '<p class="text-dim text-xs">None required.</p>'}
+      </div>
+      <div class="field mt-8"><label>Attach Document</label>
+        <div class="row2">
+          <select id="ap-attach-type">${BACKEND_ATTACHMENT_TYPES.map(t=>`<option>${t}</option>`).join('')}</select>
+          <input type="file" id="ap-attach-file" accept="image/*,application/pdf">
+        </div>
+        <div id="ap-attach-preview" class="mt-4"></div>
+        <button class="btn btn-ghost btn-sm mt-8" id="ap-attach-btn">Attach</button>
       </div>
       <div class="divider"></div>
       <div class="field"><label>Timeline</label>
@@ -340,6 +354,58 @@ async function showActionPanel(sub, company, onChange){
         target.innerHTML = pages.map((p,i) => `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
       });
     });
+
+    // Combined-PDF export (step 5a) — needs every SIBLING submission's
+    // requiredDocs (not just this one), fetched lazily on click since most
+    // opens of the panel never use it.
+    document.getElementById('ap-download-bundle').onclick = async () => {
+      const btn = document.getElementById('ap-download-bundle');
+      btn.disabled = true; btn.textContent = 'Preparing…';
+      try {
+        const siblingsSnap = await getDocs(query(collection(db,'submissions'), where('bundleId','==',s.bundleId)));
+        const lines = siblingsSnap.docs.map(d => d.data());
+        await downloadBundlePdf(s.bundleId, lines, (company?.name||'bundle').replace(/[^a-zA-Z0-9]/g,'_'));
+      } catch(e){
+        document.getElementById('ap-err').textContent = e.message;
+      } finally {
+        btn.disabled = false; btn.textContent = '⬇️ Download bundle PDF';
+      }
+    };
+
+    // Backend attachment (step 5b) — same capture pipeline as the agent's
+    // own upload, just a different (backend-only) doc-type list and a
+    // separate write path (attachBackendDocument) that fans the new
+    // requiredDocs entry out to every sibling submission in the bundle.
+    let attachEntry = null;
+    document.getElementById('ap-attach-file').onchange = async function(){
+      const file = this.files[0];
+      if(!file) return;
+      const preview = document.getElementById('ap-attach-preview');
+      preview.innerHTML = '<span class="text-dim text-xs">Processing…</span>';
+      try {
+        const result = await captureFile(file);
+        attachEntry = { fileName: file.name, pages: result.pages, truncated: result.truncated, totalPages: result.totalPages };
+        preview.innerHTML = `<span class="text-xs">${esc(file.name)} — ${result.pages.length} page${result.pages.length!==1?'s':''}${result.truncated?` (capped — PDF has ${result.totalPages})`:''}</span>`;
+      } catch(e){
+        attachEntry = null;
+        preview.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
+      }
+    };
+    document.getElementById('ap-attach-btn').onclick = async () => {
+      const err = document.getElementById('ap-err');
+      if(!attachEntry?.pages?.length){ err.textContent = 'Choose a file to attach first.'; return; }
+      const docType = v('ap-attach-type');
+      const btn = document.getElementById('ap-attach-btn');
+      btn.disabled = true; btn.textContent = 'Attaching…';
+      try {
+        await attachBackendDocument({ bundleId: s.bundleId, docType, pages: attachEntry.pages });
+        toast('Attached.');
+        await refresh();
+      } catch(e){
+        err.textContent = e.message;
+        btn.disabled = false; btn.textContent = 'Attach';
+      }
+    };
 
     // Quick (no-payload) actions
     document.querySelectorAll('[data-act]').forEach(btn => btn.onclick = async () => {
