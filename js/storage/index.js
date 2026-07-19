@@ -22,7 +22,12 @@ import * as firestoreB64 from './firestore-b64.js';
 //     pageIndex}) — viewing a multi-page doc means calling this once per
 //     pageIndex from 0 to pageCount-1, never a single call for "all pages".
 //   deleteByBundle(bundleId) → deletes every stored page for every docType
-//     in that bundle (the retention sweep's primary tool).
+//     in that bundle (submit-failure cleanup — see js/leads.js).
+//   deleteByBundles(bundleIds, description) → same, across MANY bundles in
+//     one pass, ONE summary audit entry for the whole run (the retention
+//     sweep's primary tool — see js/org.js runDocumentRetentionSweep).
+//   countPagesForBundles(bundleIds) → cheap aggregation count, no full doc
+//     fetch — the sweep's confirm-dialog "how many pages, before executing".
 // ════════════════════════════════════════════════════
 
 const DRIVERS = {
@@ -54,4 +59,12 @@ export async function get(ref){
 
 export async function deleteByBundle(bundleId){
   return currentDriver().deleteByBundle(bundleId);
+}
+
+export async function deleteByBundles(bundleIds, description){
+  return currentDriver().deleteByBundles(bundleIds, description);
+}
+
+export async function countPagesForBundles(bundleIds){
+  return currentDriver().countPagesForBundles(bundleIds);
 }

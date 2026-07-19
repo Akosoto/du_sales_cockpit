@@ -74,7 +74,11 @@ export const ORG_DEFAULTS = {
   itemFieldsByCategory: {
     Starter: ['gaid'], Essential: ['gaid'], Ultimate: ['gaid'],
     Mobile: ['msisdn','simSerial','passcode','commitmentPlan','handset']
-  }
+  },
+  // Document retention window (ARCHITECTURE.md §6) — the Org tab's cleanup
+  // sweep only touches bundles where EVERY sibling submission has been
+  // terminal (activated/rejected) for at least this many days.
+  docRetentionDays: 90
 };
 
 // ════════════════════════════════════════════════════

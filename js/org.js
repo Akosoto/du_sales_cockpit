@@ -1,5 +1,5 @@
 import {
-  db, CU, CP, auth, auth2,
+  db, CU, CP, auth, auth2, ORG_DEFAULTS,
   collection, query, where, getDocs,
   createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from './state.js';
@@ -8,6 +8,7 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions, hasPermission } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
 import { PRODUCT_CATEGORIES } from './products.js';
+import * as storage from './storage/index.js';
 import { orgId } from '../config.js';
 
 // NOTE: this file used to carry 115 hardcoded prospect leads (real names,
@@ -98,6 +99,7 @@ export async function renderOrgTab(){
       <div><h2>Org & Teams</h2><p class="pg-hdr-sub">${teams.length} team${teams.length!==1?'s':''} · ${tls.length} team lead${tls.length!==1?'s':''} · ${ags.length} agent${ags.length!==1?'s':''}</p></div>
       <div class="pg-actions">
         <button class="btn btn-ghost btn-sm" id="btn-backup-export">⬇️ Backup / Export All Data</button>
+        <button class="btn btn-ghost btn-sm" id="btn-doc-retention-sweep">🗑️ Clean up old documents</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-team">+ New Team</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-tl">+ New Team Lead</button>
         <button class="btn btn-primary btn-sm" id="btn-add-ag">+ New Agent</button>
@@ -285,6 +287,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
   ct.querySelector('#btn-orgid-migration')?.addEventListener('click', () => runOrgIdMigration());
   ct.querySelector('#btn-backup-export')?.addEventListener('click', () => runBackupExport());
+  ct.querySelector('#btn-doc-retention-sweep')?.addEventListener('click', () => runDocumentRetentionSweep());
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies, users)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
@@ -858,6 +861,69 @@ async function runBackupExport(){
     toast('Error: '+e.message,'err');
   } finally {
     if(btn){ btn.disabled = false; btn.textContent = '⬇️ Backup / Export All Data'; }
+  }
+}
+
+// Retention sweep (ARCHITECTURE.md §6) — a bundle's stored document pages are
+// only safe to delete once EVERY sibling submission (every product line under
+// that bundleId) is terminal (activated/rejected), and only after the
+// SLOWEST sibling to go terminal has sat there for docRetentionDays. Leaves
+// requiredDocs' attestation flags and expiry dates untouched — this only
+// clears the stored page bytes in submissionDocs, not the submission record
+// itself. Manager-only, matching the button's Org-tab-only reachability.
+async function runDocumentRetentionSweep(){
+  const btn = document.getElementById('btn-doc-retention-sweep');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Scanning…'; }
+  try {
+    const snap = await getDocs(query(collection(db,'submissions'), where('orgId','==',orgId)));
+    const byBundle = {};
+    snap.docs.forEach(d => { const s = d.data(); (byBundle[s.bundleId] ||= []).push(s); });
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - (ORG_DEFAULTS.docRetentionDays || 90));
+
+    const qualifying = [];
+    Object.entries(byBundle).forEach(([bundleId, lines]) => {
+      if(!bundleId) return;
+      const allTerminal = lines.every(l => l.status==='activated' || l.status==='rejected');
+      if(!allTerminal) return;
+      const terminalDates = lines.map(l => l.activatedAt || l.rejectedAt).filter(Boolean);
+      if(terminalDates.length !== lines.length) return; // a terminal line missing its stamp — don't guess, skip until it's stamped
+      const latestTerminal = terminalDates.reduce((a,b) => a>b?a:b);
+      if(new Date(latestTerminal) <= cutoff) qualifying.push(bundleId);
+    });
+
+    if(!qualifying.length){
+      toast('No bundles are eligible for cleanup yet.');
+      return;
+    }
+
+    const pageCount = await storage.countPagesForBundles(qualifying);
+    if(!pageCount){
+      toast('Eligible bundles have no stored document pages left to clean up.');
+      return;
+    }
+
+    confirmModal(
+      `Clean up documents for ${qualifying.length} bundle${qualifying.length!==1?'s':''}?`,
+      `${pageCount} document page${pageCount!==1?'s':''} across ${qualifying.length} bundle${qualifying.length!==1?'s':''} (all submissions terminal for over ${ORG_DEFAULTS.docRetentionDays||90} days) will be permanently deleted. Attestation and expiry-date fields are kept — only the stored files go. This cannot be undone.`,
+      async () => {
+        closeModal();
+        if(btn){ btn.disabled = true; btn.textContent = '⏳ Cleaning up…'; }
+        try {
+          const deleted = await storage.deleteByBundles(qualifying);
+          toast(`✅ Deleted ${deleted} document page${deleted!==1?'s':''} across ${qualifying.length} bundle${qualifying.length!==1?'s':''}.`);
+        } catch(e){
+          toast('Error: '+e.message,'err');
+        } finally {
+          if(btn){ btn.disabled = false; btn.textContent = '🗑️ Clean up old documents'; }
+        }
+      }
+    );
+  } catch(e){
+    toast('Error: '+e.message,'err');
+  } finally {
+    if(btn && !btn.textContent.includes('Cleaning')){ btn.disabled = false; btn.textContent = '🗑️ Clean up old documents'; }
   }
 }
 

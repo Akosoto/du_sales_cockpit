@@ -1,4 +1,4 @@
-import { db, CU, doc, getDoc, getDocs, collection, query, where } from '../state.js';
+import { db, CU, doc, getDoc, getDocs, collection, query, where, getCountFromServer } from '../state.js';
 import { newBatch, batchSet, batchDelete, logBulkAudit } from '../db.js';
 import { now } from '../helpers.js';
 import { orgId } from '../../config.js';
@@ -75,12 +75,29 @@ export async function get(ref){
 }
 
 // Deletes every stored page (every docType, every pageIndex) for a bundle —
-// the retention sweep's primary tool. Bulk-op pattern (skipAudit per-op +
-// one summary logBulkAudit entry, CHUNK 200) since a sweep run can touch
-// many pages across many bundles in one pass.
+// used when a single Submit-to-Backend attempt fails partway (cleanup after
+// pages were already written but the submissions themselves couldn't be
+// created — see js/leads.js's showSubmitModal). One summary logBulkAudit
+// entry per call, since a single failed submit is its own discrete event.
 export async function deleteByBundle(bundleId){
-  const snap = await getDocs(query(collection(db,'submissionDocs'), where('bundleId','==',bundleId)));
-  const docs = snap.docs;
+  return deleteByBundles([bundleId], `Cleaned up submissionDocs for bundle ${bundleId} (submit failure rollback)`);
+}
+
+// Deletes every stored page across MULTIPLE bundles in one pass — the
+// retention sweep's primary tool (js/org.js runDocumentRetentionSweep).
+// Firestore's 'in' operator caps at 30 values, so bundleIds are queried in
+// chunks of 30; the resulting docs are deleted in the usual skipAudit +
+// CHUNK-200 bulk pattern. Exactly ONE summary logBulkAudit entry for the
+// WHOLE run (not one per bundle) — a sweep across many bundles is one
+// discrete operation, not N of them.
+export async function deleteByBundles(bundleIds, description){
+  if(!bundleIds.length) return 0;
+  const ID_CHUNK = 30;
+  const docs = [];
+  for(let i=0; i<bundleIds.length; i+=ID_CHUNK){
+    const snap = await getDocs(query(collection(db,'submissionDocs'), where('bundleId','in',bundleIds.slice(i,i+ID_CHUNK))));
+    docs.push(...snap.docs);
+  }
   const CHUNK = 200;
   let deleted = 0;
   for(let i=0; i<docs.length; i+=CHUNK){
@@ -91,6 +108,20 @@ export async function deleteByBundle(bundleId){
     });
     await bat.commit();
   }
-  if(deleted) await logBulkAudit(`Deleted ${deleted} submissionDocs page(s) for bundle ${bundleId}`, deleted);
+  if(deleted) await logBulkAudit(description || `Deleted ${deleted} submissionDocs page(s) across ${bundleIds.length} bundle(s)`, deleted);
   return deleted;
+}
+
+// Cheap pre-count (getCountFromServer-style aggregation, NOT a full doc
+// fetch) for the retention sweep's confirm dialog — "show counts before
+// executing". Same chunked 'in' pattern as deleteByBundles.
+export async function countPagesForBundles(bundleIds){
+  if(!bundleIds.length) return 0;
+  const ID_CHUNK = 30;
+  let total = 0;
+  for(let i=0; i<bundleIds.length; i+=ID_CHUNK){
+    const agg = await getCountFromServer(query(collection(db,'submissionDocs'), where('bundleId','in',bundleIds.slice(i,i+ID_CHUNK))));
+    total += agg.data().count;
+  }
+  return total;
 }
