@@ -215,8 +215,10 @@ async function showActionPanel(sub, company, onChange){
         <span>${esc(rd.type)}</span>
         <span class="text-dim">${rd.status==='uploaded'?'📎 uploaded':'attested'}${rd.expiryDate?` · expires ${fmtDate(rd.expiryDate)}`:''}</span>
         ${rd.storageRef ? `<button type="button" class="btn btn-ghost btn-xs" data-view-doc="${esc(rd.type)}">View (${rd.storageRef.pageCount} page${rd.storageRef.pageCount!==1?'s':''})</button>` : ''}
+        ${rd.storageRef?.version > 1 ? `<button type="button" class="btn btn-ghost btn-xs" data-view-older="${esc(rd.type)}">older versions (${rd.storageRef.version-1})</button>` : ''}
       </div>
-      <div id="ap-docpages-${slug(rd.type)}" class="mt-4"></div>`;
+      <div id="ap-docpages-${slug(rd.type)}" class="mt-4"></div>
+      <div id="ap-olderversions-${slug(rd.type)}" class="mt-4"></div>`;
   }
 
   function render(){
@@ -300,12 +302,43 @@ async function showActionPanel(sub, company, onChange){
       try {
         const pages = await Promise.all(
           Array.from({length: rd.storageRef.pageCount}, (_,i) =>
-            storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, pageIndex: i }))
+            storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, version: rd.storageRef.version, pageIndex: i }))
         );
         target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
       } catch(e){
         target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
       }
+    });
+
+    // Older versions (step 4d) — pageCount for an OLDER version isn't stored
+    // anywhere (only the CURRENT requiredDocs[].storageRef carries one), so
+    // each version's pages are discovered by probing sequentially until a
+    // pageIndex comes back empty, capped at 10 (matches the capture
+    // pipeline's own PDF page cap).
+    document.querySelectorAll('[data-view-older]').forEach(btn => btn.onclick = () => {
+      const docType = btn.dataset.viewOlder;
+      const rd = (s.requiredDocs||[]).find(r => r.type === docType);
+      if(!rd?.storageRef) return;
+      const latestVersion = rd.storageRef.version || 1;
+      const container = document.getElementById(`ap-olderversions-${slug(docType)}`);
+      if(container.dataset.open === '1'){ container.innerHTML = ''; container.dataset.open = ''; return; }
+      container.dataset.open = '1';
+      container.innerHTML = Array.from({length: latestVersion-1}, (_,i) => i+1).map(ver =>
+        `<div class="mt-4"><button type="button" class="btn btn-ghost btn-xs" data-view-doc-version="${esc(docType)}|${ver}">View v${ver}</button><div id="ap-docpages-${slug(docType)}-v${ver}" class="mt-4"></div></div>`
+      ).join('');
+      container.querySelectorAll('[data-view-doc-version]').forEach(vbtn => vbtn.onclick = async () => {
+        const [dType, verStr] = vbtn.dataset.viewDocVersion.split('|');
+        const ver = Number(verStr);
+        const target = document.getElementById(`ap-docpages-${slug(dType)}-v${ver}`);
+        target.innerHTML = '<span class="text-dim text-xs">Loading…</span>';
+        const pages = [];
+        for(let i=0; i<10; i++){
+          const p = await storage.get({ bundleId: rd.storageRef.bundleId, docType: dType, version: ver, pageIndex: i });
+          if(!p) break;
+          pages.push(p);
+        }
+        target.innerHTML = pages.map((p,i) => `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
+      });
     });
 
     // Quick (no-payload) actions

@@ -10,17 +10,22 @@ import * as firestoreB64 from './firestore-b64.js';
 // entry here, not touching every call site.
 //
 // Interface:
-//   put({bundleId, docType, pages}) → storageRefs
+//   put({bundleId, docType, pages, version}) → storageRefs
 //     `pages` is the array of {pageIndex, mime, blob, bytes} that
-//     js/documents.js's capture pipeline produces. Returns one ref per page
-//     — [{bundleId, docType, pageIndex}, ...] — opaque beyond that shape;
-//     callers store pageCount (storageRefs.length) alongside bundleId/docType
-//     on requiredDocs[].storageRef, not the individual per-page refs (pages
-//     are re-derived by bundleId+docType+pageIndex when viewing, never
-//     enumerated and stored inline).
+//     js/documents.js's capture pipeline produces. `version` defaults to 1 —
+//     the Fix & Resubmit flow (step 4) passes the next version number
+//     explicitly when replacing a rejected document; old versions are never
+//     overwritten, only ever added alongside. Returns one ref per page —
+//     [{bundleId, docType, version, pageIndex}, ...] — opaque beyond that
+//     shape; callers store pageCount (storageRefs.length) alongside
+//     bundleId/docType/version on requiredDocs[].storageRef, not the
+//     individual per-page refs (pages are re-derived by
+//     bundleId+docType+version+pageIndex when viewing, never enumerated and
+//     stored inline).
 //   get(ref) → { mime, dataURL } for ONE page (ref = {bundleId, docType,
-//     pageIndex}) — viewing a multi-page doc means calling this once per
-//     pageIndex from 0 to pageCount-1, never a single call for "all pages".
+//     pageIndex, version}, version defaults to 1) — viewing a multi-page doc
+//     means calling this once per pageIndex from 0 to pageCount-1, never a
+//     single call for "all pages".
 //   deleteByBundle(bundleId) → deletes every stored page for every docType
 //     in that bundle (submit-failure cleanup — see js/leads.js).
 //   deleteByBundles(bundleIds, description) → same, across MANY bundles in
@@ -49,8 +54,8 @@ function currentDriver(){
 // them without reaching into feature-layer state itself. externalBat is also
 // optional passthrough — see createSubmissions()'s doc comment (js/submissions.js)
 // for the small-upload combined-batch case this exists for.
-export async function put({bundleId, docType, pages, agentId, teamId, externalBat}){
-  return currentDriver().put({bundleId, docType, pages, agentId, teamId, externalBat});
+export async function put({bundleId, docType, pages, agentId, teamId, version, externalBat}){
+  return currentDriver().put({bundleId, docType, pages, agentId, teamId, version, externalBat});
 }
 
 export async function get(ref){

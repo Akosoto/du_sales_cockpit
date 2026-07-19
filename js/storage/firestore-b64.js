@@ -6,10 +6,26 @@ import { orgId } from '../../config.js';
 // ════════════════════════════════════════════════════
 // firestore-b64 driver (ARCHITECTURE.md §6) — free-tier document storage.
 // One Firestore doc PER PAGE in a top-level `submissionDocs` collection,
-// keyed by bundleId+docType+pageIndex (NOT by any individual submission's
-// id) — files are shared PER BUNDLE, since company documents (Trade
-// License, Emirates ID) attach once per Submit-to-Backend form, not once
-// per product line.
+// keyed by bundleId+docType+version+pageIndex (NOT by any individual
+// submission's id) — files are shared PER BUNDLE, since company documents
+// (Trade License, Emirates ID) attach once per Submit-to-Backend form, not
+// once per product line.
+//
+// Versioning (step 4, ARCHITECTURE.md §5's rejected→fix-and-resubmit loop):
+// pages are immutable and deletes are manager-only, so replacing a rejected
+// document needs a new CREATE, not an edit. docIds carry a version segment
+// (`{bundleId}_{docType}_v{n}_{pageIndex}`); `bundleId` is still stored as
+// its own FIELD (not just parsed from the id), so the retention sweep's
+// existing `where('bundleId','==',...)` query already catches every version
+// with no changes needed there. Old versions are deliberately never deleted
+// individually — they're evidence a disputed original can't be erased by
+// the person who uploaded it — only the whole-bundle retention sweep clears
+// them, once every sibling submission has gone terminal.
+//
+// Docs written before this existed have no version segment at all (plain
+// `{bundleId}_{docType}_{pageIndex}`) — get() falls back to that shape when
+// version 1 isn't found under the new id, rather than migrating the handful
+// of pre-existing docs.
 //
 // Never call this module directly from feature code — go through
 // js/storage/index.js, which picks the active driver from
@@ -34,14 +50,17 @@ function blobToBase64(blob){
 }
 
 // pages: [{pageIndex, mime, blob, bytes}] from js/documents.js's capture
-// pipeline. Returns one ref per page: [{bundleId, docType, pageIndex}, ...].
+// pipeline. version defaults to 1 (a fresh upload's first version — the
+// Fix & Resubmit flow passes the next version number explicitly). Returns
+// one ref per page: [{bundleId, docType, version, pageIndex}, ...].
 //
 // externalBat: optional — when provided, writes are added to that batch
 // WITHOUT committing (the caller commits, e.g. combined atomically with the
 // submissions themselves for a small enough upload — see
 // createSubmissions()'s own externalBat doc comment). Omit for the normal
 // standalone case (commits its own batch).
-export async function put({bundleId, docType, pages, agentId, teamId, externalBat}){
+export async function put({bundleId, docType, pages, agentId, teamId, version, externalBat}){
+  const v = version || 1;
   const encoded = await Promise.all(pages.map(async page => {
     const b64 = await blobToBase64(page.blob);
     if(b64.length > HARD_CEILING_CHARS){
@@ -53,22 +72,29 @@ export async function put({bundleId, docType, pages, agentId, teamId, externalBa
   const bat = externalBat || newBatch();
   const refs = [];
   encoded.forEach(page => {
-    const docId = `${bundleId}_${docType}_${page.pageIndex}`;
+    const docId = `${bundleId}_${docType}_v${v}_${page.pageIndex}`;
     batchSet(bat, 'submissionDocs', docId, {
-      orgId, bundleId, docType, pageIndex: page.pageIndex,
+      orgId, bundleId, docType, version: v, pageIndex: page.pageIndex,
       mime: page.mime, b64: page.b64, bytes: page.bytes,
       agentId, teamId, uploadedBy: CU.uid, createdAt: now()
     });
-    refs.push({ bundleId, docType, pageIndex: page.pageIndex });
+    refs.push({ bundleId, docType, version: v, pageIndex: page.pageIndex });
   });
   if(!externalBat) await bat.commit();
   return refs;
 }
 
-// ref: {bundleId, docType, pageIndex} → { mime, dataURL } for ONE page.
+// ref: {bundleId, docType, pageIndex, version} → { mime, dataURL } for ONE
+// page. version defaults to 1 (the common case before any resubmission).
 export async function get(ref){
-  const docId = `${ref.bundleId}_${ref.docType}_${ref.pageIndex}`;
-  const snap = await getDoc(doc(db,'submissionDocs',docId));
+  const version = ref.version || 1;
+  const docId = `${ref.bundleId}_${ref.docType}_v${version}_${ref.pageIndex}`;
+  let snap = await getDoc(doc(db,'submissionDocs',docId));
+  if(!snap.exists() && version === 1){
+    // Pre-versioning docs used the old id shape with no version segment.
+    const legacyId = `${ref.bundleId}_${ref.docType}_${ref.pageIndex}`;
+    snap = await getDoc(doc(db,'submissionDocs',legacyId));
+  }
   if(!snap.exists()) return null;
   const d = snap.data();
   return { mime: d.mime, dataURL: `data:${d.mime};base64,${d.b64}` };

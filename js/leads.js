@@ -8,7 +8,7 @@ import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from '
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter, fixSelectScrollClip } from './helpers.js';
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import {
-  computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId,
+  computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId, appendEvent,
   SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS
 } from './submissions.js';
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
@@ -821,6 +821,16 @@ async function showSubmitModal(lead, byId){
   const users        = Object.values(byId);
   const expiryWarnings = docExpiryWarnings(company);
 
+  // Same resolution createSubmissions() does internally (step 0e root-cause
+  // fix) — needed here too because document PAGES are uploaded via
+  // storage.put() BEFORE createSubmissions ever runs, and that call
+  // denormalizes teamId onto every page for the same TL-read-rule mirroring
+  // reason. Resolving it once here (rather than trusting lead.teamId||'')
+  // keeps both writes consistent instead of only fixing the submission
+  // itself and leaving its pages tagged with the old stale value.
+  const assignedAgent = users.find(u => u.id === lead.assignedTo);
+  const resolvedTeamId = assignedAgent?.teamId || lead.teamId || '';
+
   let items = [];
   let docExpiryDates = {}; // { [docType]: 'YYYY-MM-DD' }
   // { [docType]: {fileName, pages, truncated, totalPages, thumbUrl} | {error} }
@@ -1039,13 +1049,14 @@ async function showSubmitModal(lead, byId){
       const combinedBat = (safelyFits && docTypesWithFiles.length) ? newBatch() : null;
 
       try {
+        if(!resolvedTeamId) throw new Error('This lead has no team data — run Repair Lead Data or contact your manager.');
         const storageRefsByType = {};
         for(const type of docTypesWithFiles){
           const refs = await storage.put({
-            bundleId, docType: type, pages: docFiles[type].pages,
-            agentId: CU.uid, teamId: lead.teamId||'', externalBat: combinedBat||undefined
+            bundleId, docType: type, pages: docFiles[type].pages, version: 1,
+            agentId: CU.uid, teamId: resolvedTeamId, externalBat: combinedBat||undefined
           });
-          storageRefsByType[type] = { bundleId, docType: type, pageCount: refs.length };
+          storageRefsByType[type] = { bundleId, docType: type, version: 1, pageCount: refs.length };
         }
 
         const requiredDocsPayload = req.map(type => ({
@@ -1109,9 +1120,12 @@ function showSubmissionTimelineModal(lead, submissions){
               <span>${esc(rd.type)}</span>
               <span class="text-dim">${rd.status==='uploaded'?'📎 uploaded':'attested'}${rd.expiryDate?` · expires ${fmtDate(rd.expiryDate)}`:''}</span>
               ${rd.storageRef ? `<button type="button" class="btn btn-ghost btn-xs" data-view-doc="${l.id}|${esc(rd.type)}">View (${rd.storageRef.pageCount} page${rd.storageRef.pageCount!==1?'s':''})</button>` : ''}
+              ${rd.storageRef?.version > 1 ? `<button type="button" class="btn btn-ghost btn-xs" data-view-older="${l.id}|${esc(rd.type)}">older versions (${rd.storageRef.version-1})</button>` : ''}
             </div>
-            <div id="tl-docpages-${l.id}-${slugForTimeline(rd.type)}" class="mt-4"></div>`).join('')}
+            <div id="tl-docpages-${l.id}-${slugForTimeline(rd.type)}" class="mt-4"></div>
+            <div id="tl-olderversions-${l.id}-${slugForTimeline(rd.type)}" class="mt-4"></div>`).join('')}
           </div>` : ''}
+          ${l.status==='rejected' && l.agentId===CU.uid ? `<button type="button" class="btn btn-ghost btn-xs mt-8" data-fix-resubmit="${l.id}">🔧 Fix & Resubmit</button>` : ''}
           <div class="mt-8">
             ${(l.events||[]).map(e => `<div class="text-xs text-dim">• ${fmtDate(e.ts)} — <strong>${esc(e.actorName)}</strong>: ${esc(EVENT_LABELS[e.type]||e.type)}${e.payload?.note?` — ${esc(e.payload.note)}`:''}${e.payload?.reason?` (${esc(e.payload.reason)})`:''}${e.payload?.value?` — ${esc(e.payload.value)}`:''}</div>`).join('')}
           </div>
@@ -1135,12 +1149,150 @@ function showSubmissionTimelineModal(lead, submissions){
     try {
       const pages = await Promise.all(
         Array.from({length: rd.storageRef.pageCount}, (_,i) =>
-          storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, pageIndex: i }))
+          storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, version: rd.storageRef.version, pageIndex: i }))
       );
       target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
     } catch(e){
       target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
     }
   });
+
+  // Older versions (step 4d) — old pages are deliberately retained as
+  // evidence (a suspected-fake original must not be destroyable by the
+  // accused uploader), so a rejected-then-fixed doc can have several. This
+  // toggles a per-version list; pageCount for an OLDER version isn't stored
+  // anywhere (only the CURRENT requiredDocs[].storageRef carries one), so
+  // each version's pages are discovered by probing sequentially until a
+  // pageIndex comes back empty, capped at the same page limit the capture
+  // pipeline itself enforces.
+  document.querySelectorAll('[data-view-older]').forEach(btn => btn.onclick = () => {
+    const [subId, docType] = btn.dataset.viewOlder.split('|');
+    const line = submissions.find(s => s.id === subId);
+    const rd = line?.requiredDocs.find(r => r.type === docType);
+    if(!rd?.storageRef) return;
+    const latestVersion = rd.storageRef.version || 1;
+    const container = document.getElementById(`tl-olderversions-${subId}-${slugForTimeline(docType)}`);
+    if(container.dataset.open === '1'){ container.innerHTML = ''; container.dataset.open = ''; return; }
+    container.dataset.open = '1';
+    container.innerHTML = Array.from({length: latestVersion-1}, (_,i) => i+1).map(ver =>
+      `<div class="mt-4"><button type="button" class="btn btn-ghost btn-xs" data-view-doc-version="${subId}|${esc(docType)}|${ver}">View v${ver}</button><div id="tl-docpages-${subId}-${slugForTimeline(docType)}-v${ver}" class="mt-4"></div></div>`
+    ).join('');
+    container.querySelectorAll('[data-view-doc-version]').forEach(vbtn => vbtn.onclick = async () => {
+      const [sId, dType, verStr] = vbtn.dataset.viewDocVersion.split('|');
+      const ver = Number(verStr);
+      const target = document.getElementById(`tl-docpages-${sId}-${slugForTimeline(dType)}-v${ver}`);
+      target.innerHTML = '<span class="text-dim text-xs">Loading…</span>';
+      const pages = [];
+      for(let i=0; i<PDF_PAGE_CAP; i++){
+        const p = await storage.get({ bundleId: rd.storageRef.bundleId, docType: dType, version: ver, pageIndex: i });
+        if(!p) break;
+        pages.push(p);
+      }
+      target.innerHTML = pages.map((p,i) => `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
+    });
+  });
+
+  document.querySelectorAll('[data-fix-resubmit]').forEach(btn => btn.onclick = () => {
+    const line = submissions.find(s => s.id === btn.dataset.fixResubmit);
+    if(line) showFixResubmitModal(line, () => showSubmissionTimelineModal(lead, submissions));
+  });
 }
 function slugForTimeline(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
+
+// ─── FIX & RESUBMIT (step 4b) ───
+// Only reachable for the submitting agent's OWN rejected submission (gated
+// in showSubmissionTimelineModal above). Replacing a document writes the
+// NEXT version's pages as a fresh CREATE (pages are immutable — the
+// existing agent create rule already allows this, agentId==self) rather
+// than editing anything; old versions stay exactly where they are as
+// evidence. categoryFields + the requiredDocs pointer to the new version
+// ride the SAME appendEvent('resubmit') transaction as the status change,
+// via its extraFields param — never a separate write.
+function showFixResubmitModal(sub, onDone){
+  const catFieldKeys = ORG_DEFAULTS.itemFieldsByCategory[sub.category] || [];
+  const docFiles = {}; // { [docType]: {fileName, pages, truncated, totalPages, thumbUrl} | {error} }
+
+  function slug(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
+  function docFilePreviewHtml(entry){
+    if(!entry) return '<span class="text-dim text-xs">No replacement file (optional)</span>';
+    if(entry.error) return `<span class="err text-xs">${esc(entry.error)}</span>`;
+    const thumb = entry.thumbUrl ? `<img src="${entry.thumbUrl}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
+    return `${thumb}<span class="text-xs">${esc(entry.fileName)} — ${entry.pages.length} page${entry.pages.length!==1?'s':''}${entry.truncated?` (capped at ${PDF_PAGE_CAP} — PDF has ${entry.totalPages})`:''}</span>`;
+  }
+
+  function render(){
+    const rejEvent = [...(sub.events||[])].reverse().find(e=>e.type==='rejected');
+    modal(`Fix & Resubmit — ${esc(sub.productName)}`, `
+      <p class="text-dim text-sm mb-12">This submission was rejected${sub.rejectedAt?` on ${fmtDate(sub.rejectedAt)}`:''}. Fix what's needed below, then resubmit.</p>
+      ${rejEvent ? `<div class="locked-note mb-12">⚠ Rejected: <strong>${esc(rejEvent.payload?.reason||'—')}</strong>${rejEvent.payload?.note?` — ${esc(rejEvent.payload.note)}`:''}</div>` : ''}
+      ${catFieldKeys.length ? `<div class="field mb-12"><label>Product Fields</label>
+        <div class="row2">
+          ${catFieldKeys.map(f=>`<input type="text" id="fr-cf-${f}" placeholder="${CATEGORY_FIELD_LABELS[f]||f}" value="${esc(sub.categoryFields?.[f]||'')}">`).join('')}
+        </div>
+      </div>` : ''}
+      <div class="field"><label>Replace Documents <span class="text-dim text-xs">(optional — only upload what actually needs fixing)</span></label>
+        ${(sub.requiredDocs||[]).map(rd => `<div class="row2 mt-8" style="align-items:center">
+          <span class="text-xs">${esc(rd.type)} <span class="text-dim">(current: v${rd.storageRef?.version||1})</span></span>
+          <input type="file" accept="image/*,application/pdf" data-doc-file="${esc(rd.type)}">
+        </div>
+        <div id="fr-docfile-preview-${slug(rd.type)}" class="mt-4">${docFilePreviewHtml(docFiles[rd.type])}</div>`).join('')}
+      </div>
+      <div class="field mt-12"><label>Note (optional)</label><input type="text" id="fr-note" placeholder="What did you fix?"></div>
+      <p id="fr-err" class="err"></p>
+      <button class="btn btn-primary btn-full mt-12" id="fr-btn">Resubmit</button>
+    `, true);
+
+    document.querySelectorAll('[data-doc-file]').forEach(input => input.onchange = async function(){
+      const docType = this.dataset.docFile;
+      const file = this.files[0];
+      if(!file) return;
+      const previewEl = document.getElementById(`fr-docfile-preview-${slug(docType)}`);
+      previewEl.innerHTML = '<span class="text-dim text-xs">Processing…</span>';
+      try {
+        const result = await captureFile(file);
+        const thumbUrl = URL.createObjectURL(result.pages[0].blob);
+        docFiles[docType] = { fileName: file.name, pages: result.pages, truncated: result.truncated, totalPages: result.totalPages, thumbUrl };
+      } catch(e){
+        docFiles[docType] = { error: e.message };
+      }
+      previewEl.innerHTML = docFilePreviewHtml(docFiles[docType]);
+    });
+
+    document.getElementById('fr-btn').onclick = async () => {
+      const err = document.getElementById('fr-err');
+      err.textContent = '';
+      disable('fr-btn','Resubmitting…');
+      try {
+        const newCategoryFields = {...(sub.categoryFields||{})};
+        catFieldKeys.forEach(f => { const val = v(`fr-cf-${f}`); if(val) newCategoryFields[f]=val; else delete newCategoryFields[f]; });
+
+        const newRequiredDocs = (sub.requiredDocs||[]).map(rd => ({...rd}));
+        for(const rd of newRequiredDocs){
+          const entry = docFiles[rd.type];
+          if(!entry || entry.error || !entry.pages?.length) continue;
+          const newVersion = (rd.storageRef?.version || 1) + 1;
+          const refs = await storage.put({
+            bundleId: sub.bundleId, docType: rd.type, pages: entry.pages, version: newVersion,
+            agentId: CU.uid, teamId: sub.teamId
+          });
+          rd.status = 'uploaded';
+          rd.storageRef = { bundleId: sub.bundleId, docType: rd.type, version: newVersion, pageCount: refs.length };
+        }
+
+        await appendEvent(sub.id, {
+          type: 'resubmit',
+          payload: { note: v('fr-note') },
+          extraFields: { categoryFields: newCategoryFields, requiredDocs: newRequiredDocs }
+        });
+
+        closeModal(); toast('Resubmitted.');
+        onDone?.();
+      } catch(e){
+        err.textContent = e.message;
+        enable('fr-btn','Resubmit');
+      }
+    };
+  }
+
+  render();
+}
