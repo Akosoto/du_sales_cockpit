@@ -17,6 +17,26 @@ const EVENT_TYPES = [
   'correction','note','activated','rejected','resubmit'
 ];
 
+// Display labels/colors — shared by every submission-status-rendering UI
+// (the agent's Submit modal + read-only timeline in js/leads.js, the
+// backend Queue/action panel in js/queue.js) so they can't drift apart.
+export const SUBMISSION_STATUS_LABELS = {
+  pendingVerification: 'Pending Verification', submittedToDu: 'Submitted to du',
+  inProgress: 'In Progress', activated: 'Activated', rejected: 'Rejected'
+};
+export const SUBMISSION_STATUS_COLORS = {
+  pendingVerification: 'var(--amber)', submittedToDu: 'var(--blue)',
+  inProgress: 'var(--purple2)', activated: 'var(--green)', rejected: 'var(--red)'
+};
+export const EVENT_LABELS = {
+  created:'Created', docsVerified:'Documents Verified', verificationCall:'Verified by Call',
+  verificationEmail:'Verified by Email', submittedToDu:'Submitted to du',
+  proceededWithoutVerification:'Proceeded Without Verification',
+  activityNo:'Activity Number', workOrderNo:'Work Order Number', appointment:'Appointment Scheduled',
+  biometric:'Biometric', sprObtained:'SPR Obtained', correction:'Correction', note:'Note',
+  activated:'Activated', rejected:'Rejected', resubmit:'Resubmitted'
+};
+
 // ════════════════════════════════════════════════════
 // SUBMISSIONS — agent → backend handoff (ARCHITECTURE.md Section 5)
 // v2: one submission DOC per product line (not an items[] array) — see

@@ -7,28 +7,12 @@ import {
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter, fixSelectScrollClip } from './helpers.js';
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
-import { computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId } from './submissions.js';
+import {
+  computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId,
+  SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS
+} from './submissions.js';
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
 import * as storage from './storage/index.js';
-
-// Submission status/event display labels + colors — shared by the Submit
-// modal's own confirmation and the read-only timeline view.
-const SUBMISSION_STATUS_LABELS = {
-  pendingVerification: 'Pending Verification', submittedToDu: 'Submitted to du',
-  inProgress: 'In Progress', activated: 'Activated', rejected: 'Rejected'
-};
-const SUBMISSION_STATUS_COLORS = {
-  pendingVerification: 'var(--amber)', submittedToDu: 'var(--blue)',
-  inProgress: 'var(--purple2)', activated: 'var(--green)', rejected: 'var(--red)'
-};
-const EVENT_LABELS = {
-  created:'Created', docsVerified:'Documents Verified', verificationCall:'Verified by Call',
-  verificationEmail:'Verified by Email', submittedToDu:'Submitted to du',
-  proceededWithoutVerification:'Proceeded Without Verification',
-  activityNo:'Activity Number', workOrderNo:'Work Order Number', appointment:'Appointment Scheduled',
-  biometric:'Biometric', sprObtained:'SPR Obtained', correction:'Correction', note:'Note',
-  activated:'Activated', rejected:'Rejected', resubmit:'Resubmitted'
-};
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
