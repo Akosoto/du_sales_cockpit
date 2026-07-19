@@ -267,7 +267,12 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
 // could otherwise read the same stale events[] and one write would silently
 // clobber the other's event. A transaction detects that conflict and
 // automatically retries the whole read+write with fresh data.
-export async function appendEvent(submissionId, { type, payload = {} }){
+// extraFields: internal-only — merged into the same transactional update as
+// the event/status change, for the few cases where a field OTHER than
+// events/status needs to change atomically with a logged event (claim/
+// reassign's assignedBackendAgent below). Not a general escape hatch for
+// arbitrary UI callers.
+export async function appendEvent(submissionId, { type, payload = {}, extraFields = {} }){
   if(!EVENT_TYPES.includes(type)) throw new Error(`Unknown event type: ${type}`);
   if(type === 'rejected' && !payload.reason) throw new Error('A rejection reason is required.');
   if(type === 'rejected' && !ORG_DEFAULTS.rejectionReasons.includes(payload.reason)){
@@ -298,7 +303,7 @@ export async function appendEvent(submissionId, { type, payload = {} }){
     const otherSiblingSnaps = await Promise.all(otherSiblingRefs.map(r => transaction.get(r)));
 
     const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
-    const update = { events, lastEditedBy: CP.name, lastEditedAt: now() };
+    const update = { events, lastEditedBy: CP.name, lastEditedAt: now(), ...extraFields };
 
     if(['docsVerified','verificationCall','verificationEmail'].includes(type)){
       update.verification = {
@@ -351,4 +356,30 @@ export async function appendEvent(submissionId, { type, payload = {} }){
   });
 
   return finalStatus;
+}
+
+// Claim/reassignment (ARCHITECTURE.md §4, step 2) — both just an
+// assignedBackendAgent change logged as a 'note' event, atomic with it via
+// appendEvent's extraFields. Distinguishing "any backend user may claim an
+// UNASSIGNED submission" from "backend TL/manager may reassign ANY
+// submission" is a CLIENT-SIDE workflow/UI policy, not a server-side
+// restriction — the submissions rule already gives the whole backend
+// department unrestricted update rights on every submission (ARCHITECTURE.md
+// §4: "whole dept sees all submissions"), and isActiveBackend() doesn't
+// distinguish a coordinator/TL from a regular backend agent at the rule
+// level at all. See js/queue.js for which button each role actually sees.
+export async function claimSubmission(submissionId){
+  return appendEvent(submissionId, {
+    type: 'note',
+    payload: { text: `Claimed by ${CP.name}` },
+    extraFields: { assignedBackendAgent: CU.uid }
+  });
+}
+
+export async function reassignSubmission(submissionId, newAgentId, oldAgentName, newAgentName){
+  return appendEvent(submissionId, {
+    type: 'note',
+    payload: { text: `Reassigned from ${oldAgentName||'Unassigned'} to ${newAgentName}` },
+    extraFields: { assignedBackendAgent: newAgentId }
+  });
 }

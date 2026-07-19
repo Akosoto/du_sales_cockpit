@@ -2,8 +2,17 @@ import {
   db, CU, CP,
   collection, getDocs, doc, getDoc
 } from './state.js';
-import { esc, fmtDate, toast, modal, closeModal } from './helpers.js';
-import { SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS } from './submissions.js';
+import { esc, fmtDate, toast, modal, closeModal, disable, enable } from './helpers.js';
+import { SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, claimSubmission, reassignSubmission } from './submissions.js';
+
+// Client-side workflow policy (step 2) — NOT a security boundary, the
+// submissions rule already gives the whole backend department unrestricted
+// update rights on every submission. This just decides which button each
+// role sees: any active backend user can claim an unassigned submission;
+// only a backend coordinator (team_lead + department:'backend') or manager
+// gets the reassign picker.
+function isBackendUser(){ return CP.department === 'backend' && CP.active !== false; }
+function canReassign(){ return CP.role === 'manager' || (CP.role === 'team_lead' && isBackendUser()); }
 
 // ════════════════════════════════════════════════════
 // BACKEND QUEUE (ARCHITECTURE.md §4/§5, this session's step 1-3)
@@ -110,7 +119,11 @@ export async function renderQueueTab(){
             <td><span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</span></td>
             <td class="td-dim text-sm">${s.assignedBackendAgent ? esc(agentName(s.assignedBackendAgent)) : '<span class="text-dim">Unassigned</span>'}</td>
             <td class="td-dim text-sm">${s.createdAt?fmtDate(s.createdAt):'—'}</td>
-            <td><button class="btn btn-ghost btn-xs" data-open="${s.id}">Open →</button></td>
+            <td class="flex gap-8">
+              <button class="btn btn-ghost btn-xs" data-open="${s.id}">Open →</button>
+              ${!s.assignedBackendAgent && isBackendUser() ? `<button class="btn btn-primary btn-xs" data-claim="${s.id}">Claim</button>` : ''}
+              ${canReassign() ? `<button class="btn btn-ghost btn-xs" data-reassign="${s.id}">Reassign</button>` : ''}
+            </td>
           </tr>`).join('')}
         </tbody>
       </table></div>` : `<div class="empty"><div class="empty-icon">📥</div><div class="empty-title">No submissions in this view</div><div class="empty-sub">Try a different queue view, status filter, or include activated/rejected.</div></div>`}
@@ -123,6 +136,51 @@ export async function renderQueueTab(){
       const sub = submissions.find(s=>s.id===b.dataset.open);
       if(sub) toast('Action panel arrives in step 3.');
     }));
+
+    ct.querySelectorAll('[data-claim]').forEach(b => b.addEventListener('click', async () => {
+      const sub = submissions.find(s=>s.id===b.dataset.claim); if(!sub) return;
+      b.disabled = true; b.textContent = 'Claiming…';
+      try {
+        await claimSubmission(sub.id);
+        sub.assignedBackendAgent = CU.uid;
+        toast('Claimed.');
+        render();
+      } catch(e){ toast('Error: '+e.message, 'err'); b.disabled = false; b.textContent = 'Claim'; }
+    }));
+
+    ct.querySelectorAll('[data-reassign]').forEach(b => b.addEventListener('click', () => {
+      const sub = submissions.find(s=>s.id===b.dataset.reassign); if(!sub) return;
+      showReassignModal(sub);
+    }));
+  }
+
+  function showReassignModal(sub){
+    const oldAgentName = sub.assignedBackendAgent ? agentName(sub.assignedBackendAgent) : null;
+    modal('Reassign Submission', `
+      <p class="text-dim text-sm mb-12">Currently: <strong>${oldAgentName ? esc(oldAgentName) : 'Unassigned'}</strong></p>
+      <div class="field"><label>Assign To</label>
+        <select id="rs-agent">
+          <option value="">— Unassigned —</option>
+          ${backendUsers.map(u=>`<option value="${u.id}" ${u.id===sub.assignedBackendAgent?' selected':''}>${esc(u.name)}</option>`).join('')}
+        </select>
+      </div>
+      <p id="rs-err" class="err"></p>
+      <button class="btn btn-primary btn-full mt-12" id="rs-btn">Reassign</button>
+    `);
+    document.getElementById('rs-btn').onclick = async () => {
+      const newAgentId = document.getElementById('rs-agent').value;
+      if(newAgentId === (sub.assignedBackendAgent||'')){ closeModal(); return; }
+      disable('rs-btn','Reassigning…');
+      try {
+        const newAgentName = newAgentId ? (byId[newAgentId]?.name || '—') : 'Unassigned';
+        await reassignSubmission(sub.id, newAgentId || null, oldAgentName, newAgentName);
+        sub.assignedBackendAgent = newAgentId || null;
+        closeModal(); toast('Reassigned.'); render();
+      } catch(e){
+        document.getElementById('rs-err').textContent = e.message;
+        enable('rs-btn','Reassign');
+      }
+    };
   }
 
   render();
