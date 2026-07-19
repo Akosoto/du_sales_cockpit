@@ -1,9 +1,13 @@
 import {
-  db, CU, CP,
+  db, CU, CP, ORG_DEFAULTS,
   collection, getDocs, doc, getDoc
 } from './state.js';
-import { esc, fmtDate, toast, modal, closeModal, disable, enable } from './helpers.js';
-import { SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, claimSubmission, reassignSubmission } from './submissions.js';
+import { esc, fmtDate, toast, modal, closeModal, disable, enable, v } from './helpers.js';
+import {
+  SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS,
+  claimSubmission, reassignSubmission, appendEvent
+} from './submissions.js';
+import * as storage from './storage/index.js';
 
 // Client-side workflow policy (step 2) — NOT a security boundary, the
 // submissions rule already gives the whole backend department unrestricted
@@ -134,7 +138,7 @@ export async function renderQueueTab(){
     document.getElementById('q-include-terminal').addEventListener('change', function(){ includeTerminal = this.checked; render(); });
     ct.querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () => {
       const sub = submissions.find(s=>s.id===b.dataset.open);
-      if(sub) toast('Action panel arrives in step 3.');
+      if(sub) showActionPanel(sub, companyById[sub.companyId], () => render());
     }));
 
     ct.querySelectorAll('[data-claim]').forEach(b => b.addEventListener('click', async () => {
@@ -181,6 +185,182 @@ export async function renderQueueTab(){
         enable('rs-btn','Reassign');
       }
     };
+  }
+
+  render();
+}
+
+// ════════════════════════════════════════════════════
+// SUBMISSION ACTION PANEL (step 3) — opens from a Queue row. Shows the full
+// submission (company block, product line, doc checklist + on-demand page
+// viewing via the existing storage adapter, full events timeline) and every
+// appendEvent action. The UI only ever CALLS appendEvent — it never sets
+// status directly; every status transition (including the
+// proceededWithoutVerification auto-append) already lives there.
+// ════════════════════════════════════════════════════
+function slug(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
+
+async function showActionPanel(sub, company, onChange){
+  let current = sub;
+
+  async function refresh(){
+    const snap = await getDoc(doc(db,'submissions',current.id));
+    if(snap.exists()) current = {id:snap.id, ...snap.data()};
+    render();
+    onChange?.();
+  }
+
+  function docRow(rd){
+    return `<div class="text-xs mt-4" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span>${esc(rd.type)}</span>
+        <span class="text-dim">${rd.status==='uploaded'?'📎 uploaded':'attested'}${rd.expiryDate?` · expires ${fmtDate(rd.expiryDate)}`:''}</span>
+        ${rd.storageRef ? `<button type="button" class="btn btn-ghost btn-xs" data-view-doc="${esc(rd.type)}">View (${rd.storageRef.pageCount} page${rd.storageRef.pageCount!==1?'s':''})</button>` : ''}
+      </div>
+      <div id="ap-docpages-${slug(rd.type)}" class="mt-4"></div>`;
+  }
+
+  function render(){
+    const s = current;
+    modal(`Submission — ${esc(company?.name || 'Unknown Company')}`, `
+      <div class="info-grid mb-12">
+        <div class="info-item"><div class="lbl">Company</div><div class="val">${esc(company?.name||'—')} ${company?.hasDuAccount?'<span class="text-ok text-xs">● has du account</span>':''}</div></div>
+        <div class="info-item"><div class="lbl">Account Code</div><div class="val">${esc(company?.accountCode||'—')}</div></div>
+        <div class="info-item"><div class="lbl">Agent</div><div class="val">${esc(s.agentName||'—')}</div></div>
+        <div class="info-item"><div class="lbl">Status</div><div class="val" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</div></div>
+      </div>
+      <div class="divider"></div>
+      <div class="info-grid mb-12">
+        <div class="info-item"><div class="lbl">Product</div><div class="val">${esc(s.productName)} <span class="text-dim text-xs">${esc(s.category)}</span></div></div>
+        <div class="info-item"><div class="lbl">Qty / MRC</div><div class="val">Qty ${s.qty} · AED ${Number(s.mrc).toLocaleString()}/mo</div></div>
+        <div class="info-item"><div class="lbl">Type of Request</div><div class="val">${esc(s.typeOfRequest)}</div></div>
+        <div class="info-item"><div class="lbl">Contract Term</div><div class="val">${s.contractTerm?`${s.contractTerm} months`:'—'}</div></div>
+      </div>
+      ${Object.keys(s.categoryFields||{}).length ? `<div class="info-grid mb-12">
+        ${Object.entries(s.categoryFields).map(([k,val])=>`<div class="info-item"><div class="lbl">${esc(k)}</div><div class="val">${esc(val)}</div></div>`).join('')}
+      </div>` : ''}
+      ${s.sprFlag ? `<div class="locked-note mb-12">⭐ Special Pricing Request${s.sprNote?`: ${esc(s.sprNote)}`:''}</div>` : ''}
+      ${s.accTransfer?.flag ? `<div class="locked-note mb-12">🔄 Account transfer from ${esc(s.accTransfer.fromPartner||'another partner')}</div>` : ''}
+      <div class="divider"></div>
+      <div class="field"><label>Documents</label>
+        ${(s.requiredDocs||[]).map(docRow).join('') || '<p class="text-dim text-xs">None required.</p>'}
+      </div>
+      <div class="divider"></div>
+      <div class="field"><label>Timeline</label>
+        <div class="mt-4">
+          ${(s.events||[]).map(e => `<div class="text-xs text-dim">• ${fmtDate(e.ts)} — <strong>${esc(e.actorName)}</strong>: ${esc(EVENT_LABELS[e.type]||e.type)}${e.payload?.note?` — ${esc(e.payload.note)}`:''}${e.payload?.text?` — ${esc(e.payload.text)}`:''}${e.payload?.reason?` (${esc(e.payload.reason)})`:''}${e.payload?.value?` — ${esc(e.payload.value)}`:''}${e.payload?.date?` — ${esc(e.payload.date)} ${esc(e.payload.time||'')} with ${esc(e.payload.person||'')}`:''}</div>`).join('')}
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="field"><label>Quick Actions</label>
+        <div class="flex gap-8" style="flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" data-act="docsVerified">✅ Docs Verified</button>
+          <button class="btn btn-ghost btn-sm" data-act="verificationCall">📞 Verified by Call</button>
+          <button class="btn btn-ghost btn-sm" data-act="verificationEmail">📧 Verified by Email</button>
+          <button class="btn btn-ghost btn-sm" data-act="biometric">🖐 Biometric Done</button>
+          <button class="btn btn-ghost btn-sm" data-act="submittedToDu">📤 Submitted to du</button>
+          <button class="btn btn-primary btn-sm" data-act="activated">✅ Activate</button>
+        </div>
+      </div>
+      <div class="row2 mt-12">
+        <div class="field"><label>Activity Number</label><div class="flex gap-8"><input type="text" id="ap-activityNo" placeholder="Activity #"><button class="btn btn-ghost btn-sm" data-payload-act="activityNo">Log</button></div></div>
+        <div class="field"><label>Work Order Number</label><div class="flex gap-8"><input type="text" id="ap-workOrderNo" placeholder="WO #"><button class="btn btn-ghost btn-sm" data-payload-act="workOrderNo">Log</button></div></div>
+      </div>
+      <div class="field mt-8"><label>Appointment</label>
+        <div class="row2">
+          <input type="date" id="ap-appt-date">
+          <input type="time" id="ap-appt-time">
+        </div>
+        <div class="flex gap-8 mt-8">
+          <input type="text" id="ap-appt-person" placeholder="Person">
+          <button class="btn btn-ghost btn-sm" data-payload-act="appointment">Log</button>
+        </div>
+      </div>
+      <div class="row2 mt-8">
+        <div class="field"><label>SPR Obtained</label><div class="flex gap-8"><input type="text" id="ap-sprObtained" placeholder="Note (optional)"><button class="btn btn-ghost btn-sm" data-payload-act="sprObtained">Log</button></div></div>
+        <div class="field"><label>Correction</label><div class="flex gap-8"><input type="text" id="ap-correction" placeholder="Note"><button class="btn btn-ghost btn-sm" data-payload-act="correction">Log</button></div></div>
+      </div>
+      <div class="field mt-8"><label>Note</label><div class="flex gap-8"><input type="text" id="ap-note" placeholder="Free-text note"><button class="btn btn-ghost btn-sm" data-payload-act="note">Log</button></div></div>
+      <div class="divider"></div>
+      <div class="field"><label style="color:var(--red)">Reject</label>
+        <select id="ap-reject-reason"><option value="">— Select a reason —</option>${ORG_DEFAULTS.rejectionReasons.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('')}</select>
+        <input type="text" id="ap-reject-note" placeholder="Note (optional)" class="mt-8">
+        <button class="btn btn-danger btn-full mt-8" data-payload-act="rejected">Reject Submission</button>
+      </div>
+      <p id="ap-err" class="err"></p>
+    `, true);
+
+    // Doc page viewing — identical on-demand single-get pattern as the
+    // agent's own read-only timeline (js/leads.js showSubmissionTimelineModal).
+    document.querySelectorAll('[data-view-doc]').forEach(btn => btn.onclick = async () => {
+      const docType = btn.dataset.viewDoc;
+      const rd = (s.requiredDocs||[]).find(r => r.type === docType);
+      if(!rd?.storageRef) return;
+      const target = document.getElementById(`ap-docpages-${slug(docType)}`);
+      target.innerHTML = '<span class="text-dim text-xs">Loading…</span>';
+      try {
+        const pages = await Promise.all(
+          Array.from({length: rd.storageRef.pageCount}, (_,i) =>
+            storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, pageIndex: i }))
+        );
+        target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
+      } catch(e){
+        target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
+      }
+    });
+
+    // Quick (no-payload) actions
+    document.querySelectorAll('[data-act]').forEach(btn => btn.onclick = async () => {
+      const type = btn.dataset.act;
+      btn.disabled = true;
+      try {
+        await appendEvent(s.id, { type, payload: {} });
+        toast('Logged.');
+        await refresh();
+      } catch(e){
+        document.getElementById('ap-err').textContent = e.message;
+        btn.disabled = false;
+      }
+    });
+
+    // Payload actions
+    document.querySelectorAll('[data-payload-act]').forEach(btn => btn.onclick = async () => {
+      const type = btn.dataset.payloadAct;
+      const err = document.getElementById('ap-err');
+      err.textContent = '';
+      let payload = {};
+      if(type==='activityNo' || type==='workOrderNo'){
+        const val = v(`ap-${type}`);
+        if(!val){ err.textContent = 'A value is required.'; return; }
+        payload = { value: val };
+      } else if(type==='appointment'){
+        const date = v('ap-appt-date'), time = v('ap-appt-time'), person = v('ap-appt-person');
+        if(!date || !person){ err.textContent = 'Date and person are required.'; return; }
+        payload = { date, time, person };
+      } else if(type==='sprObtained'){
+        payload = { note: v('ap-sprObtained') };
+      } else if(type==='correction'){
+        const note = v('ap-correction');
+        if(!note){ err.textContent = 'A note is required.'; return; }
+        payload = { note };
+      } else if(type==='note'){
+        const text = v('ap-note');
+        if(!text){ err.textContent = 'Note text is required.'; return; }
+        payload = { text };
+      } else if(type==='rejected'){
+        const reason = v('ap-reject-reason');
+        if(!reason){ err.textContent = 'A rejection reason is required.'; return; }
+        payload = { reason, note: v('ap-reject-note') };
+      }
+      btn.disabled = true;
+      try {
+        await appendEvent(s.id, { type, payload });
+        toast(type==='rejected' ? 'Submission rejected.' : 'Logged.');
+        await refresh();
+      } catch(e){
+        err.textContent = e.message;
+        btn.disabled = false;
+      }
+    });
   }
 
   render();
