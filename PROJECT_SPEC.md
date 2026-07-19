@@ -323,9 +323,11 @@ line activate while a sibling is still pending (the normal case, not an edge cas
   verification: { done, method: 'call'|'email'|null, ts } | null,  // structured summary,
                                      // maintained alongside events[] so the UI doesn't need to
                                      // scan the timeline to show verified-or-not
-  requiredDocs: [ { type, status:'attested', expiryDate } ],  // doc checklist + expiry dates only
-                                     // this session — NO file upload yet (StorageAdapter is next
-                                     // session); computed at submit time (union across the whole
+  requiredDocs: [ { type, status:'attested'|'uploaded', expiryDate, storageRef } ],  // doc
+                                     // checklist + expiry dates; storageRef ({bundleId, docType,
+                                     // pageCount}) is present once a file is attached (status
+                                     // becomes 'uploaded') — see the Document Storage section
+                                     // below. Computed at submit time (union across the whole
                                      // bundle) and stored, not re-derived later
   assignedBackendAgent: userId|null,
   createdAt, lastEditedBy, lastEditedAt
@@ -366,9 +368,54 @@ line activate while a sibling is still pending (the normal case, not an edge cas
   submitting agent, their TL, and manager (matches the submissions read rule's scoping). Backend's
   own queue/action UI (where events would actually get logged through a real screen, not a
   console call) is **not built yet** — that's the next Phase B session.
-- **No file upload yet** — `requiredDocs[].status` is always `'attested'` (self-attested by the
-  agent, not verified/uploaded). The StorageAdapter (`firestore-b64` driver + pdf.js) that adds
-  real file bytes is explicitly deferred to the next session.
+- **Document Storage (ARCHITECTURE.md §6, shipped)** — real file bytes on the free tier via a
+  `StorageAdapter` façade (`js/storage/index.js`) over a driver registry, so feature code never
+  imports a driver directly. Only driver today is `firestore-b64` (`js/storage/firestore-b64.js`):
+  one Firestore doc per PAGE in a top-level `submissionDocs` collection, keyed by
+  `bundleId_docType_pageIndex` — files are shared PER BUNDLE (company docs attach once, not once
+  per product line), with `agentId`/`teamId` denormalized onto every page doc so the read rule
+  mirrors the `submissions` read rule exactly. Hard ceiling: 900KB per page, checked against the
+  **encoded** base64 length (not raw bytes — base64 inflates size ~33%), rejected with a clear
+  error if exceeded even after compression.
+  - **Capture pipeline (`js/documents.js`)** — images: canvas resize to max edge 1200px + JPEG
+    recompression stepping down from quality 0.72 to a 0.4 floor, targeting ≤300KB/page
+    (best-effort, distinct from the 900KB hard ceiling). PDFs: pdf.js (pinned CDN version, ES
+    module import) renders each page to canvas at ~150 DPI through the same JPEG pipeline — one
+    stored page per PDF page, capped at 10 pages with a clear truncation message. No raw PDF bytes
+    are ever stored.
+  - **Submit to Backend UI**: each doc type gets an optional file input + thumbnail preview;
+    attaching a file sets that `requiredDocs[]` entry to `status:'uploaded'` (files encouraged, not
+    required — a doc with no file stays `'attested'`, backend rejects if actually missing). Upload
+    batching: small uploads (≤4 doc types, ≤1.6MB raw, ≤20 pages) write document pages and
+    submissions in ONE atomic `writeBatch`; larger ones write pages first, submissions after, with
+    `storage.deleteByBundle()` cleanup if the submissions write then fails.
+  - **Viewing**: the read-only Submission Timeline renders each uploaded doc's pages on demand
+    (one `get()` call per page, never a list query — see the LIST-query gotcha below) for exactly
+    the roles the submissions read rule already allows.
+  - **Retention sweep (`js/org.js runDocumentRetentionSweep`, manager-only)** — "Clean up old
+    documents" button in the Org tab. Finds bundles where every sibling submission is terminal
+    (`activated`/`rejected`) and the SLOWEST sibling to go terminal has sat there past
+    `ORG_DEFAULTS.docRetentionDays` (default 90); shows a page/bundle count via a cheap
+    `getCountFromServer` aggregation before a confirm dialog, then bulk-deletes via
+    `storage.deleteByBundles()` (skipAudit per page + ONE summary `auditLog` entry for the whole
+    run). Leaves `requiredDocs` attestation/expiry-date fields completely untouched — only the
+    stored page bytes go.
+  - **`appendEvent` hardening (done alongside this work):** reworked to run inside a Firestore
+    `runTransaction` (read + append + status-change atomic) after review found the old
+    `getDoc`-then-`update` pattern could silently lose a concurrent event write. Status changes
+    now also stamp queryable top-level `submittedToDuAt`/`activatedAt`/`rejectedAt` fields (first
+    transition only) alongside `events[]`, so reports and the future contract-expiry pipeline can
+    query directly instead of scanning the timeline.
+  - **Full regression (manager identity + direct Firestore inspection, see rules note below for
+    the cross-role read-check caveat):** submitted a bundle with a real JPG (Trade License) and a
+    real 3-page PDF (Emirates ID Front), plus a 12-page PDF on Emirates ID Back to confirm the
+    10-page cap truncates with the correct message; verified actual stored page sizes (~30-33KB
+    each, well under both the 300KB target and the 900KB hard ceiling); viewed all three docs'
+    pages back through the Submission Timeline; ran the sweep against a real bundle whose
+    submission was transitioned to `activated` and backdated 120 days, confirmed it correctly
+    identified the bundle (14 pages), deleted them, left `requiredDocs` untouched, and wrote one
+    summary `auditLog` entry; cleaned up all test data back to baseline (115 leads, 0 submissions,
+    0 submissionDocs).
 - **Firestore LIST-query gotcha (found during regression):** Firestore rejects a `list` query
   outright unless it can prove every possible matched document satisfies the read rule — it does
   NOT filter per-document the way a single `get()` effectively does. The submissions read rule is
@@ -552,6 +599,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 | `scripts` | Any auth | Manager unrestricted; TL own scripts direct, manager scripts suggest-only via `pendingApproval` (`affectedKeys().hasOnly(['pendingApproval'])`) |
 | `products` | Any auth | Manager only |
 | `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted (broad for now — narrows once the real backend queue UI's update shape is known), OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
+| `submissionDocs` (firestore-b64 driver, ARCHITECTURE.md §6) | Same four parties as `submissions` — manager; `agentId==self`; their TL (`teamId` match); backend department (fields denormalized onto every page doc for exactly this reason) | Create: the uploading agent (`agentId==self`) or manager; **no update at all** — pages are immutable, replacing a doc means delete + re-upload; delete: manager-only (matches the retention sweep's own gate) |
 | `auditLog` | Manager only | Create: any auth, `sameOrgWrite()` (the gateway writes these on every mutation); update/delete: **never**, always `false` — append-only |
 
 **Key implementation notes:**
@@ -560,7 +608,19 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 - `companyId` needed no new `leads` rule — it's not an admin-locked field.
 - The `companies` rule (like every other collection's) is handed to Ashok as a full-file paste-in for the Firebase Console from `rules/firestore.rules` (see the version-control note above) — confirm it's been published before relying on non-manager company creation working in production.
 - **Caught during the submissions v1 rule review:** `createSubmission()` writes `teams.assignmentCursor` as part of the submitting agent's own batch — the existing manager-only `teams` write rule would have silently failed that update for any non-manager agent. Fixed by adding a narrowly-scoped `affectedKeys().hasOnly(['assignmentCursor'])` exception, the same pattern already used for `scripts.pendingApproval`.
-- **Storage rules — N/A for now.** All Storage SDK code (`uploadBytes` etc.) was removed from `js/submissions.js` this session; there is no active file-upload path until the StorageAdapter (`firestore-b64` driver) lands next session. The old Storage ruleset note from the v1 build is stale and removed here.
+- **Firebase Storage (Blaze-only SDK product) — still N/A, deliberately.** Document storage is
+  built entirely on the free-tier `firestore-b64` driver (one Firestore doc per page in
+  `submissionDocs`, see the Document Storage section above) — there is still no `uploadBytes`/
+  Storage-bucket code path anywhere, and none is planned unless a future `firebase-storage` driver
+  is added for Blaze-tier clients (ARCHITECTURE.md §6, not built).
+- **Cross-role read verification caveat:** the `submissionDocs` rules mirror the already-audited
+  `submissions` read rule exactly (same four clauses, same `sameOrg()` gate), and the regression
+  pass verified the manager-read path live end-to-end (upload → view → sweep → delete). The
+  agent/team_lead/backend/non-party-agent read-path checks were **not** independently re-verified
+  with real distinct logins this session (the assistant does not type credentials into any login
+  form, per a hard standing rule) — anyone doing a deeper audit of this feature should log in as
+  each of those four identities once and confirm a non-party agent gets `permission-denied` on a
+  `submissionDocs` read that isn't theirs, their TL's, or backend's.
 - **Firestore LIST-query gotcha (found during this session's regression, see the submissions data model section above for full detail):** a `list` query is rejected outright unless Firestore can prove EVERY possible matched doc satisfies the read rule, unlike a single `get()`. A bare `where('leadId','==',id)` query only provable for manager; team_lead/agent queries must ALSO include the same field their rule clause checks (`teamId`/`agentId` respectively) to match that specific OR-branch. This is a general Firestore rules lesson, not specific to submissions — any future collection with a role-scoped OR-clause read rule needs the same query-side treatment.
 
 ---
@@ -738,8 +798,20 @@ Per `ARCHITECTURE.md` v2.0's schema amendment (§3/§5) and quota-discipline sec
   allowed to resubmit (`rejected` → `pendingVerification`) their own. All test data cleaned up
   afterward, verified back at baseline (115 leads, 114 companies, 0 submissions).
 - **Not started yet:** the backend queue/action UI (a real screen for verify/reject/activate,
-  instead of console calls to `appendEvent`) and the StorageAdapter (real file bytes) — both next
-  session, per `ARCHITECTURE.md` §10's Phase B scope.
+  instead of console calls to `appendEvent`) — per `ARCHITECTURE.md` §10's Phase B scope. The
+  StorageAdapter (real file bytes) shipped in the following session — see Phase C below.
+
+### Phase C (shipped) — Document Storage on the free tier
+Per `ARCHITECTURE.md` §5/§6. Full detail — schema, capture pipeline, retention sweep, rules, and
+the regression pass — is in the `submissions` data model section above (Document Storage) and the
+Firestore Security Rules section (`submissionDocs` row + cross-role caveat); not restated here.
+Summary: `StorageAdapter` + `firestore-b64` driver, `js/documents.js` capture pipeline
+(image/PDF → compressed JPEG pages, 10-page PDF cap), Submit-to-Backend file attachment wired in,
+read-only page viewing in the Submission Timeline, a manager-only retention sweep in the Org tab,
+and an `appendEvent` transaction/timestamp hardening fix done alongside it. Regression pass used
+real synthetic JPG/PDF files and a real backdated bundle, all cleaned up back to baseline
+afterward; the one gap is the cross-role read-rule check noted above, left for a human to verify
+with real logins.
 
 ---
 
