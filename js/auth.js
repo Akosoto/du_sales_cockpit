@@ -113,14 +113,25 @@ export function showLogin(){
   document.getElementById('li-btn').textContent = 'Sign In';
 }
 
-export function showApp(){
+export async function showApp(){
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   const role = CP.role;
   const rp = document.getElementById('hdr-role');
-  rp.textContent = role === 'manager' ? '● Manager' : role === 'team_lead' ? '● Team Lead' : '● Agent';
+  const roleLabel = role === 'manager' ? 'Manager' : role === 'team_lead' ? 'Team Lead' : 'Agent';
+  rp.textContent = `● ${roleLabel}`;
   rp.className = `role-pill ${role}`;
   document.getElementById('hdr-name').textContent = CP.name;
   renderNav();
   switchTab(role === 'manager' ? 'org' : 'dashboard');
+
+  // Team name in the header (agent/TL only — manager isn't scoped to one
+  // team, so it stays as-is). Fetched after the tab switch so a slow/failed
+  // lookup never blocks the app from becoming usable.
+  if(role !== 'manager' && CP.teamId){
+    try {
+      const snap = await getDoc(doc(db,'teams',CP.teamId));
+      if(snap.exists()) rp.textContent = `● ${roleLabel} · ${snap.data().name}`;
+    } catch(e){ /* header team name is cosmetic — a failed lookup just leaves the role-only label */ }
+  }
 }
