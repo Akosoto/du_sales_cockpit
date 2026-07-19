@@ -531,7 +531,25 @@ export async function showLeadModal(lead, byId, agents){
       }
 
       await dbUpdate('leads', lead.id, update);
-      closeModal(); toast('Lead saved.'); renderPipelineTab();
+      renderPipelineTab();
+
+      // Close-to-submit: saving into Closed (with a company already linked,
+      // and nothing submitted for this lead yet) transitions straight into
+      // the Submit to Backend view instead of just closing — the whole point
+      // of closing a lead is to hand it to backend, so make that the next
+      // natural step rather than a separate thing to remember to do.
+      // canSubmit (computed at modal-open time) checked the ORIGINAL
+      // lead.stage — useless here since this save may be the very save that
+      // sets stage to 'Closed'. Re-check permission against the just-saved
+      // values instead.
+      const updatedLead = {...lead, ...update};
+      const canSubmitNow = updatedLead.companyId && (role==='manager' || updatedLead.assignedTo===CU.uid);
+      if(stage === 'Closed' && canSubmitNow && !existingSubmissions.length){
+        toast('Lead saved.');
+        await showSubmitModal(updatedLead, byId);
+      } else {
+        closeModal(); toast('Lead saved.');
+      }
     } catch(e){ document.getElementById('lm-err').textContent=e.message; enable('lm-save','Save Changes'); }
   };
 
@@ -848,6 +866,9 @@ async function showSubmitModal(lead, byId){
     const catFields = selectedProduct ? (ORG_DEFAULTS.itemFieldsByCategory[selectedProduct.category]||[]) : [];
 
     modal(`Submit to Backend — ${esc(lead.company)}`, `
+      <div class="flex mb-12" style="justify-content:flex-end">
+        <button type="button" class="btn btn-ghost btn-xs" id="sm-submit-later">Submit later</button>
+      </div>
       ${expiryWarnings.length ? `<div class="locked-note" style="background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:var(--amber)">
         ⚠ ${expiryWarnings.map(w=>`${w.isEstablishmentCard?'<strong>Establishment Card</strong> (SIM-suspension risk)':esc(w.label)} expires ${fmtDate(w.date)}`).join('; ')}
       </div>` : ''}
@@ -912,6 +933,10 @@ async function showSubmitModal(lead, byId){
     // picker itself) — the template only renders sm-term as an empty
     // placeholder; actual options are always JS-populated.
     if(selectedProduct) populateTermSelect(selectedProduct);
+
+    document.getElementById('sm-submit-later').onclick = () => {
+      closeModal(); toast('Lead saved. You can submit to backend anytime from this lead.');
+    };
 
     document.getElementById('sm-prod').onchange = function(){
       selectedProductId = this.value;
