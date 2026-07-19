@@ -785,9 +785,19 @@ function showAddLeadModal(agents, byId){
       if(!companyId){
         companyId = await findOrCreateCompany(co, {industry:v('nl-ind'), city:v('nl-cy'), accountCode:acctCode});
       }
-      // Resolve teamId from assignee's user doc (skip for manager self-assign)
+      // Resolve teamId/tlId from the assignee's OWN profile (step 0e-c root
+      // cause fix). The old check here was `assignTo !== CU.uid`, meaning
+      // "skip resolution when self-assigning" — intended for a MANAGER
+      // self-assigning (managers aren't on a team), but it fired for ANY
+      // self-assignment, including the single most common lead-creation
+      // path there is: an agent creating and self-assigning their own lead.
+      // That silently left every self-created agent lead with a permanently
+      // blank teamId/tlId even though the agent's own profile (already
+      // loaded as CP) had one all along — no extra read needed for that case.
       let leadTeamId = '', leadTlId = '';
-      if(assignTo && assignTo !== CU.uid){
+      if(assignTo === CU.uid && role !== 'manager'){
+        leadTeamId = CP.teamId || ''; leadTlId = CP.tlId || '';
+      } else if(assignTo && assignTo !== CU.uid){
         const aSnap = await getDoc(doc(db,'users',assignTo));
         if(aSnap.exists()){ leadTeamId = aSnap.data().teamId||''; leadTlId = aSnap.data().tlId||''; }
       }
