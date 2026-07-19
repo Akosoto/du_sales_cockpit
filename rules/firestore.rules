@@ -228,6 +228,36 @@ service cloud.firestore {
       allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
+    // ── SUBMISSION DOCS (ARCHITECTURE.md §6) ────────
+    // firestore-b64 storage driver: one doc per PAGE, keyed by bundleId (not
+    // submission id) since company documents attach once per bundle, shared
+    // across every product-line submission in it. agentId/teamId are
+    // denormalized copies of the owning submission's own fields (stamped by
+    // js/storage/firestore-b64.js's put()), so the read rule mirrors the
+    // submissions read rule exactly — same four parties, same reasoning.
+    match /submissionDocs/{d} {
+      allow read: if isAuth() && sameOrg() && (
+        role() == 'manager' ||
+        resource.data.agentId == request.auth.uid ||
+        (role() == 'team_lead' && resource.data.teamId == userDoc().teamId) ||
+        isActiveBackend()
+      );
+
+      // Uploaded at Submit-to-Backend time by the submitting agent, or by a
+      // manager (no other path creates these).
+      allow create: if isAuth() && sameOrgWrite()
+        && (request.resource.data.agentId == request.auth.uid || role() == 'manager');
+
+      // Pages are immutable — replacing a document means delete + re-upload,
+      // never an in-place edit, so there is no update rule at all.
+      allow update: if false;
+
+      // Manager-only, matching the retention sweep's own manager-only gate
+      // (js/org.js runDocumentRetentionSweep) — no one else can bulk- or
+      // single-delete stored pages, including the uploading agent.
+      allow delete: if isAuth() && role() == 'manager' && sameOrg();
+    }
+
     // ── AUDIT LOG (ARCHITECTURE.md §3) ──────────────
     // Append-only: js/db.js writes one doc per mutation, in the same batch
     // as the mutation itself. No update/delete ever — the log is only ever
