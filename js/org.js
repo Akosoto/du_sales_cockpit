@@ -744,25 +744,82 @@ function showEditUserModal(userId, users, teams){
 // Backfill teamId/tlId on leads that predate those fields (e.g. the original
 // seeded leads) — without them the TL Firestore rule's teamId match always
 // fails, silently blocking TL edits/deletes on those leads.
+// Step 0e-b cascade: a lead whose teamId/tlId was blank/stale at the time it
+// was SUBMITTED already has that same stale value frozen onto its
+// submissions (createSubmissions used to just copy lead.teamId||'' verbatim
+// — fixed at the source in js/submissions.js, but that fix doesn't
+// retroactively touch documents already written before it). Repairing the
+// LEAD alone leaves those already-created submissions permanently invisible
+// to the TL, since the TL's rule-mirrored query matches teamId. This finds
+// and backfills them too.
 async function repairLeadTeamData(leadsToFix, byId){
   const btn = document.getElementById('btn-repair');
   if(btn){ btn.disabled = true; btn.textContent = '⏳ Repairing…'; }
   try {
     const CHUNK = 200;
-    let fixed = 0;
+    const ID_CHUNK = 30; // Firestore 'in' operator cap
+    let fixedLeads = 0;
+    const teamByLeadId = {}; // leadId -> the corrected {teamId, tlId} it now has
+
     for(let i = 0; i < leadsToFix.length; i += CHUNK){
       const chunk = leadsToFix.slice(i, i + CHUNK);
       const bat = newBatch();
       chunk.forEach(l => {
         const assignee = byId[l.assignedTo];
         if(!assignee) return;
-        batchUpdate(bat, 'leads', l.id, { teamId: assignee.teamId||'', tlId: assignee.tlId||'' }, {skipAudit:true});
-        fixed++;
+        const teamId = assignee.teamId||'', tlId = assignee.tlId||'';
+        batchUpdate(bat, 'leads', l.id, { teamId, tlId }, {skipAudit:true});
+        fixedLeads++;
+        teamByLeadId[l.id] = { teamId, tlId };
       });
       await bat.commit();
     }
-    if(fixed) await logBulkAudit(`Repaired teamId/tlId on ${fixed} lead(s)`, fixed);
-    toast(`✅ Repaired ${fixed} lead${fixed!==1?'s':''}.`);
+
+    // Cascade to submissions already created from these leads.
+    const fixedLeadIds = Object.keys(teamByLeadId);
+    let fixedSubs = 0;
+    const staleSubDocs = [];
+    if(fixedLeadIds.length){
+      for(let i=0; i<fixedLeadIds.length; i+=ID_CHUNK){
+        const snap = await getDocs(query(collection(db,'submissions'), where('leadId','in',fixedLeadIds.slice(i,i+ID_CHUNK))));
+        staleSubDocs.push(...snap.docs);
+      }
+      for(let i=0; i<staleSubDocs.length; i+=CHUNK){
+        const bat = newBatch();
+        let touchedInChunk = false;
+        staleSubDocs.slice(i,i+CHUNK).forEach(d => {
+          const s = d.data();
+          const correct = teamByLeadId[s.leadId];
+          if(!correct || (s.teamId===correct.teamId && s.tlId===correct.tlId)) return;
+          batchUpdate(bat, 'submissions', d.id, { teamId: correct.teamId, tlId: correct.tlId }, {skipAudit:true});
+          fixedSubs++; touchedInChunk = true;
+        });
+        if(touchedInChunk) await bat.commit();
+      }
+    }
+
+    // submissionDocs pages are DELIBERATELY immutable (step 4 — no update
+    // rule exists at all, replacing a doc means delete + re-upload), so a
+    // stale teamId on an already-stored page cannot be backfilled in place.
+    // Count them for visibility instead of attempting a write that the
+    // rules would reject outright — a TL-invisible page here self-corrects
+    // the next time that document type is replaced (Fix & Resubmit).
+    let staleDocPages = 0;
+    const affectedBundleIds = [...new Set(staleSubDocs.map(d=>d.data().bundleId))];
+    if(affectedBundleIds.length){
+      for(let i=0; i<affectedBundleIds.length; i+=ID_CHUNK){
+        const snap = await getDocs(query(collection(db,'submissionDocs'), where('bundleId','in',affectedBundleIds.slice(i,i+ID_CHUNK))));
+        snap.docs.forEach(d => {
+          const sub = staleSubDocs.find(s => s.data().bundleId === d.data().bundleId);
+          const correct = sub && teamByLeadId[sub.data().leadId];
+          if(correct && d.data().teamId !== correct.teamId) staleDocPages++;
+        });
+      }
+    }
+
+    const total = fixedLeads + fixedSubs;
+    if(total) await logBulkAudit(`Repaired team data: ${fixedLeads} lead(s), ${fixedSubs} submission(s)${staleDocPages?`; ${staleDocPages} submissionDocs page(s) left as-is (immutable)`:''}`, total);
+    toast(`✅ Repaired ${fixedLeads} lead${fixedLeads!==1?'s':''}, ${fixedSubs} submission${fixedSubs!==1?'s':''}.${staleDocPages?` ${staleDocPages} document page(s) still carry the old team tag — immutable, will self-correct if replaced.`:''}`);
     renderOrgTab();
   } catch(e){
     toast('Error: '+e.message,'err');
