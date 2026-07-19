@@ -136,6 +136,15 @@ service cloud.firestore {
       allow delete: if isAuth() && role() == 'team_lead' && sameOrg()
         && resource.data.teamId == userDoc().teamId
         && resource.data.ownerLocked != true;
+
+      // Narrow exception, same pattern as teams.assignmentCursor above: any
+      // authenticated user may update ONLY submissionSummary — the pipeline
+      // badge (step 0d) is stamped by createSubmissions (the submitting
+      // agent's own batch) AND by appendEvent (backend department staff
+      // acting on a submission that isn't their own lead, no other clause
+      // above covers them at all).
+      allow update: if isAuth() && sameOrg()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['submissionSummary']);
     }
 
     // ── CHANNELS ─────────────────────────────────────

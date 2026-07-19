@@ -1,6 +1,6 @@
 import {
   db, CU, CP, MANDATORY_DOC_TYPES, ORG_DEFAULTS,
-  doc, collection, runTransaction
+  doc, collection, runTransaction, getDoc, getDocs, query, where
 } from './state.js';
 import { newBatch, batchAdd, batchUpdate } from './db.js';
 import { now } from './helpers.js';
@@ -68,6 +68,24 @@ export function docExpiryWarnings(company){
 // an empty/no backend team) → unassigned (shared queue). Rotation cursor
 // advances once per call — per SUBMISSION now, not per bundle
 // (ARCHITECTURE.md §5), since each product line is assigned independently.
+// Collapses a bundle's sibling submission statuses into the small badge
+// vocabulary the pipeline list renders (ARCHITECTURE.md §5/this session's
+// step 0d) — 'none' is the caller's job (a lead with no submissions at all
+// never calls this). Priority: any rejected line needs attention regardless
+// of how far along its siblings are; only when EVERY line has activated does
+// the whole bundle read as activated; otherwise it's the furthest-along
+// in-flight state, collapsed down to the two badge buckets 'submitted'
+// (pendingVerification/submittedToDu — nothing's actively being worked yet)
+// and 'inProgress' (inProgress, or a partial activation with no rejects).
+const STATUS_RANK = { pendingVerification:0, submittedToDu:1, inProgress:2, activated:3 };
+export function collapseSubmissionSummary(lines){
+  if(!lines.length) return 'none';
+  if(lines.some(l => l.status === 'rejected')) return 'rejected';
+  if(lines.every(l => l.status === 'activated')) return 'activated';
+  const furthest = lines.reduce((max,l) => Math.max(max, STATUS_RANK[l.status] ?? 0), 0);
+  return furthest >= STATUS_RANK.inProgress ? 'inProgress' : 'submitted';
+}
+
 export function pickBackendAgent(category, backendAgents, cursor){
   const available = backendAgents.filter(u => u.available !== false);
   const specialtyMatches = available.filter(u => !(u.specialties||[]).length || u.specialties.includes(category));
@@ -126,6 +144,25 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
   const requiredDocsPayload = requiredDocs.map(rd => ({ type: rd.type, status: rd.status || 'attested', expiryDate: rd.expiryDate || null, storageRef: rd.storageRef || null }));
   const accTransferPayload = accTransfer?.flag ? { flag: true, fromPartner: accTransfer.fromPartner || '' } : { flag: false, fromPartner: '' };
 
+  // Resolve teamId/tlId from the ASSIGNED AGENT's own profile at submit time
+  // (step 0e root-cause fix) — the lead's own teamId/tlId can be stale or
+  // never stamped at all (e.g. an agent self-creating their own lead used to
+  // skip team resolution entirely — see js/leads.js showAddLeadModal), and
+  // this must never silently freeze '' onto a submission the way the old
+  // `lead.teamId||''` copy did: that's exactly what made a whole bundle
+  // permanently invisible to the TL even after the LEAD itself was later
+  // repaired, since the fix never touched the already-created submissions.
+  // Falling back to the lead's own fields covers the case where the
+  // assignee's profile itself is somehow missing (shouldn't happen, but
+  // cheap insurance); refusing outright when BOTH are empty surfaces the gap
+  // at submit time instead of writing another silent blank.
+  const assignedAgent = users.find(u => u.id === lead.assignedTo);
+  const teamId = assignedAgent?.teamId || lead.teamId || '';
+  const tlId   = assignedAgent?.tlId   || lead.tlId   || '';
+  if(!teamId){
+    throw new Error('This lead has no team data — run Repair Lead Data or contact your manager.');
+  }
+
   const bat = externalBat || newBatch();
   const subIds = [];
   items.forEach(it => {
@@ -138,7 +175,7 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
     const subRef = batchAdd(bat, 'submissions', {
       bundleId, leadId: lead.id, companyId: lead.companyId,
       agentId: CU.uid, agentName: CP.name,
-      teamId: lead.teamId||'', tlId: lead.tlId||'',
+      teamId, tlId,
       productId: it.productId, productName: it.productName, category: it.category,
       qty: Number(it.qty)||1, mrc: Number(it.mrc)||0,
       typeOfRequest: it.typeOfRequest || 'NEW', contractTerm: it.contractTerm || null,
@@ -152,6 +189,12 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
     });
     subIds.push(subRef.id);
   });
+
+  // Pipeline submission-status badge (step 0d) — denormalized onto the LEAD
+  // so the pipeline list never needs a per-lead submissions query just to
+  // show a badge. A fresh bundle is always all-pendingVerification, which
+  // collapseSubmissionSummary always resolves to 'submitted'.
+  batchUpdate(bat, 'leads', lead.id, { submissionSummary: 'submitted' });
 
   if(accTransferPayload.flag && accTransferPayload.fromPartner && company){
     batchUpdate(bat, 'companies', company.id, {
@@ -214,10 +257,25 @@ export async function appendEvent(submissionId, { type, payload = {} }){
   const subRef = doc(db,'submissions',submissionId);
   let finalStatus;
 
+  // Sibling bundle enumeration — a plain query BEFORE the transaction, since
+  // Firestore transactions can only re-read specific document refs
+  // (transaction.get), never run a query. The IDs found here are re-read
+  // fresh INSIDE the transaction below, so the actual collapse is still
+  // computed from consistent, as-of-commit data (and retried automatically
+  // if a sibling changes between this enumeration and the commit).
+  const preSnap = await getDoc(subRef);
+  if(!preSnap.exists()) throw new Error('Submission not found.');
+  const { bundleId, leadId } = preSnap.data();
+  const siblingsSnap = await getDocs(query(collection(db,'submissions'), where('bundleId','==',bundleId)));
+  const otherSiblingRefs = siblingsSnap.docs.map(d => d.ref).filter(r => r.id !== submissionId);
+
   await runTransaction(db, async (transaction) => {
     const snap = await transaction.get(subRef);
     if(!snap.exists()) throw new Error('Submission not found.');
     const sub = snap.data();
+    // Reads-before-writes: every transaction.get() in this transaction must
+    // happen before any transaction.set()/update() call below.
+    const otherSiblingSnaps = await Promise.all(otherSiblingRefs.map(r => transaction.get(r)));
 
     const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
     const update = { events, lastEditedBy: CP.name, lastEditedAt: now() };
@@ -258,6 +316,18 @@ export async function appendEvent(submissionId, { type, payload = {} }){
     });
 
     finalStatus = update.status || sub.status;
+
+    // Pipeline submission-status badge (step 0d) — recomputed across every
+    // sibling in the bundle, using THIS submission's just-computed new
+    // status rather than its stale pre-transaction one, and stamped onto the
+    // LEAD in the same transaction as the status change itself.
+    if(leadId){
+      const siblingStatuses = [
+        { status: finalStatus },
+        ...otherSiblingSnaps.filter(s => s.exists()).map(s => ({ status: s.data().status }))
+      ];
+      transaction.update(doc(db,'leads',leadId), { submissionSummary: collapseSubmissionSummary(siblingStatuses) });
+    }
   });
 
   return finalStatus;

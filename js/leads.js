@@ -328,6 +328,20 @@ export async function renderPipelineTab(){
     el.querySelectorAll('[data-pg]').forEach(b=>b.addEventListener('click',()=>goToPage(Number(b.dataset.pg))));
   }
 
+  // Pipeline submission-status badge (step 0d) — reads the denormalized
+  // lead.submissionSummary stamped by createSubmissions/appendEvent, never a
+  // per-lead query. A Closed lead with no summary at all is exactly the
+  // "closed but never submitted" gap a TL needs to catch, so it gets its own
+  // attention-styled badge instead of just silently showing nothing.
+  const SUBMISSION_BADGE_LABELS = { submitted:'Submitted', inProgress:'In Progress', activated:'Activated', rejected:'⚠ Rejected' };
+  function submissionBadgeHtml(l){
+    const summary = l.submissionSummary;
+    if(!summary || summary === 'none'){
+      return l.stage === 'Closed' ? `<span class="subb subb-none">Not submitted</span>` : '';
+    }
+    return `<span class="subb subb-${summary}">${SUBMISSION_BADGE_LABELS[summary]||summary}</span>`;
+  }
+
   function renderList(){
     const cnt = filtersActive() ? applyClientFilters(expandedLeads).length : totalCount;
     document.getElementById('lead-cnt').textContent = `${cnt} lead${cnt!==1?'s':''}`;
@@ -349,7 +363,7 @@ export async function renderPipelineTab(){
           <td class="td-dim">${esc(l.contact||'—')}</td>
           <td class="td-dim">${l.phone?`<a href="tel:${l.phone}">${l.phone}</a>`:'—'}</td>
           ${role!=='agent'?`<td class="td-dim">${esc(byId[l.assignedTo]?.name||'—')}</td>`:''}
-          <td>${stagePill(l.stage)}</td>
+          <td>${stagePill(l.stage)}${submissionBadgeHtml(l)}</td>
           <td class="td-dim">${esc(l.city||'—')}</td>
           <td class="td-dim text-sm">${l.followup||'—'}</td>
           <td class="td-dim text-sm">${l.lastEditedAt?fmtDate(l.lastEditedAt):'—'}</td>
