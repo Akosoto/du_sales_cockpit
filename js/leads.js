@@ -5,7 +5,7 @@ import {
   orderBy, limit, startAfter, getCountFromServer
 } from './state.js';
 import { dbAdd, dbUpdate, dbDelete, newBatch, batchUpdate, logBulkAudit } from './db.js';
-import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter } from './helpers.js';
+import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, stagePill, buildMsFilter, wireMsFilter, fixSelectScrollClip } from './helpers.js';
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import { computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId } from './submissions.js';
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
@@ -496,6 +496,8 @@ export async function showLeadModal(lead, byId, agents){
   document.getElementById('lm-submit')?.addEventListener('click', () => showSubmitModal(lead, byId));
   document.getElementById('lm-view-timeline')?.addEventListener('click', () => showSubmissionTimelineModal(lead, existingSubmissions));
 
+  fixSelectScrollClip('ls-stage');
+
   // Show deal value when Won
   document.getElementById('ls-stage').addEventListener('change', function(){
     document.getElementById('ls-dv-wrap').style.display = this.value==='Closed' ? '' : 'none';
@@ -652,7 +654,7 @@ function showAddLeadModal(agents, byId){
     </div>
     <div class="row2">
       <div class="field"><label>Stage</label>
-        <select id="nl-st">${STAGES.filter(s=>s!=='Closed'&&s!=='Lost').map(s=>`<option>${s}</option>`).join('')}</select>
+        <select id="nl-st">${STAGES.map(s=>`<option>${s}</option>`).join('')}</select>
       </div>
       ${role!=='agent' ? `<div class="field"><label>Assign To</label>
         <select id="nl-ag">
@@ -664,6 +666,8 @@ function showAddLeadModal(agents, byId){
     </div>
     <p id="nl-err" class="err"></p>
     <button class="btn btn-primary btn-full mt-12" id="nl-btn">Add Lead</button>`);
+
+  fixSelectScrollClip('nl-st');
 
   // Company search dropdown — same visual/behavior pattern as the existing
   // multi-select filters (.ms-wrap/.ms-dd), so the global click-outside-closes

@@ -17,6 +17,18 @@ export function calculateTLTarget(tlId, users){
     .reduce((sum, u) => sum + (Number(u.monthlyTarget) || 0), 0);
 }
 
+// A <select> sitting near the bottom of a scrollable modal body can have its
+// native options popup clipped/pushed off-screen in some environments —
+// there's little room below it and nothing forces the browser to reconsider.
+// Centering the element in the viewport on focus (fires for mouse AND
+// keyboard activation, before the popup opens) guarantees equal room on both
+// sides regardless of where the field happened to land, without touching the
+// native <select> itself — keyboard/screen-reader behavior is unaffected.
+export function fixSelectScrollClip(id){
+  const el = document.getElementById(id);
+  if(el) el.addEventListener('focus', function(){ this.scrollIntoView({block:'center', behavior:'instant'}); });
+}
+
 // ════════════════════════════════════════════════════
 // TOAST
 // ════════════════════════════════════════════════════
