@@ -1,6 +1,8 @@
 import { db, CU, CP, doc, getDoc, collection, query, where, getDocs } from './state.js';
-import { esc, fmtDate, stagePill } from './helpers.js';
+import { esc, fmtDate, stagePill, toast } from './helpers.js';
 import { showLeadModal } from './leads.js';
+import { getDashboardData } from './dashboardData.js';
+import { renderDonutCard } from './dashboardCharts.js';
 
 // ════════════════════════════════════════════════════
 // DASHBOARD TAB
@@ -160,6 +162,8 @@ export async function renderDashboardTab(){
       ${role==='team_lead' ? `<div class="kpi-card"><div class="kpi-val">${agentUsers.length}</div><div class="kpi-lbl">Agents</div></div>` : ''}
     </div>
 
+    ${role==='manager' ? `<div id="mgr-cockpit" style="margin-bottom:20px"></div>` : ''}
+
     ${role !== 'agent' ? `<div class="section-card" style="margin-bottom:20px">
       <div style="font-weight:700;font-size:14px;margin-bottom:12px">👥 Agent Performance</div>
       <div style="overflow-x:auto"><table class="data-table">
@@ -217,4 +221,103 @@ export async function renderDashboardTab(){
     const expanded = log.classList.toggle('expanded');
     btn.textContent = expanded ? 'Show Less' : `Show More (${recentActs.length-10})`;
   });
+
+  // Manager's Cockpit (Session B4 Steps 5-7) — a separate section reading
+  // through getDashboardData(period), independent of the leads/stage-based
+  // KPIs above it. teams/agentUsers are already fetched for this role.
+  if(role === 'manager') renderManagerCockpit();
+}
+
+// All teams (agentUsers above only covers role:'agent' for the manager
+// branch — the cockpit's byTeam breakdown needs every team regardless of
+// who's on it, so this re-fetches teams separately rather than threading a
+// wider fetch back through renderDashboardTab's existing per-role branches).
+async function fetchAllTeams(){
+  const s = await getDocs(collection(db,'teams'));
+  return s.docs.map(d=>({id:d.id,...d.data()}));
+}
+
+// Local UI state (period + AED/count mode) lives in this closure, shared
+// across Steps 5-7's sections so they all react to the same selector
+// instead of each owning a duplicate one. Re-renders only #mgr-cockpit's
+// subtree, never the whole Dashboard tab.
+function renderManagerCockpit(){
+  const box = document.getElementById('mgr-cockpit');
+  if(!box) return;
+  let period = 'thisMonth';
+  let mode = 'aed'; // 'aed' | 'count'
+  let customFrom = '', customTo = '';
+
+  async function refresh(){
+    box.innerHTML = '<div class="loading"><div class="spin"></div> Loading…</div>';
+    let data, err = '';
+    try {
+      const allTeams = await fetchAllTeams();
+      const usersSnap = await getDocs(collection(db,'users'));
+      const users = usersSnap.docs.map(d=>({id:d.id,...d.data()}));
+      const periodArg = period === 'custom' ? { preset:'custom', from:customFrom, to:customTo } : period;
+      data = await getDashboardData(periodArg, { teams: allTeams, users });
+    } catch(e){
+      // The status+activatedAt composite index (js/dashboardData.js) ships
+      // in Step 8 — until then Firestore denies this specific query shape
+      // with its own "requires an index" error. Surface that plainly
+      // instead of a raw Firebase error string.
+      err = /requires an index/i.test(e.message||'')
+        ? "This view needs a Firestore index that hasn't been created yet — ships in Step 8 of this build."
+        : e.message;
+    }
+
+    const periodBtn = (id,label) => `<button class="ch-tag${period===id?' active':''}" data-period="${id}">${esc(label)}</button>`;
+    const modeBtn = (id,label) => `<button class="ch-tag${mode===id?' active':''}" data-mode="${id}">${esc(label)}</button>`;
+
+    box.innerHTML = `
+      <div class="pg-hdr" style="margin-bottom:12px">
+        <div><h2 style="font-size:1.05rem">🎯 Manager's Cockpit</h2><p class="pg-hdr-sub">Activated submissions${data?` · ${esc(data.period.label)}`:''}</p></div>
+      </div>
+      <div class="filters" style="margin-bottom:8px">
+        ${periodBtn('thisMonth','This Month')}${periodBtn('lastMonth','Last Month')}${periodBtn('thisQuarter','This Quarter')}${periodBtn('custom','Custom')}
+      </div>
+      ${period==='custom' ? `<div class="row2" style="max-width:420px;margin-bottom:12px">
+        <div class="field"><label>From</label><input type="date" id="mc-from" value="${esc(customFrom)}"></div>
+        <div class="field"><label>To <span class="text-dim">(max 92 days)</span></label><input type="date" id="mc-to" value="${esc(customTo)}"></div>
+      </div>
+      <button class="btn btn-ghost btn-sm mb-12" id="mc-apply-range">Apply Range</button>` : ''}
+      <div class="filters" style="margin-bottom:12px">${modeBtn('aed','AED')}${modeBtn('count','Count')}</div>
+      ${err ? `<p class="err">${esc(err)}</p>` : `
+      <div class="dash-donut-grid">
+        ${renderDonutCard('Share by Team', data.byTeam.map(t=>({name:t.teamName, aed:t.aed, count:t.count})), mode)}
+        ${renderDonutCard('Share by Contributor', data.byContributor.map(c=>({name:c.name, aed:c.aed, count:c.count})), mode)}
+      </div>`}
+    `;
+
+    box.querySelectorAll('[data-period]').forEach(b=>b.addEventListener('click', ()=>{
+      period = b.dataset.period;
+      if(period !== 'custom') refresh();
+      else render_customDefaults();
+    }));
+    box.querySelectorAll('[data-mode]').forEach(b=>b.addEventListener('click', ()=>{ mode = b.dataset.mode; refresh(); }));
+    box.querySelector('#mc-apply-range')?.addEventListener('click', ()=>{
+      customFrom = document.getElementById('mc-from').value;
+      customTo = document.getElementById('mc-to').value;
+      if(!customFrom || !customTo){ toast('Pick both dates.','err'); return; }
+      refresh();
+    });
+
+    function render_customDefaults(){
+      // First switch to Custom: default the range to the current period's
+      // own bounds so Apply Range works immediately without the manager
+      // having to know today's date math themselves. Built in LOCAL time
+      // (not toISOString, which converts to UTC and can silently roll the
+      // date back a day west of UTC) since these feed <input type="date">.
+      if(!customFrom){
+        const localDateStr = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const t = new Date();
+        customFrom = localDateStr(new Date(t.getFullYear(), t.getMonth(), 1));
+        customTo = localDateStr(t);
+      }
+      refresh();
+    }
+  }
+
+  refresh();
 }
