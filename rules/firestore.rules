@@ -137,13 +137,18 @@ service cloud.firestore {
         && resource.data.teamId == userDoc().teamId
         && resource.data.ownerLocked != true;
 
-      // Narrow exception, same pattern as teams.assignmentCursor above: any
-      // authenticated user may update ONLY submissionSummary — the pipeline
-      // badge (step 0d) is stamped by createSubmissions (the submitting
-      // agent's own batch) AND by appendEvent (backend department staff
-      // acting on a submission that isn't their own lead, no other clause
-      // above covers them at all).
-      allow update: if isAuth() && sameOrg()
+      // Narrow exception, same pattern as teams.assignmentCursor above —
+      // but scoped to BACKEND department staff only, not any authenticated
+      // user: the pipeline badge (step 0d) is stamped by createSubmissions
+      // (the submitting agent's own batch, already covered by the agent/TL
+      // clauses above since submissionSummary isn't in either one's blocked-
+      // fields list) AND by appendEvent, which is the only path with no
+      // other clause covering it — a backend user acting on a submission
+      // whose lead they don't own, aren't the TL of, and aren't a manager
+      // for. Requiring isActiveBackend() here means an agent or TL can only
+      // ever touch this field through their own already-scoped rule, never
+      // through this exception.
+      allow update: if isAuth() && sameOrg() && isActiveBackend()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['submissionSummary']);
     }
 
