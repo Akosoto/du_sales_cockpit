@@ -3,6 +3,7 @@ import { esc, fmtDate, stagePill, toast } from './helpers.js';
 import { showLeadModal } from './leads.js';
 import { getDashboardData } from './dashboardData.js';
 import { renderDonutCard } from './dashboardCharts.js';
+import { renderRoleMetricsSection } from './dashboardCards.js';
 
 // ════════════════════════════════════════════════════
 // DASHBOARD TAB
@@ -287,7 +288,8 @@ function renderManagerCockpit(){
       <div class="dash-donut-grid">
         ${renderDonutCard('Share by Team', data.byTeam.map(t=>({name:t.teamName, aed:t.aed, count:t.count})), mode)}
         ${renderDonutCard('Share by Contributor', data.byContributor.map(c=>({name:c.name, aed:c.aed, count:c.count})), mode)}
-      </div>`}
+      </div>
+      ${renderRoleMetricsSection(data.roleMetrics)}`}
     `;
 
     box.querySelectorAll('[data-period]').forEach(b=>b.addEventListener('click', ()=>{
