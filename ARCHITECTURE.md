@@ -407,3 +407,40 @@ data; vendor licenses software + updates + support. Differentiators to
 lead the pitch: rejection analytics, suspension-risk early warning
 (docs + bills), live daily numbers without compiling, du order-form
 export, projections/commitments, escalation memory.
+
+## 12. Session B4 — Manager's Cockpit (STUB — finalized in Step 10)
+
+Session-sequence label ("B4"), not a Phase-B feature — sits ahead of
+§10's Phase C in delivery order but deliberately does NOT build Phase
+C's rollup counters (see below). Scope: (A) category identity
+refactor + Products config panel, (B) Manager Dashboard — donuts +
+role-based performance metrics, (C) target-remaining metrics with a
+run-rate visibility toggle. Out of scope this session: SOF template
+library (deferred), escalation/KAM metrics (reserved placeholder slots
+only), rollup counters (still Phase C, a later session — this
+session's dashboard aggregates client-side behind a swappable
+`getDashboardData(period)` module whose internals Phase C replaces
+with rollup reads, not its call signature or output shape).
+
+**Category identity model (replaces name-string identity):**
+Categories (`Starter`, `Essential`, `Ultimate`, `Mobile`, …) get
+permanent immutable IDs in org-config (`orgs/{orgId}.categories: [{id,
+label}]`); the display name is a label on the ID, editable via the
+Products config panel. Every reference that used to store the name
+string directly — `products.category`, `submissions.category`,
+`users.specialties[]`, `ORG_DEFAULTS.itemFieldsByCategory` keys —
+migrates to store the ID instead, resolving the label at render time.
+Rename = one label edit, reflects everywhere by construction (specialty
+checklists, field-mapping lookups, dashboard breakdowns) with no
+per-reference update needed. Category delete is blocked while any
+product still references the ID, with the blocking products listed to
+the manager.
+
+**Escalation attribution rule (recorded now, applied when the
+escalations module itself ships in Phase E):** whoever RESOLVES an
+escalation gets the credit for it, not who opened it and not the
+account's KAM by default — this explicitly includes backend agents,
+since backend already fields plenty of escalation-adjacent work today.
+This session only reserves "coming with escalations module" placeholder
+slots in the role-metrics cards; no escalation data model or UI ships
+here.
