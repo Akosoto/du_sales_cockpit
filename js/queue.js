@@ -12,6 +12,54 @@ import * as storage from './storage/index.js';
 import { captureFile } from './documents.js';
 import { downloadBundlePdf } from './pdfExport.js';
 
+// Fixed field order for "Copy All" (step 6) — best-guess order for pasting
+// into du's ticket form. TODO: make this org-configurable once we actually
+// know du's real ticket field order (ARCHITECTURE.md's white-label plan) —
+// hardcoded for now since there's no org-config UI yet to drive it from.
+const COPY_ALL_FIELDS = [
+  { label: 'Company Name', get: (s,c) => c?.name },
+  { label: 'Account Code', get: (s,c) => c?.accountCode },
+  { label: 'Authorized Person', get: (s,c) => c?.contacts?.authorizedPerson },
+  { label: 'Technical Contact', get: (s,c) => c?.contacts?.technicalName },
+  { label: 'Phone', get: (s,c) => c?.contacts?.phone },
+  { label: 'Alt Phone', get: (s,c) => c?.contacts?.altPhone },
+  { label: 'Email', get: (s,c) => c?.contacts?.email },
+  { label: 'Address', get: (s,c) => c?.addressBlock?.full || [c?.addressBlock?.building, c?.addressBlock?.street, c?.addressBlock?.city, c?.addressBlock?.emirate].filter(Boolean).join(', ') },
+  { label: 'PO Box', get: (s,c) => c?.addressBlock?.poBox },
+  { label: 'Product', get: (s) => s.productName },
+  { label: 'Category', get: (s) => s.category },
+  { label: 'Qty', get: (s) => s.qty },
+  { label: 'MRC', get: (s) => s.mrc!=null ? `AED ${s.mrc}` : '' },
+  { label: 'Type of Request', get: (s) => s.typeOfRequest },
+  { label: 'Contract Term', get: (s) => s.contractTerm ? `${s.contractTerm} months` : '' },
+  { label: 'MSISDN', get: (s) => s.categoryFields?.msisdn },
+  { label: 'GAID', get: (s) => s.categoryFields?.gaid },
+  { label: 'SIM Serial', get: (s) => s.categoryFields?.simSerial },
+  { label: 'Passcode', get: (s) => s.categoryFields?.passcode },
+  { label: 'Commitment Plan', get: (s) => s.categoryFields?.commitmentPlan },
+  { label: 'Handset', get: (s) => s.categoryFields?.handset },
+  { label: 'Activity Number', get: (s) => [...(s.events||[])].reverse().find(e=>e.type==='activityNo')?.payload?.value },
+  { label: 'Work Order Number', get: (s) => [...(s.events||[])].reverse().find(e=>e.type==='workOrderNo')?.payload?.value }
+];
+
+async function copyToClipboard(text){
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Copied.');
+  } catch(e){
+    toast('Could not copy — copy it manually.', 'err');
+  }
+}
+
+// A value + its own small copy icon — used throughout the action panel's
+// info blocks. Renders nothing copyable when the value is empty (no icon
+// for a dash).
+function copyField(label, value){
+  const display = (value===undefined || value===null || value==='') ? '—' : String(value);
+  const copyBtn = display!=='—' ? `<button type="button" class="btn btn-ghost btn-xs" data-copy="${esc(display)}" title="Copy">📋</button>` : '';
+  return `<div class="info-item"><div class="lbl">${esc(label)}</div><div class="val" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${esc(display)} ${copyBtn}</div></div>`;
+}
+
 // Client-side workflow policy (step 2) — NOT a security boundary, the
 // submissions rule already gives the whole backend department unrestricted
 // update rights on every submission. This just decides which button each
@@ -227,24 +275,35 @@ async function showActionPanel(sub, company, onChange){
   function render(){
     const s = current;
     modal(`Submission — ${esc(company?.name || 'Unknown Company')}`, `
-      <div class="flex mb-12" style="justify-content:flex-end">
+      <div class="flex mb-12" style="justify-content:flex-end;gap:8px">
+        <button type="button" class="btn btn-ghost btn-xs" id="ap-copy-all">📋 Copy All</button>
         <button type="button" class="btn btn-ghost btn-xs" id="ap-download-bundle">⬇️ Download bundle PDF</button>
       </div>
       <div class="info-grid mb-12">
-        <div class="info-item"><div class="lbl">Company</div><div class="val">${esc(company?.name||'—')} ${company?.hasDuAccount?'<span class="text-ok text-xs">● has du account</span>':''}</div></div>
-        <div class="info-item"><div class="lbl">Account Code</div><div class="val">${esc(company?.accountCode||'—')}</div></div>
+        ${copyField('Company', company?.name)}
+        ${copyField('Account Code', company?.accountCode)}
         <div class="info-item"><div class="lbl">Agent</div><div class="val">${esc(s.agentName||'—')}</div></div>
-        <div class="info-item"><div class="lbl">Status</div><div class="val" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</div></div>
+        <div class="info-item"><div class="lbl">Status</div><div class="val" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}${company?.hasDuAccount?' <span class="text-ok text-xs">● has du account</span>':''}</div></div>
       </div>
+      ${company?.contacts ? `<div class="info-grid mb-12">
+        ${copyField('Authorized Person', company.contacts.authorizedPerson)}
+        ${copyField('Phone', company.contacts.phone)}
+        ${copyField('Email', company.contacts.email)}
+      </div>` : ''}
+      ${company?.addressBlock ? `<div class="info-grid mb-12">
+        ${copyField('Address', company.addressBlock.full || [company.addressBlock.building, company.addressBlock.street, company.addressBlock.city, company.addressBlock.emirate].filter(Boolean).join(', '))}
+      </div>` : ''}
       <div class="divider"></div>
       <div class="info-grid mb-12">
-        <div class="info-item"><div class="lbl">Product</div><div class="val">${esc(s.productName)} <span class="text-dim text-xs">${esc(s.category)}</span></div></div>
-        <div class="info-item"><div class="lbl">Qty / MRC</div><div class="val">Qty ${s.qty} · AED ${Number(s.mrc).toLocaleString()}/mo</div></div>
+        ${copyField('Product', s.productName)}
+        <div class="info-item"><div class="lbl">Category</div><div class="val">${esc(s.category)}</div></div>
+        ${copyField('Qty', s.qty)}
+        <div class="info-item"><div class="lbl">MRC</div><div class="val">AED ${Number(s.mrc).toLocaleString()}/mo</div></div>
         <div class="info-item"><div class="lbl">Type of Request</div><div class="val">${esc(s.typeOfRequest)}</div></div>
         <div class="info-item"><div class="lbl">Contract Term</div><div class="val">${s.contractTerm?`${s.contractTerm} months`:'—'}</div></div>
       </div>
       ${Object.keys(s.categoryFields||{}).length ? `<div class="info-grid mb-12">
-        ${Object.entries(s.categoryFields).map(([k,val])=>`<div class="info-item"><div class="lbl">${esc(k)}</div><div class="val">${esc(val)}</div></div>`).join('')}
+        ${Object.entries(s.categoryFields).map(([k,val])=>copyField(k, val)).join('')}
       </div>` : ''}
       ${s.sprFlag ? `<div class="locked-note mb-12">⭐ Special Pricing Request${s.sprNote?`: ${esc(s.sprNote)}`:''}</div>` : ''}
       ${s.accTransfer?.flag ? `<div class="locked-note mb-12">🔄 Account transfer from ${esc(s.accTransfer.fromPartner||'another partner')}</div>` : ''}
@@ -304,6 +363,15 @@ async function showActionPanel(sub, company, onChange){
       </div>
       <p id="ap-err" class="err"></p>
     `, true);
+
+    // Copy tools (step 6) — one delegated handler for every per-field icon
+    // (copyField() above renders them), plus Copy All in the fixed
+    // COPY_ALL_FIELDS order.
+    document.querySelectorAll('[data-copy]').forEach(btn => btn.onclick = () => copyToClipboard(btn.dataset.copy));
+    document.getElementById('ap-copy-all').onclick = () => {
+      const block = COPY_ALL_FIELDS.map(f => `${f.label}: ${f.get(s, company) || ''}`).join('\n');
+      copyToClipboard(block);
+    };
 
     // Doc page viewing — identical on-demand single-get pattern as the
     // agent's own read-only timeline (js/leads.js showSubmissionTimelineModal).
