@@ -73,3 +73,22 @@ export function findCategoryIdByLabel(label){
 export function currentCategories(){
   return OC?.categories || DEFAULT_CATEGORIES;
 }
+
+// Contract-term display labels (Session B4 Step 3, Products config panel).
+// Unlike categories, a pricingOption's label is NOT migrated away from the
+// product doc — every product keeps its own free-text label as the
+// fallback/default (no data migration needed, nothing breaks if this
+// override is never set). org-config only holds an OPTIONAL override keyed
+// by term (months), so a manager can rename "12-month contract" once and
+// have it reflected on every product that uses that term, without touching
+// per-product data. termLabel() is the single resolver every render call
+// site should use instead of reading pricingOption.label directly.
+export function termLabel(term, fallbackLabel){
+  return OC?.contractTermLabels?.[term] ?? fallbackLabel;
+}
+
+// Current term-label overrides — always an object (possibly empty), for the
+// config panel to render/edit directly.
+export function currentTermLabels(){
+  return OC?.contractTermLabels || {};
+}

@@ -14,7 +14,7 @@ import {
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
 import * as storage from './storage/index.js';
 import { downloadBundlePdf } from './pdfExport.js';
-import { categoryLabel } from './orgConfig.js';
+import { categoryLabel, termLabel } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -874,7 +874,7 @@ async function showSubmitModal(lead, byId){
     const termSel = document.getElementById('sm-term');
     if(!p){ termSel.innerHTML = '<option value="">— Select product first —</option>'; termSel.disabled = true; return; }
     termSel.disabled = false;
-    termSel.innerHTML = (p.pricingOptions||[]).map((po,i)=>`<option value="${i}">${esc(po.label)} (AED ${po.price})</option>`).join('');
+    termSel.innerHTML = (p.pricingOptions||[]).map((po,i)=>`<option value="${i}">${esc(termLabel(po.term,po.label))} (AED ${po.price})</option>`).join('');
     termSel.onchange = () => {
       const po = p.pricingOptions[Number(termSel.value)];
       document.getElementById('sm-mrc').value = po ? po.price : '';

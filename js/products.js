@@ -1,10 +1,11 @@
 import {
-  db, CU, CP,
+  db, CU, CP, OC,
   collection, query, where, getDocs
 } from './state.js';
-import { dbAdd, dbUpdate, newBatch, batchAdd } from './db.js';
+import { dbAdd, dbSet, dbUpdate, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
-import { currentCategories, categoryLabel } from './orgConfig.js';
+import { currentCategories, categoryLabel, currentTermLabels, termLabel, loadOrgConfig } from './orgConfig.js';
+import { orgId } from '../config.js';
 
 // ════════════════════════════════════════════════════
 // PRODUCTS — SEED DATA  (du Business, June 2026)
@@ -294,7 +295,7 @@ export async function renderProductsSection(){
       const priceRows = opts.map(po=>{
         const disc = activeDiscount(p.discounts, po.term);
         return `<div class="pr-price-row">
-          <span class="pr-price-term">${esc(po.label)}:</span>
+          <span class="pr-price-term">${esc(termLabel(po.term,po.label))}:</span>
           ${disc
             ? `<span class="pr-price-orig">AED ${po.price}</span><span class="pr-price-now">AED ${disc.price}</span>${disc.percentage?`<span class="text-dim text-xs">(${disc.percentage}% off)</span>`:''}`
             : `<span class="pr-price-now">AED ${po.price}</span>`}
@@ -364,7 +365,8 @@ export async function renderProductsSection(){
     <div class="pg-hdr">
       <div><h2>📦 Products & Pricing</h2><p class="pg-hdr-sub" id="pr-count">${products.length} product${products.length!==1?'s':''}</p></div>
       <div class="pg-actions">
-        ${isManager?`<button class="btn btn-primary btn-sm" id="btn-add-pr">+ New Product</button>`:''}
+        ${isManager?`<button class="btn btn-ghost btn-sm" id="btn-config-categories">⚙ Categories & Terms</button>
+        <button class="btn btn-primary btn-sm" id="btn-add-pr">+ New Product</button>`:''}
       </div>
     </div>
     <div class="filters" id="pr-cat-filters">
@@ -376,6 +378,7 @@ export async function renderProductsSection(){
   renderCards();
 
   ct.querySelector('#btn-add-pr')?.addEventListener('click',()=>showAddProductModal(onProductUpdate));
+  ct.querySelector('#btn-config-categories')?.addEventListener('click',()=>showCategoryConfigModal(products, ()=>renderProductsSection()));
   ct.querySelectorAll('[data-cat]').forEach(b=>b.addEventListener('click',()=>{
     catFilter = b.dataset.cat;
     ct.querySelectorAll('[data-cat]').forEach(x=>x.classList.toggle('active',x===b));
@@ -685,4 +688,125 @@ function showManageWaiversModal(product, onUpdate){
   }
 
   renderList();
+}
+
+// ── CATEGORIES & CONTRACT TERMS CONFIG (manager) — Session B4 Step 3 ───
+// Category rename = label edit only; ids are permanent once assigned
+// (js/orgConfig.js) — delete is blocked while any product still
+// references the id, with the blocking products listed (ARCHITECTURE.md
+// §12). Contract-term labels are an optional org-config override on top of
+// each product's own stored pricingOption.label (js/orgConfig.js
+// termLabel()) — no product data migration needed, renaming just adds/
+// updates the override.
+//
+// orgs/{orgId} has no published Firestore rule yet as of this step — its
+// rule ships in Step 8 (PAUSE POINT). Every write here goes through
+// withOrgConfigSave() so a permission-denied failure surfaces a clear
+// "not yet available" message instead of a raw Firestore error, without
+// blocking the rest of the panel.
+function saveOrgConfig(patch){
+  return dbSet('orgs', orgId, { ...(OC||{}), ...patch }, {skipAudit:true});
+}
+async function withOrgConfigSave(fn){
+  try {
+    await fn();
+    await loadOrgConfig();
+    return true;
+  } catch(e){
+    const denied = e.code === 'permission-denied' || /insufficient permissions/i.test(e.message||'');
+    toast(denied ? "Can't save yet — org config rules ship in Step 8 of this build. Not saved." : 'Error: '+e.message, 'err');
+    return false;
+  }
+}
+
+function showCategoryConfigModal(products, onSaved){
+  function countFor(catId){ return products.filter(p=>p.category===catId); }
+
+  function render(){
+    const categories = currentCategories();
+    const terms = {}; // term -> a stored label to use as the default/fallback
+    products.forEach(p => (p.pricingOptions||[]).forEach(po => { if(terms[po.term]==null) terms[po.term] = po.label; }));
+    const termLabels = currentTermLabels();
+
+    modal('Categories & Contract Terms', `
+      <p class="text-dim text-sm mb-12">Renaming a label updates it everywhere immediately (products, specialty checklists, dashboards). Category ids are permanent — delete only works once no product uses that category.</p>
+      <p><strong>Categories</strong></p>
+      <div class="tbl-wrap"><table><tbody>
+        ${categories.map(c=>{
+          const blockers = countFor(c.id);
+          const n = blockers.length;
+          const blockText = n ? `${n} product${n!==1?'s':''}: ${esc(blockers.slice(0,3).map(p=>p.name).join(', '))}${n>3?` +${n-3} more`:''}` : '—';
+          return `<tr>
+            <td style="width:35%"><input type="text" class="cc-cat-label" data-id="${c.id}" value="${esc(c.label)}"></td>
+            <td class="td-dim text-xs">${blockText}</td>
+            <td style="text-align:right;white-space:nowrap">
+              <button class="btn btn-ghost btn-xs" data-cat-save="${c.id}">Save</button>
+              <button class="btn btn-danger btn-xs" data-cat-del="${c.id}" ${n?'disabled title="In use — cannot delete"':''}>Delete</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody></table></div>
+      <div class="row2 mt-8">
+        <input type="text" id="cc-new-cat-label" placeholder="New category label">
+        <button class="btn btn-ghost btn-sm" id="cc-add-cat">+ Add Category</button>
+      </div>
+      <div class="divider"></div>
+      <p><strong>Contract Term Labels</strong></p>
+      ${Object.keys(terms).length ? `<div class="tbl-wrap"><table><tbody>
+        ${Object.entries(terms).map(([term,defaultLabel])=>`<tr>
+          <td class="td-dim" style="width:20%">${term==='0'?'No contract':term+' months'}</td>
+          <td style="width:50%"><input type="text" class="cc-term-label" data-term="${term}" value="${esc(termLabels[term] ?? defaultLabel)}"></td>
+          <td style="text-align:right"><button class="btn btn-ghost btn-xs" data-term-save="${term}">Save</button></td>
+        </tr>`).join('')}
+      </tbody></table></div>` : '<p class="text-dim text-xs">No pricing terms found on any product yet.</p>'}
+      <div class="flex gap-8 mt-12">
+        <button class="btn btn-ghost" onclick="document.getElementById('modal').style.display='none'">Close</button>
+      </div>`, true);
+
+    document.querySelectorAll('[data-cat-save]').forEach(b=>b.addEventListener('click', async ()=>{
+      const id = b.dataset.catSave;
+      const label = (document.querySelector(`.cc-cat-label[data-id="${id}"]`).value||'').trim();
+      if(!label){ toast('Label cannot be empty.','err'); return; }
+      const updated = categories.map(c=>c.id===id?{...c,label}:c);
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
+      if(ok){ toast('Category renamed.'); onSaved(); }
+      render();
+    }));
+
+    document.querySelectorAll('[data-cat-del]:not([disabled])').forEach(b=>{
+      b.addEventListener('click', ()=>{
+        const id = b.dataset.catDel;
+        confirmModal(`Delete "${esc(categories.find(c=>c.id===id)?.label||'')}"?`, 'This category is not used by any product and will be removed permanently.', async ()=>{
+          const updated = categories.filter(c=>c.id!==id);
+          const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
+          if(ok){ toast('Category deleted.'); onSaved(); }
+          render();
+        });
+      });
+    });
+
+    document.getElementById('cc-add-cat').onclick = async () => {
+      const label = v('cc-new-cat-label');
+      if(!label){ toast('Enter a label first.','err'); return; }
+      const id = label.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+      if(!id){ toast('Label must contain letters or numbers.','err'); return; }
+      if(categories.some(c=>c.id===id)){ toast('A category with this id already exists — use a different label.','err'); return; }
+      const updated = [...categories, {id, label:label.trim()}];
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
+      if(ok){ toast('Category added.'); onSaved(); }
+      render();
+    };
+
+    document.querySelectorAll('[data-term-save]').forEach(b=>b.addEventListener('click', async ()=>{
+      const term = b.dataset.termSave;
+      const label = (document.querySelector(`.cc-term-label[data-term="${term}"]`).value||'').trim();
+      if(!label){ toast('Label cannot be empty.','err'); return; }
+      const updated = { ...termLabels, [term]: label };
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({contractTermLabels:updated}));
+      if(ok){ toast('Term label updated.'); onSaved(); }
+      render();
+    }));
+  }
+
+  render();
 }
