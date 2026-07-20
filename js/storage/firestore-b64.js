@@ -86,16 +86,35 @@ export async function put({bundleId, docType, pages, agentId, teamId, version, e
 
 // ref: {bundleId, docType, pageIndex, version} → { mime, dataURL } for ONE
 // page. version defaults to 1 (the common case before any resubmission).
+//
+// Firestore denies (throws permission-denied) rather than resolving with an
+// exists()===false snapshot when a get() target doesn't exist and the
+// read rule's non-manager/backend clauses reference resource.data — those
+// clauses error out on a null resource instead of evaluating to false, and
+// an evaluation error denies the whole rule regardless of what a LATER `||`
+// branch would have allowed. That makes "probe the new id shape, fall back
+// to the legacy one if it's not there" throw instead of gracefully missing
+// for any role whose OWN clause needs resource.data (agent, team_lead) —
+// only manager/backend's clauses don't touch resource.data at all, so only
+// they got a clean miss. Caught here instead of relying on rule wording,
+// since a denied get() throws for every role the same way regardless.
+async function tryGetDoc(docId){
+  try {
+    return await getDoc(doc(db,'submissionDocs',docId));
+  } catch(e){
+    return null;
+  }
+}
 export async function get(ref){
   const version = ref.version || 1;
   const docId = `${ref.bundleId}_${ref.docType}_v${version}_${ref.pageIndex}`;
-  let snap = await getDoc(doc(db,'submissionDocs',docId));
-  if(!snap.exists() && version === 1){
+  let snap = await tryGetDoc(docId);
+  if((!snap || !snap.exists()) && version === 1){
     // Pre-versioning docs used the old id shape with no version segment.
     const legacyId = `${ref.bundleId}_${ref.docType}_${ref.pageIndex}`;
-    snap = await getDoc(doc(db,'submissionDocs',legacyId));
+    snap = await tryGetDoc(legacyId);
   }
-  if(!snap.exists()) return null;
+  if(!snap || !snap.exists()) return null;
   const d = snap.data();
   return { mime: d.mime, dataURL: `data:${d.mime};base64,${d.b64}` };
 }

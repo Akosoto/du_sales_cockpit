@@ -10,8 +10,17 @@ import * as storage from './storage/index.js';
 // Pinned deliberately — same reasoning as js/documents.js's pdf.js import:
 // never track "latest" for a CDN dependency loaded at runtime with no
 // build step to lock a version otherwise.
+//
+// jsPDF's own published ESM build (dist/jspdf.es.min.js) references
+// internal Babel helpers via bare npm-style specifiers
+// (e.g. "@babel/runtime/helpers/typeof") that only resolve inside a
+// bundler — a raw browser `import()` throws "Failed to resolve module
+// specifier" on it, found live during this session's regression. jsdelivr's
+// `+esm` endpoint re-bundles the whole package (all deps inlined) into one
+// browser-consumable ES module instead, which is what actually works
+// without a build step.
 const JSPDF_VERSION = '2.5.2';
-const JSPDF_URL = `https://cdn.jsdelivr.net/npm/jspdf@${JSPDF_VERSION}/dist/jspdf.es.min.js`;
+const JSPDF_URL = `https://cdn.jsdelivr.net/npm/jspdf@${JSPDF_VERSION}/+esm`;
 
 let jsPDFPromise = null;
 function loadJsPDF(){
