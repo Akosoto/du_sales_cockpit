@@ -386,11 +386,23 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
 // §4: "whole dept sees all submissions"), and isActiveBackend() doesn't
 // distinguish a coordinator/TL from a regular backend agent at the rule
 // level at all. See js/queue.js for which button each role actually sees.
+// Queryable claimedAt (Session B4 Step 4, dashboard data layer) — stamped
+// only on the unassigned->claimed transition, never on a later
+// reassignSubmission (which already has an owner), so it measures actual
+// queue wait (createdAt -> claimedAt) rather than resetting on every
+// handoff. Single-get on a known doc id — provable for any role per the
+// same denied-get()-on-nonexistent-doc pattern noted elsewhere
+// (js/storage/firestore-b64.js); this id always exists by the time a
+// backend user is claiming it. Pre-B4 claims and auto-assigned submissions
+// (assignedBackendAgent set at creation, never explicitly claimed) have no
+// claimedAt — the dashboard surfaces those as N/A rather than guessing.
 export async function claimSubmission(submissionId){
+  const snap = await getDoc(doc(db,'submissions',submissionId));
+  const wasUnclaimed = snap.exists() && !snap.data().assignedBackendAgent;
   return appendEvent(submissionId, {
     type: 'note',
     payload: { text: `Claimed by ${CP.name}` },
-    extraFields: { assignedBackendAgent: CU.uid }
+    extraFields: wasUnclaimed ? { assignedBackendAgent: CU.uid, claimedAt: now() } : { assignedBackendAgent: CU.uid }
   });
 }
 
