@@ -364,14 +364,28 @@ queries, never `fetchCompanies()`'s full scan:
   (originally scoped to precede the orgId migration — migration
   already ran and is verified safe, so this is now a forward-looking
   prerequisite for every future migration/import, not a live gate).
-- **Phase B — schema + submissions v2**: company enrichment (contacts,
-  address, accountCode, segment, expiries) + dedup by accountCode;
-  status+timeline replaces stages (one submission = one product line,
-  see §5); per-category item fields (GAID…); typeOfRequest; SPR;
-  accTransfer; verification gate; rejection reasons; doc-expiry
-  warnings; StorageAdapter + b64 driver + pdf.js; backend queue UI +
-  event logging; copy/export tools.
-- **Phase C — stats engine** (rollups incl. AED values + families).
+- **Phase B — schema + submissions v2 (COMPLETE).** Delivered across
+  three chunks (B1/B2/B3 — session planning vocabulary, not a
+  numbering this doc used before; recorded here so future sessions
+  reference the same labels):
+  - **B1 — submissions v2 core + company enrichment + scalable
+    lookups**: company enrichment (contacts, address, accountCode,
+    segment, expiries) + dedup by accountCode; status+timeline
+    replaces stages (one submission = one product line, see §5);
+    per-category item fields (GAID…); typeOfRequest; SPR; accTransfer;
+    verification gate; rejection reasons; doc-expiry warnings.
+  - **B2 — StorageAdapter + firestore-b64 + pdf.js + retention
+    sweep**: free-tier document storage (client-side compression,
+    pdf.js page rendering), manager-only retention sweep once a
+    bundle's submissions are all terminal.
+  - **B3 — backend queue UI + versioned resubmission + bundle PDF +
+    copy tools + the 0-series UX fixes**: Queue tab, claim/
+    reassignment, the submission action panel driving every
+    appendEvent action, versioned Fix & Resubmit, combined-PDF export,
+    backend document attachments, copy tools, plus the header team
+    name / close-to-submit flow / stage-dropdown / pipeline badge /
+    stale-team-data fixes found live alongside it.
+- **Phase C — stats engine** (rollups incl. AED values + families). **Next up.**
 - **Phase D — reports v1**: live team table, master tracker view,
   daily summary, rejection analytics, target/attainment incl. TL
   personal.
