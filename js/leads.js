@@ -14,6 +14,7 @@ import {
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
 import * as storage from './storage/index.js';
 import { downloadBundlePdf } from './pdfExport.js';
+import { categoryLabel } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // PIPELINE TAB
@@ -899,7 +900,7 @@ async function showSubmitModal(lead, byId){
         <label>Add Product</label>
         <div class="row2">
           <select id="sm-prod"><option value="">— Select product —</option>
-            ${products.map(p=>`<option value="${p.id}"${p.id===selectedProductId?' selected':''}>${esc(p.category)} — ${esc(p.name)}</option>`).join('')}
+            ${products.map(p=>`<option value="${p.id}"${p.id===selectedProductId?' selected':''}>${esc(categoryLabel(p.category))} — ${esc(p.name)}</option>`).join('')}
           </select>
           <select id="sm-term" ${selectedProduct?'':'disabled'}><option value="">${selectedProduct?'— Select term —':'— Select product first —'}</option></select>
         </div>
@@ -921,7 +922,7 @@ async function showSubmitModal(lead, byId){
       </div>
       <div id="sm-items" class="mt-12">
         ${items.length ? items.map(it=>`<div class="pr-sub-row flex" style="justify-content:space-between;align-items:center">
-          <div><strong>${esc(it.productName)}</strong> <span class="text-dim text-xs">${esc(it.category)} · Qty ${it.qty} · ${esc(it.typeOfRequest)}${it.sprFlag?' · SPR':''}</span></div>
+          <div><strong>${esc(it.productName)}</strong> <span class="text-dim text-xs">${esc(categoryLabel(it.category))} · Qty ${it.qty} · ${esc(it.typeOfRequest)}${it.sprFlag?' · SPR':''}</span></div>
           <div class="flex gap-8">
             <span class="text-dim text-xs">AED ${Number(it.mrc).toLocaleString()}/mo</span>
             <button type="button" class="btn btn-danger btn-xs" data-rm-item="${it.itemId}">Remove</button>
@@ -1118,7 +1119,7 @@ function showSubmissionTimelineModal(lead, submissions){
             <strong style="font-size:13px">${esc(l.productName)}</strong>
             <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
           </div>
-          <div class="text-dim text-xs mt-4">${esc(l.category)} · Qty ${l.qty} · AED ${Number(l.mrc).toLocaleString()}/mo</div>
+          <div class="text-dim text-xs mt-4">${esc(categoryLabel(l.category))} · Qty ${l.qty} · AED ${Number(l.mrc).toLocaleString()}/mo</div>
           ${(l.requiredDocs||[]).length ? `<div class="mt-8">
             ${l.requiredDocs.map(rd => `<div class="text-xs mt-4" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
               <span>${esc(rd.type)}</span>

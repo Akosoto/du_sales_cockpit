@@ -7,6 +7,7 @@ import {
 import { dbSet } from './db.js';
 import { v, now, toast, modal, closeModal } from './helpers.js';
 import { renderNav, switchTab } from './main.js';
+import { loadOrgConfig } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // CHANGE PASSWORD
@@ -122,6 +123,14 @@ export async function showApp(){
   rp.textContent = `● ${roleLabel}`;
   rp.className = `role-pill ${role}`;
   document.getElementById('hdr-name').textContent = CP.name;
+
+  // Awaited before the first tab renders — category labels (Products,
+  // Org's specialty checklists) need real data on first paint, not a
+  // flash of defaults that then jumps to the manager-edited label on the
+  // next re-render. Falls back to DEFAULT_CATEGORIES internally on any
+  // failure, so this never blocks login on a slow/missing orgs/{orgId}.
+  await loadOrgConfig();
+
   renderNav();
   switchTab(role === 'manager' ? 'org' : 'dashboard');
 

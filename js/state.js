@@ -70,10 +70,13 @@ export const ORG_DEFAULTS = {
   ],
   // Per-category optional fields the Submit-to-Backend form offers for a
   // line item (ARCHITECTURE.md §3 categoryFields). Starter/Essential/Ultimate
-  // are fiber/internet plans (gaid); Mobile is SIM-based.
+  // are fiber/internet plans (gaid); Mobile is SIM-based. Keyed by category
+  // ID (Session B4 category-identity refactor — see js/orgConfig.js), NOT
+  // the display label; this object itself isn't org-editable this session,
+  // so it stays a hardcoded JS constant rather than moving into Firestore.
   itemFieldsByCategory: {
-    Starter: ['gaid'], Essential: ['gaid'], Ultimate: ['gaid'],
-    Mobile: ['msisdn','simSerial','passcode','commitmentPlan','handset']
+    starter: ['gaid'], essential: ['gaid'], ultimate: ['gaid'],
+    mobile: ['msisdn','simSerial','passcode','commitmentPlan','handset']
   },
   // Document retention window (ARCHITECTURE.md §6) — the Org tab's cleanup
   // sweep only touches bundles where EVERY sibling submission has been
@@ -89,6 +92,8 @@ export const ORG_DEFAULTS = {
 export let CU  = null;   // Firebase Auth user
 export let CP  = null;   // Firestore profile
 export let TAB = '';
+export let OC  = null;   // Org config (orgs/{orgId} doc — categories today; Session B4)
 
 export function setUser(u, p){ CU = u; CP = p; }
 export function setTab(id){ TAB = id; }
+export function setOrgConfig(oc){ OC = oc; }

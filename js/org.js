@@ -1,13 +1,13 @@
 import {
   db, CU, CP, auth, auth2, ORG_DEFAULTS,
-  collection, query, where, getDocs,
+  collection, query, where, getDocs, doc, getDoc,
   createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from './state.js';
-import { dbAdd, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete, logBulkAudit } from './db.js';
+import { dbAdd, dbSet, dbUpdate, newBatch, batchSet, batchUpdate, batchDelete, logBulkAudit } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal, calculateTLTarget } from './helpers.js';
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions, hasPermission } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
-import { PRODUCT_CATEGORIES } from './products.js';
+import { currentCategories, categoryLabel, findCategoryIdByLabel, loadOrgConfig, DEFAULT_CATEGORIES } from './orgConfig.js';
 import * as storage from './storage/index.js';
 import { orgId } from '../config.js';
 
@@ -43,14 +43,16 @@ async function commitBulkOps(ops, description){
 }
 export async function renderOrgTab(){
   const ct = document.getElementById('content');
-  const [tSnap, uSnap, lSnap, companies] = await Promise.all([
+  const [tSnap, uSnap, lSnap, companies, pSnap] = await Promise.all([
     getDocs(collection(db,'teams')),
     getDocs(collection(db,'users')),
     getDocs(collection(db,'leads')),
-    fetchCompanies()
+    fetchCompanies(),
+    getDocs(collection(db,'products'))
   ]);
   const teams = tSnap.docs.map(d=>({id:d.id,...d.data()}));
   const users = uSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const products = pSnap.docs.map(d=>({id:d.id,...d.data()}));
   const tls   = users.filter(u=>u.role==='team_lead');
   const ags   = users.filter(u=>u.role==='agent');
   const byId  = {}; users.forEach(u=>byId[u.id]=u);
@@ -73,6 +75,16 @@ export async function renderOrgTab(){
   // proxy signal — the actual migration below covers all 8 collections
   // regardless of which ones triggered this banner.
   const needsOrgIdMigration = teams.some(t=>!t.orgId) || users.some(u=>!u.orgId) || allLeads.some(l=>!l.orgId) || companies.some(c=>!c.orgId);
+  // Category identity migration (Session B4 Step 2) — products.category and
+  // users.specialties[] used to store the display NAME directly ('Starter',
+  // 'Mobile', ...); they now store the permanent id ('starter','mobile',...)
+  // resolved via categoryLabel() at render time. Detected from data already
+  // fetched here (no extra reads) by checking for any value that isn't one
+  // of the known ids — cheap and catches both legacy labels and any
+  // unexpected custom value the migration will need to flag.
+  const CATEGORY_IDS = new Set(DEFAULT_CATEGORIES.map(c=>c.id));
+  const needsCategoryMigration = products.some(p => p.category && !CATEGORY_IDS.has(p.category))
+    || users.some(u => (u.specialties||[]).some(s => !CATEGORY_IDS.has(s)));
 
   function perfStats(uids){
     const l = allLeads.filter(x=>uids.includes(x.assignedTo));
@@ -119,6 +131,11 @@ export async function renderOrgTab(){
     ${needsOrgIdMigration ? `<div class="seed-banner">
       <p>Some existing records predate multi-tenant support and are missing an <strong>orgId</strong> tag. This stamps <code>orgId: "${esc(orgId)}"</code> on every existing document across users, teams, leads, companies, channels, scripts, products, and submissions — safe to re-run, and required before the Firestore rules can enforce org isolation.</p>
       <button class="btn btn-primary btn-sm" id="btn-orgid-migration">🏷️ Stamp orgId on Existing Data</button>
+    </div>` : ''}
+
+    ${needsCategoryMigration ? `<div class="seed-banner">
+      <p>Some existing product and specialty records predate the category-id refactor and still store the category as a name (e.g. "Starter") instead of its permanent id. This converts <code>products.category</code> and <code>users.specialties[]</code> to ids and creates the <code>orgs</code> config document if it doesn't exist yet — safe to re-run. Shows a preview before writing anything.</p>
+      <button class="btn btn-primary btn-sm" id="btn-category-migration">🏷️ Migrate Categories to IDs</button>
     </div>` : ''}
 
     <div class="stats-row">
@@ -286,6 +303,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-repair')?.addEventListener('click',   () => repairLeadTeamData(needsRepair, byId));
   ct.querySelector('#btn-backfill-companies')?.addEventListener('click', () => runCompanyBackfill(needsCompanyBackfill));
   ct.querySelector('#btn-orgid-migration')?.addEventListener('click', () => runOrgIdMigration());
+  ct.querySelector('#btn-category-migration')?.addEventListener('click', () => showCategoryMigrationPreview());
   ct.querySelector('#btn-backup-export')?.addEventListener('click', () => runBackupExport());
   ct.querySelector('#btn-doc-retention-sweep')?.addEventListener('click', () => runDocumentRetentionSweep());
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies, users)));
@@ -503,8 +521,8 @@ function showAddUserModal(role, teams, users=[]){
     <div class="field" id="au-backend-wrap" style="display:none">
       <label>Specialties <span class="text-dim">(leave empty = generalist, handles anything)</span></label>
       <div class="flex gap-12" style="flex-wrap:wrap">
-        ${PRODUCT_CATEGORIES.map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
-          <input type="checkbox" class="au-specialty" value="${c}" style="width:auto;margin:0;cursor:pointer">${c}
+        ${currentCategories().map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
+          <input type="checkbox" class="au-specialty" value="${c.id}" style="width:auto;margin:0;cursor:pointer">${esc(c.label)}
         </label>`).join('')}
       </div>
       <div class="flex gap-8 mt-8">
@@ -612,8 +630,8 @@ function showEditUserModal(userId, users, teams){
     <div class="field" id="eu-backend-wrap" style="${!isBackendAg?'display:none':''}">
       <label>Specialties <span class="text-dim">(leave empty = generalist, handles anything)</span></label>
       <div class="flex gap-12" style="flex-wrap:wrap">
-        ${PRODUCT_CATEGORIES.map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
-          <input type="checkbox" class="eu-specialty" value="${c}" ${(u.specialties||[]).includes(c)?'checked':''} style="width:auto;margin:0;cursor:pointer">${c}
+        ${currentCategories().map(c=>`<label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer">
+          <input type="checkbox" class="eu-specialty" value="${c.id}" ${(u.specialties||[]).includes(c.id)?'checked':''} style="width:auto;margin:0;cursor:pointer">${esc(c.label)}
         </label>`).join('')}
       </div>
       <div class="flex gap-8 mt-8">
@@ -885,6 +903,130 @@ async function runOrgIdMigration(){
   } catch(e){
     toast('Error: '+e.message,'err');
     if(btn){ btn.disabled=false; btn.textContent='🏷️ Stamp orgId on Existing Data'; }
+  }
+}
+
+// Category identity migration (Session B4 Step 2, ARCHITECTURE.md §12) —
+// one-time conversion of products.category and users.specialties[] from
+// display-name strings to the new permanent category ids (js/orgConfig.js).
+// findCategoryIdByLabel() does the name->id lookup; any value that matches
+// neither a known id nor a known label is left untouched and surfaced as a
+// warning in the preview rather than silently dropped or guessed at.
+async function computeCategoryMigrationPlan(){
+  const CATEGORY_IDS = new Set(DEFAULT_CATEGORIES.map(c=>c.id));
+  const [pSnap, uSnap] = await Promise.all([
+    getDocs(collection(db,'products')),
+    getDocs(collection(db,'users'))
+  ]);
+  const products = pSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const users    = uSnap.docs.map(d=>({id:d.id,...d.data()}));
+
+  const productOps = [], unmappedProducts = [];
+  products.forEach(p => {
+    if(!p.category || CATEGORY_IDS.has(p.category)) return;
+    const id = findCategoryIdByLabel(p.category);
+    if(id) productOps.push({ id:p.id, name:p.name, from:p.category, to:id });
+    else unmappedProducts.push({ id:p.id, name:p.name, value:p.category });
+  });
+
+  const userOps = [], unmappedSpecialties = [];
+  users.forEach(u => {
+    const specs = u.specialties || [];
+    if(!specs.length) return;
+    let changed = false;
+    const to = specs.map(s => {
+      if(CATEGORY_IDS.has(s)) return s;
+      const id = findCategoryIdByLabel(s);
+      if(id){ changed = true; return id; }
+      unmappedSpecialties.push({ id:u.id, name:u.name, value:s });
+      return s;
+    });
+    if(changed) userOps.push({ id:u.id, name:u.name, from:specs, to });
+  });
+
+  // orgs/{orgId} has no published rule yet as of Step 2 — it ships in Step
+  // 8 (PAUSE POINT). A denied read here just means "doesn't exist / not
+  // reachable yet", same fallback loadOrgConfig() already uses — this must
+  // not block the product/user conversion below, which doesn't depend on it.
+  let orgDocExists = false;
+  try { orgDocExists = (await getDoc(doc(db,'orgs',orgId))).exists(); } catch(e){ /* rule not published yet — treat as not-existing */ }
+  return { productOps, userOps, unmappedProducts, unmappedSpecialties, orgDocExists };
+}
+
+function showCategoryMigrationPreview(){
+  const box = document.getElementById('content');
+  const btn = document.getElementById('btn-category-migration');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Computing preview…'; }
+  computeCategoryMigrationPlan().then(plan => {
+    if(btn){ btn.disabled = false; btn.textContent = '🏷️ Migrate Categories to IDs'; }
+    const { productOps, userOps, unmappedProducts, unmappedSpecialties, orgDocExists } = plan;
+    const rows = (list, cols) => list.length
+      ? `<div class="tbl-wrap"><table><tbody>${list.map(cols).join('')}</tbody></table></div>`
+      : '<p class="text-dim" style="font-size:.85rem">None.</p>';
+    modal('Migrate Categories to IDs — Preview', `
+      <p class="text-dim" style="margin-bottom:12px">Dry run only — nothing has been written yet.</p>
+      ${orgDocExists ? '' : '<p><strong>orgs</strong> config document does not exist yet — will attempt to create it with the default category list (no-op until its Firestore rule ships in Step 8; the app already works off defaults either way).</p>'}
+      <p style="margin-top:12px"><strong>Products to convert (${productOps.length})</strong></p>
+      ${rows(productOps, o=>`<tr><td>${esc(o.name)}</td><td class="td-dim">${esc(o.from)} → ${esc(o.to)}</td></tr>`)}
+      <p style="margin-top:12px"><strong>Users with specialties to convert (${userOps.length})</strong></p>
+      ${rows(userOps, o=>`<tr><td>${esc(o.name)}</td><td class="td-dim">${esc(o.from.join(', '))} → ${esc(o.to.join(', '))}</td></tr>`)}
+      ${unmappedProducts.length ? `<p style="margin-top:12px;color:var(--amber)"><strong>⚠ Unrecognized product categories (left as-is, ${unmappedProducts.length})</strong></p>
+        ${rows(unmappedProducts, o=>`<tr><td>${esc(o.name)}</td><td class="td-dim">${esc(o.value)}</td></tr>`)}` : ''}
+      ${unmappedSpecialties.length ? `<p style="margin-top:12px;color:var(--amber)"><strong>⚠ Unrecognized specialty values (left as-is, ${unmappedSpecialties.length})</strong></p>
+        ${rows(unmappedSpecialties, o=>`<tr><td>${esc(o.name)}</td><td class="td-dim">${esc(o.value)}</td></tr>`)}` : ''}
+      <div class="flex gap-8 mt-12">
+        <button class="btn btn-primary" id="btn-category-migration-run" ${(productOps.length||userOps.length||!orgDocExists)?'':'disabled'}>Run Migration</button>
+        <button class="btn btn-ghost" onclick="document.getElementById('modal').style.display='none'">Cancel</button>
+      </div>`, true);
+    document.getElementById('btn-category-migration-run').onclick = () => runCategoryMigration(plan);
+  }).catch(e => {
+    if(btn){ btn.disabled = false; btn.textContent = '🏷️ Migrate Categories to IDs'; }
+    toast('Error: '+e.message,'err');
+  });
+}
+
+async function runCategoryMigration(plan){
+  const runBtn = document.getElementById('btn-category-migration-run');
+  if(runBtn){ runBtn.disabled = true; runBtn.textContent = '⏳ Migrating…'; }
+  try {
+    const { productOps, userOps, orgDocExists } = plan;
+    // skipAudit: pure schema backfill (same reasoning as runOrgIdMigration
+    // above), summarized in one logBulkAudit entry instead of per-doc.
+    // Best-effort: orgs/{orgId} rules ship in Step 8, not this step — if the
+    // write is denied because that rule doesn't exist yet, the app already
+    // falls back to DEFAULT_CATEGORIES (js/orgConfig.js), so this must not
+    // block the product/user conversion below. Re-running this migration
+    // after Step 8 publishes the rule will create the doc then.
+    let orgDocWritten = orgDocExists;
+    if(!orgDocExists){
+      try { await dbSet('orgs', orgId, { categories: DEFAULT_CATEGORIES }, {skipAudit:true}); orgDocWritten = true; }
+      catch(e){ /* orgs rules not published yet (Step 8) — defaults still apply */ }
+    }
+
+    let converted = 0;
+    const CHUNK = 200;
+    const allOps = [
+      ...productOps.map(o => ({ collectionName:'products', id:o.id, data:{ category:o.to } })),
+      ...userOps.map(o => ({ collectionName:'users', id:o.id, data:{ specialties:o.to } }))
+    ];
+    for(let i=0;i<allOps.length;i+=CHUNK){
+      const bat = newBatch();
+      allOps.slice(i,i+CHUNK).forEach(op => {
+        batchUpdate(bat, op.collectionName, op.id, op.data, {skipAudit:true});
+        converted++;
+      });
+      await bat.commit();
+    }
+    const orgDocPending = !orgDocExists && !orgDocWritten;
+    const auditNote = orgDocExists ? '' : (orgDocWritten ? '; created orgs config' : '; orgs config not created — rules pending (Step 8)');
+    if(converted || orgDocWritten) await logBulkAudit(`Category migration: converted ${converted} document(s)${auditNote}`, converted);
+    closeModal();
+    toast(`✅ Migrated ${converted} document${converted!==1?'s':''} to category ids.${orgDocPending?' orgs config not yet created (Step 8).':''}`);
+    await loadOrgConfig();
+    renderOrgTab();
+  } catch(e){
+    toast('Error: '+e.message,'err');
+    if(runBtn){ runBtn.disabled = false; runBtn.textContent = 'Run Migration'; }
   }
 }
 

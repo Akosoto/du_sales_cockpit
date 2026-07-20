@@ -11,6 +11,7 @@ import {
 import * as storage from './storage/index.js';
 import { captureFile } from './documents.js';
 import { downloadBundlePdf } from './pdfExport.js';
+import { categoryLabel } from './orgConfig.js';
 
 // Fixed field order for "Copy All" (step 6) — best-guess order for pasting
 // into du's ticket form. TODO: make this org-configurable once we actually
@@ -27,7 +28,7 @@ const COPY_ALL_FIELDS = [
   { label: 'Address', get: (s,c) => c?.addressBlock?.full || [c?.addressBlock?.building, c?.addressBlock?.street, c?.addressBlock?.city, c?.addressBlock?.emirate].filter(Boolean).join(', ') },
   { label: 'PO Box', get: (s,c) => c?.addressBlock?.poBox },
   { label: 'Product', get: (s) => s.productName },
-  { label: 'Category', get: (s) => s.category },
+  { label: 'Category', get: (s) => categoryLabel(s.category) },
   { label: 'Qty', get: (s) => s.qty },
   { label: 'MRC', get: (s) => s.mrc!=null ? `AED ${s.mrc}` : '' },
   { label: 'Type of Request', get: (s) => s.typeOfRequest },
@@ -169,7 +170,7 @@ export async function renderQueueTab(){
         <tbody>
           ${list.map(s=>`<tr>
             <td class="td-company">${esc(companyById[s.companyId]?.name || '—')}</td>
-            <td class="td-dim">${esc(s.productName||'—')} <span class="text-dim text-xs">${esc(s.category||'')}</span></td>
+            <td class="td-dim">${esc(s.productName||'—')} <span class="text-dim text-xs">${esc(categoryLabel(s.category)||'')}</span></td>
             <td class="td-dim">${esc(s.agentName||'—')}</td>
             <td><span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</span></td>
             <td class="td-dim text-sm">${s.assignedBackendAgent ? esc(agentName(s.assignedBackendAgent)) : '<span class="text-dim">Unassigned</span>'}</td>
@@ -296,7 +297,7 @@ async function showActionPanel(sub, company, onChange){
       <div class="divider"></div>
       <div class="info-grid mb-12">
         ${copyField('Product', s.productName)}
-        <div class="info-item"><div class="lbl">Category</div><div class="val">${esc(s.category)}</div></div>
+        <div class="info-item"><div class="lbl">Category</div><div class="val">${esc(categoryLabel(s.category))}</div></div>
         ${copyField('Qty', s.qty)}
         <div class="info-item"><div class="lbl">MRC</div><div class="val">AED ${Number(s.mrc).toLocaleString()}/mo</div></div>
         <div class="info-item"><div class="lbl">Type of Request</div><div class="val">${esc(s.typeOfRequest)}</div></div>

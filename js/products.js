@@ -4,10 +4,7 @@ import {
 } from './state.js';
 import { dbAdd, dbUpdate, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
-
-// Shared with js/org.js (backend agent specialties checklist) — keep this the
-// one source of truth for category names so the two never drift apart.
-export const PRODUCT_CATEGORIES = ['Starter','Essential','Ultimate','Mobile'];
+import { currentCategories, categoryLabel } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // PRODUCTS — SEED DATA  (du Business, June 2026)
@@ -16,7 +13,7 @@ export const PRODUCT_CATEGORIES = ['Starter','Essential','Ultimate','Mobile'];
 // ════════════════════════════════════════════════════
 const SEED_PRODUCTS = [
   // ── Starter ──────────────────────────────────────
-  { category:'Starter', name:'Starter',
+  { category:'starter', name:'Starter',
     pricingOptions:[{term:12,label:'12-month contract',price:299}],
     activationFee:200,
     specs:{ 'Internet':'Unlimited usage, full speed', 'Router':'5G enabled, Gigabit Ethernet port', 'Voice':'Not included' },
@@ -27,7 +24,7 @@ const SEED_PRODUCTS = [
       conditions:'Promotional price applies for the full 12-month contract period.',
       createdBy:'system', createdByName:'Seed', createdAt:'2025-07-01T00:00:00.000Z' }] },
 
-  { category:'Starter', name:'Starter Pro',
+  { category:'starter', name:'Starter Pro',
     pricingOptions:[{term:12,label:'12-month contract',price:499}],
     activationFee:200,
     specs:{ 'Internet':'Unlimited usage, full speed', 'Router':'5G enabled, Gigabit Ethernet port',
@@ -41,35 +38,35 @@ const SEED_PRODUCTS = [
       createdBy:'system', createdByName:'Seed', createdAt:'2025-07-01T00:00:00.000Z' }] },
 
   // ── Essential ────────────────────────────────────
-  { category:'Essential', name:'Essential 80 Mbps',
+  { category:'essential', name:'Essential 80 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:810},{term:0,label:'No contract',price:1450}],
     activationFee:200, specs:{ 'Speed':'80/10 Mbps' },
     sourceDoc:'AP-ENT-BUS-FIX-SER-MAY2019',
     notes:'Source sheet dated 2019 — confirm against current du.ae pricing before quoting.',
     discounts:[] },
 
-  { category:'Essential', name:'Essential 120 Mbps',
+  { category:'essential', name:'Essential 120 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:950},{term:0,label:'No contract',price:1850}],
     activationFee:200, specs:{ 'Speed':'120/15 Mbps' },
     sourceDoc:'AP-ENT-BUS-FIX-SER-MAY2019',
     notes:'Subject to technical availability and site survey. Source sheet dated 2019 — confirm before quoting.',
     discounts:[] },
 
-  { category:'Essential', name:'Essential 175 Mbps',
+  { category:'essential', name:'Essential 175 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:1250},{term:0,label:'No contract',price:2250}],
     activationFee:200, specs:{ 'Speed':'175/25 Mbps' },
     sourceDoc:'AP-ENT-BUS-FIX-SER-MAY2019',
     notes:'Subject to technical availability and site survey. Source sheet dated 2019 — confirm before quoting.',
     discounts:[] },
 
-  { category:'Essential', name:'Essential 275 Mbps',
+  { category:'essential', name:'Essential 275 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:1550},{term:0,label:'No contract',price:2850}],
     activationFee:200, specs:{ 'Speed':'275/30 Mbps' },
     sourceDoc:'AP-ENT-BUS-FIX-SER-MAY2019',
     notes:'Subject to technical availability and site survey. Source sheet dated 2019 — confirm before quoting.',
     discounts:[] },
 
-  { category:'Essential', name:'Essential 500 Mbps',
+  { category:'essential', name:'Essential 500 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:2990},{term:0,label:'No contract',price:3650}],
     activationFee:200, specs:{ 'Speed':'500/50 Mbps' },
     sourceDoc:'AP-ENT-BUS-FIX-SER-MAY2019',
@@ -77,7 +74,7 @@ const SEED_PRODUCTS = [
     discounts:[] },
 
   // ── Ultimate ─────────────────────────────────────
-  { category:'Ultimate', name:'Ultimate 200 Mbps',
+  { category:'ultimate', name:'Ultimate 200 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:1049},{term:24,label:'24-month contract',price:949}],
     activationFee:200,
     specs:{ 'Speed':'200/40 Mbps','Router':'Basic','Business Voice':'1 Business Line','Desk Phone':'1 Cordless Phone',
@@ -86,7 +83,7 @@ const SEED_PRODUCTS = [
     notes:'All Ultimate tiers include: unlimited landline + 100 mobile + 100 intl. minutes, firewall, 1-yr e-Commerce Starter Kit, 1 .ae domain.',
     discounts:[] },
 
-  { category:'Ultimate', name:'Ultimate 400 Mbps',
+  { category:'ultimate', name:'Ultimate 400 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:1399},{term:24,label:'24-month contract',price:1299}],
     activationFee:200,
     specs:{ 'Speed':'400/80 Mbps','Router':'Advanced','Business Voice':'1 Business Line','Desk Phone':'1 Cordless Phone',
@@ -102,7 +99,7 @@ const SEED_PRODUCTS = [
       conditions:'30% off for the first 6 months, reverts to standard rate for the remaining term. Eligibility determined by Business Management — selected customers only.',
       createdBy:'system', createdByName:'Seed', createdAt:'2025-09-01T00:00:00.000Z' }] },
 
-  { category:'Ultimate', name:'Ultimate 600 Mbps',
+  { category:'ultimate', name:'Ultimate 600 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:1799},{term:24,label:'24-month contract',price:1699}],
     activationFee:200,
     specs:{ 'Speed':'600/120 Mbps','Router':'Advanced','Business Voice':'1 Business Line','Desk Phone':'1 Cordless Phone',
@@ -118,7 +115,7 @@ const SEED_PRODUCTS = [
       conditions:'30% off for the first 6 months, reverts to standard rate for the remaining term. Eligibility determined by Business Management — selected customers only.',
       createdBy:'system', createdByName:'Seed', createdAt:'2025-09-01T00:00:00.000Z' }] },
 
-  { category:'Ultimate', name:'Ultimate 800 Mbps',
+  { category:'ultimate', name:'Ultimate 800 Mbps',
     pricingOptions:[{term:12,label:'12-month contract',price:2399},{term:24,label:'24-month contract',price:2299}],
     activationFee:200,
     specs:{ 'Speed':'800/160 Mbps','Router':'Pro','Business Voice':'1 Trunk Line + 1 Extension','Desk Phone':'2 Cordless Phones',
@@ -134,7 +131,7 @@ const SEED_PRODUCTS = [
       conditions:'60% off for the first 3 months, reverts to standard rate for the remaining term. Eligibility determined by Business Management — selected customers only.',
       createdBy:'system', createdByName:'Seed', createdAt:'2025-09-01T00:00:00.000Z' }] },
 
-  { category:'Ultimate', name:'Ultimate 1 Gbps',
+  { category:'ultimate', name:'Ultimate 1 Gbps',
     pricingOptions:[{term:12,label:'12-month contract',price:3299},{term:24,label:'24-month contract',price:3149}],
     activationFee:200,
     specs:{ 'Speed':'1 Gbps/200 Mbps','Router':'Pro','Business Voice':'1 Trunk Line + 2 Extensions','Desk Phone':'3 Cordless Phones',
@@ -151,7 +148,7 @@ const SEED_PRODUCTS = [
       createdBy:'system', createdByName:'Seed', createdAt:'2025-09-01T00:00:00.000Z' }] },
 
   // ── Mobile (BMP) ─────────────────────────────────
-  { category:'Mobile', name:'BMP 100 — National',
+  { category:'mobile', name:'BMP 100 — National',
     pricingOptions:[{term:12,label:'12-month contract',price:100},{term:0,label:'No contract',price:125}],
     activationFee:55,
     specs:{ 'National minutes':'1,100','International minutes':'Not included','National data':'8 GB','National SMS':'130',
@@ -160,7 +157,7 @@ const SEED_PRODUCTS = [
     notes:'Internet calling pack +AED 50/mo (national+intl. plans get this free) — tracked as add-on, not in core pricing.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 200 — National',
+  { category:'mobile', name:'BMP 200 — National',
     pricingOptions:[{term:12,label:'12-month contract',price:200},{term:0,label:'No contract',price:225}],
     activationFee:55,
     specs:{ 'National minutes':'2,000','International minutes':'Not included','National data':'18 GB','National SMS':'200',
@@ -168,7 +165,7 @@ const SEED_PRODUCTS = [
     sourceDoc:'BMP_2024', notes:'Internet calling pack free on this tier.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 100 — National & International',
+  { category:'mobile', name:'BMP 100 — National & International',
     pricingOptions:[{term:12,label:'12-month contract',price:100},{term:0,label:'No contract',price:125}],
     activationFee:55,
     specs:{ 'National minutes':'600','International minutes':'200','National data':'8 GB','National SMS':'65','International SMS':'65',
@@ -177,7 +174,7 @@ const SEED_PRODUCTS = [
     notes:'Internet calling pack +AED 50/mo — tracked as add-on, not in core pricing.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 200 — National & International',
+  { category:'mobile', name:'BMP 200 — National & International',
     pricingOptions:[{term:12,label:'12-month contract',price:200},{term:0,label:'No contract',price:225}],
     activationFee:55,
     specs:{ 'National minutes':'1,000','International minutes':'600','National data':'18 GB','National SMS':'130','International SMS':'130',
@@ -185,7 +182,7 @@ const SEED_PRODUCTS = [
     sourceDoc:'BMP_2024', notes:'Internet calling pack free on this tier.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 325',
+  { category:'mobile', name:'BMP 325',
     pricingOptions:[{term:12,label:'12-month contract',price:325},{term:0,label:'No contract',price:350}],
     activationFee:55,
     specs:{ 'National minutes':'Unlimited','International minutes':'410','National data':'55 GB','National/Intl SMS':'130/130',
@@ -194,7 +191,7 @@ const SEED_PRODUCTS = [
     notes:'Identical entitlements whether booked as National or National+International — single SKU. Intl. per-minute rate carries its own promo (AED 2.2→1/min) tracked separately, not as a plan discount.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 600',
+  { category:'mobile', name:'BMP 600',
     pricingOptions:[{term:12,label:'12-month contract',price:600},{term:0,label:'No contract',price:700}],
     activationFee:55,
     specs:{ 'National minutes':'Unlimited','International minutes':'Unlimited','National data':'85 GB','National/Intl SMS':'300/300',
@@ -203,7 +200,7 @@ const SEED_PRODUCTS = [
     notes:'Identical entitlements whether booked as National or National+International — single SKU. Intl. per-minute rate carries its own promo (AED 1.8→1/min) tracked separately, not as a plan discount.',
     discounts:[] },
 
-  { category:'Mobile', name:'BMP 900',
+  { category:'mobile', name:'BMP 900',
     pricingOptions:[{term:12,label:'12-month contract',price:900},{term:0,label:'No contract',price:1000}],
     activationFee:55,
     specs:{ 'National minutes':'Unlimited','International minutes':'Unlimited','National data':'Unlimited','National/Intl SMS':'300/300',
@@ -269,7 +266,7 @@ export async function renderProductsSection(){
   const snap = await getDocs(query(collection(db,'products'),where('active','==',true)));
   let products = snap.docs.map(d=>({id:d.id,...d.data()}));
 
-  const categories = PRODUCT_CATEGORIES;
+  const categories = currentCategories(); // [{id,label}] — org-config, Session B4
   let catFilter = '';
 
   function filtered(){ return catFilter ? products.filter(p=>p.category===catFilter) : products; }
@@ -312,7 +309,7 @@ export async function renderProductsSection(){
       const wvCount   = (p.monthlyWaivers||[]).length;
       return `<div class="pr-card">
         <div class="flex gap-8" style="flex-wrap:wrap;justify-content:space-between">
-          <span class="pr-cat ${prCatClass(p.category)}">${esc(p.category)}</span>
+          <span class="pr-cat ${prCatClass(p.category)}">${esc(categoryLabel(p.category))}</span>
           <div class="flex gap-8">
             ${discCount?`<span class="pr-sub-badge pr-sub-discount">${discCount} discount${discCount!==1?'s':''}</span>`:''}
             ${wvCount?`<span class="pr-sub-badge pr-sub-waiver">${wvCount} waiver${wvCount!==1?'s':''}</span>`:''}
@@ -372,7 +369,7 @@ export async function renderProductsSection(){
     </div>
     <div class="filters" id="pr-cat-filters">
       <button class="ch-tag active" data-cat="">All</button>
-      ${categories.map(c=>`<button class="ch-tag" data-cat="${c}">${c}</button>`).join('')}
+      ${categories.map(c=>`<button class="ch-tag" data-cat="${c.id}">${esc(c.label)}</button>`).join('')}
     </div>
     <div id="pr-list"></div>`;
 
@@ -392,10 +389,7 @@ function showAddProductModal(onUpdate){
     <div class="row2">
       <div class="field"><label>Category*</label>
         <select id="np-cat">
-          <option value="Starter">Starter</option>
-          <option value="Essential">Essential</option>
-          <option value="Ultimate">Ultimate</option>
-          <option value="Mobile">Mobile</option>
+          ${currentCategories().map(c=>`<option value="${c.id}">${esc(c.label)}</option>`).join('')}
         </select>
       </div>
       <div class="field"><label>Name*</label><input type="text" id="np-name" placeholder="e.g. Essential 80 Mbps"></div>
@@ -457,7 +451,7 @@ function showEditProductModal(p, onUpdate){
     <div class="row2">
       <div class="field"><label>Category*</label>
         <select id="ep-cat">
-          ${PRODUCT_CATEGORIES.map(c=>`<option value="${c}"${p.category===c?' selected':''}>${c}</option>`).join('')}
+          ${currentCategories().map(c=>`<option value="${c.id}"${p.category===c.id?' selected':''}>${esc(c.label)}</option>`).join('')}
         </select>
       </div>
       <div class="field"><label>Name*</label><input type="text" id="ep-name" value="${esc(p.name)}"></div>
