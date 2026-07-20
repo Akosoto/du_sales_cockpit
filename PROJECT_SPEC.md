@@ -52,13 +52,33 @@ js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLead
                         collection), commitBulkOps (shared chunked-bulk-commit helper for this
                         file's 4 cascades — team delete, member removal, hard-delete,
                         department-change — CHUNK 200 + skipAudit + one summary logBulkAudit call)
-js/leads.js           — Pipeline tab (incl. bulk-assign), lead modal, add-lead modal (type-ahead
-                        company picker via companies.js's searchCompanies — see below), Submit to
-                        Backend modal (bundle creation, one submission doc per product line), and
-                        the read-only Submission Timeline view (showSubmissionTimelineModal).
-                        Pipeline tab is server-side paginated, 25 leads/page, numbered page
-                        buttons; requires 5 Firestore composite indexes (created, see Firestore
-                        Security Rules below).
+js/leads.js           — Pipeline tab (incl. bulk-assign, submissionSummary badge on Closed rows),
+                        lead modal (close-to-submit flow: saving into Closed transitions straight
+                        into Submit to Backend), add-lead modal (type-ahead company picker via
+                        companies.js's searchCompanies — see below), Submit to Backend modal
+                        (bundle creation, one submission doc per product line), the read-only
+                        Submission Timeline view (showSubmissionTimelineModal — also offers
+                        Download bundle PDF and, on the submitting agent's own rejected line, Fix
+                        & Resubmit — showFixResubmitModal). Pipeline tab is server-side paginated,
+                        25 leads/page, numbered page buttons; requires 5 Firestore composite
+                        indexes (created, see Firestore Security Rules below).
+js/queue.js           — Backend Queue tab (manager + active backend department staff only):
+                        Unassigned/My Queue/All views, claim/reassign, the submission action panel
+                        (every appendEvent action, on-demand doc viewing with an older-versions
+                        expander, backend document attachments, Download bundle PDF, copy tools —
+                        COPY_ALL_FIELDS + per-field copy icons)
+js/pdfExport.js       — downloadBundlePdf: compiles a bundle's latest-version document pages into
+                        one combined PDF via jsPDF (loaded from jsdelivr's `+esm` endpoint — the
+                        package's own published ESM build has an unresolvable bare import)
+js/documents.js       — captureFile: client-side capture pipeline (image canvas-resize + JPEG
+                        recompression, PDF page-to-image via pdf.js) feeding the StorageAdapter
+js/storage/index.js   — StorageAdapter façade over a driver registry (config.storageDriver);
+                        feature code never imports a driver directly
+js/storage/firestore-b64.js — the only driver today: one Firestore doc per PAGE in a top-level
+                        submissionDocs collection, docId carries a version segment
+                        ({bundleId}_{docType}_v{n}_{pageIndex}, falling back to the pre-versioning
+                        id shape for old docs), 900KB-encoded hard ceiling, manager-only bulk
+                        delete (retention sweep)
 js/companies.js       — normalizeCompanyName, findFuzzyMatch (operates ONLY on an already-fetched
                         ≤10-doc candidate set, never a full scan), fetchCompanies (raw full scan —
                         ONLY for backfillCompanies + the Org tab Companies card, never a picker),
@@ -72,15 +92,25 @@ js/submissions.js     — computeRequiredDocs, docExpiryWarnings (company docExp
                         days, establishment card flagged specially), pickBackendAgent
                         (rotation-based auto-assign with a fallback to any available agent if no
                         specialty matches), createSubmissions (plural — one doc per product line,
-                        shared bundleId, no file upload this session), appendEvent (the event/
-                        status-transition engine — every timeline write goes through this) —
-                        pure logic; the modal UI lives in leads.js
+                        shared bundleId, resolves teamId/tlId from the assigned agent's own live
+                        profile, refuses the submission if both that and the lead's own fields are
+                        empty), appendEvent (the event/status-transition engine — every timeline
+                        write goes through this, runs inside a transaction, also recomputes +
+                        stamps the bundle's collapsed submissionSummary onto the lead in the same
+                        transaction; extraFields param merges additional field changes into the
+                        same atomic write for claim/reassign/resubmit), collapseSubmissionSummary
+                        (pure — the pipeline badge's collapse rule), claimSubmission/
+                        reassignSubmission, attachBackendDocument (backend-only additional
+                        documents) — pure logic; the modal UI lives in leads.js and queue.js
 js/dashboard.js       — Dashboard tab
 js/scripts.js         — Scripts tab, channels, approval workflow
 js/products.js        — Products tab, seed catalog, discounts, waivers, PRODUCT_CATEGORIES
                         (shared with js/org.js's backend agent specialties checklist)
 js/main.js            — getTabs/renderNav/switchTab — the only place that imports every
-                        render*Tab function and routes between them
+                        render*Tab function and routes between them. Queue tab is gated to
+                        manager or isBackendUser() (department:'backend' && active!==false,
+                        independent of role — mirrors the submissions read rule's
+                        isActiveBackend())
 ```
 Dropped as confirmed-dead code during the split (verified via grep for call sites before removal): `renderTeamTab()` and its `switchTab` branch (orphaned once "My Team" was merged into the Dashboard), `renderPlaceholder()` (never called), and a `ct.getElementById` monkey-patch in the Pipeline tab (assigned, never read).
 
@@ -169,12 +199,20 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
   deleteRequest: { requestedBy, requestedByName, requestedAt } | null,  // TL request to delete a locked lead, pending manager approval
   createdBy, createdByRole,
   lastEditedBy, lastEditedAt,
-  history: [{ ts, actorId, actorName, change }]  // capped at 100 entries by js/db.js (keeps the
+  history: [{ ts, actorId, actorName, change }],  // capped at 100 entries by js/db.js (keeps the
                                     // tail — entries are only ever appended, never reordered)
+  submissionSummary: 'none' | 'submitted' | 'inProgress' | 'activated' | 'rejected'  // NEW —
+                                    // denormalized pipeline badge (step 0d, see the submissions
+                                    // section below for the collapse rule), stamped by
+                                    // createSubmissions and appendEvent in the SAME batch/
+                                    // transaction as the write that changes it, never a per-lead
+                                    // query from the Pipeline list
 }
 ```
 
 > `assignedTo`/`teamId`/`tlId` can all be empty string `''` to represent "unassigned" — this is a valid, intentional state (e.g. after a team member is removed/deleted), not an error state. The lead modal shows an explicit "— Unassigned —" option in that case rather than defaulting the dropdown to whatever agent renders first.
+>
+> **Root-cause fix (found live in testing):** the New Lead modal's teamId/tlId resolution used to skip whenever `assignTo === CU.uid` — intended for a manager self-assigning (managers aren't on a team), but it fired for ANY self-assignment, including an agent creating and self-assigning their own lead (the single most common lead-creation path). That left every self-created agent lead permanently blank on teamId/tlId. Fixed to use the agent's own already-loaded profile (`CP.teamId`/`CP.tlId`) for that case, only reading another user's profile when actually assigning to someone else.
 
 ### `channels`
 ```
@@ -325,10 +363,13 @@ line activate while a sibling is still pending (the normal case, not an edge cas
                                      // scan the timeline to show verified-or-not
   requiredDocs: [ { type, status:'attested'|'uploaded', expiryDate, storageRef } ],  // doc
                                      // checklist + expiry dates; storageRef ({bundleId, docType,
-                                     // pageCount}) is present once a file is attached (status
-                                     // becomes 'uploaded') — see the Document Storage section
-                                     // below. Computed at submit time (union across the whole
-                                     // bundle) and stored, not re-derived later
+                                     // version, pageCount}) is present once a file is attached
+                                     // (status becomes 'uploaded') — see the Document Storage
+                                     // section below. Computed at submit time (union across the
+                                     // whole bundle) and stored, not re-derived later. `version`
+                                     // (added the session that built Fix & Resubmit) always points
+                                     // at the LATEST replacement; older versions stay in storage as
+                                     // evidence, never overwritten
   assignedBackendAgent: userId|null,
   createdAt, lastEditedBy, lastEditedAt
 }
@@ -365,9 +406,13 @@ line activate while a sibling is still pending (the normal case, not an edge cas
   within 15 days, establishment card flagged specially (SIM-suspension risk).
 - **Read-only Submission Timeline** (`js/leads.js showSubmissionTimelineModal`) — groups a lead's
   submissions by `bundleId`, shows each line's status + full events[] history. Visible to the
-  submitting agent, their TL, and manager (matches the submissions read rule's scoping). Backend's
-  own queue/action UI (where events would actually get logged through a real screen, not a
-  console call) is **not built yet** — that's the next Phase B session.
+  submitting agent, their TL, and manager (matches the submissions read rule's scoping). Also
+  offers "Download bundle PDF" and, for the submitting agent's own rejected lines, "Fix & Resubmit"
+  — both described below.
+- **Backend Queue + action panel (shipped, Phase D)** — see the Phase D entry in Phase History
+  below for the full writeup (Queue tab, claim/reassign, the action panel driving every
+  `appendEvent` type, versioned Fix & Resubmit, combined-PDF export, backend document attachments,
+  copy tools). Backend's own screen for logging events now exists — no more console calls.
 - **Document Storage (ARCHITECTURE.md §6, shipped)** — real file bytes on the free tier via a
   `StorageAdapter` façade (`js/storage/index.js`) over a driver registry, so feature code never
   imports a driver directly. Only driver today is `firestore-b64` (`js/storage/firestore-b64.js`):
@@ -587,19 +632,19 @@ acting manager's own `orgId` immediately, and every subsequent collection's `sam
 then compare a real orgId against still-unmigrated docs and fail closed, silently locking the
 migration out of everything after `users`.
 
-All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, seven collections:
+All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, ten collections:
 
 | Collection | Read | Write |
 |---|---|---|
 | `users` | Any auth | Self or manager (create/update); manager-only (delete) |
 | `teams` | Any auth | Manager only, **plus** any auth may update ONLY the `assignmentCursor` field (`affectedKeys().hasOnly(['assignmentCursor'])`) — needed so an agent's own submission-create call can advance the rotation cursor without being manager |
 | `companies` | Any auth | Create: any auth, must set `createdBy == request.auth.uid` (same pattern as `leads`/`scripts`); update/delete: manager only |
-| `leads` | Any auth | Manager unrestricted; TL within own `teamId` for general edits, blocked from `ownerLocked`/`createdBy`/`createdByRole`/`teamId`; **`tlId` reassignment additionally gated** — a TL may only change `tlId` if the lead is currently unowned or already theirs, and the result must land back in their own sub-group; Agent own assigned leads, blocked from admin fields; delete guards on `ownerLocked` |
+| `leads` | Any auth | Manager unrestricted; TL within own `teamId` for general edits, blocked from `ownerLocked`/`createdBy`/`createdByRole`/`teamId`; **`tlId` reassignment additionally gated** — a TL may only change `tlId` if the lead is currently unowned or already theirs, and the result must land back in their own sub-group; Agent own assigned leads, blocked from admin fields; delete guards on `ownerLocked`; **narrow exception (Phase D): active backend department staff may update ONLY `submissionSummary`** (`affectedKeys().hasOnly(['submissionSummary'])`, gated on `isActiveBackend()`) — the pipeline badge is stamped by `appendEvent` on a lead backend has no other write access to; agent/TL/manager don't need this exception since it was never in their own clauses' blocked-fields lists |
 | `channels` | Any auth | Create: any auth (seed guard); update/delete: manager only |
 | `scripts` | Any auth | Manager unrestricted; TL own scripts direct, manager scripts suggest-only via `pendingApproval` (`affectedKeys().hasOnly(['pendingApproval'])`) |
 | `products` | Any auth | Manager only |
-| `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted (broad for now — narrows once the real backend queue UI's update shape is known), OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
-| `submissionDocs` (firestore-b64 driver, ARCHITECTURE.md §6) | Same four parties as `submissions` — manager; `agentId==self`; their TL (`teamId` match); backend department (fields denormalized onto every page doc for exactly this reason) | Create: the uploading agent (`agentId==self`) or manager; **no update at all** — pages are immutable, replacing a doc means delete + re-upload; delete: manager-only (matches the retention sweep's own gate) |
+| `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted, OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop, now built end-to-end as Fix & Resubmit — Phase D); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
+| `submissionDocs` (firestore-b64 driver, ARCHITECTURE.md §6) | Same four parties as `submissions` — manager; `agentId==self`; their TL (`teamId` match); backend department (fields denormalized onto every page doc for exactly this reason) | Create: the uploading agent (`agentId==self`), a manager, **or (Phase D) active backend department staff** attaching an additional document to someone else's bundle (the page's `agentId` stays the ORIGINAL submitting agent's, not the backend uploader's — `isActiveBackend()` is what actually authorizes that write, since `agentId==self` can't); **no update at all** — pages are immutable, replacing a doc means writing the NEXT version as a new create (Fix & Resubmit, Phase D); delete: manager-only (matches the retention sweep's own gate) |
 | `auditLog` | Manager only | Create: any auth, `sameOrgWrite()` (the gateway writes these on every mutation); update/delete: **never**, always `false` — append-only |
 
 **Key implementation notes:**
@@ -613,15 +658,31 @@ All rules changes have been treated with extra care after one earlier bug (a fra
   `submissionDocs`, see the Document Storage section above) — there is still no `uploadBytes`/
   Storage-bucket code path anywhere, and none is planned unless a future `firebase-storage` driver
   is added for Blaze-tier clients (ARCHITECTURE.md §6, not built).
-- **Cross-role read verification caveat:** the `submissionDocs` rules mirror the already-audited
-  `submissions` read rule exactly (same four clauses, same `sameOrg()` gate), and the regression
-  pass verified the manager-read path live end-to-end (upload → view → sweep → delete). The
-  agent/team_lead/backend/non-party-agent read-path checks were **not** independently re-verified
-  with real distinct logins this session (the assistant does not type credentials into any login
-  form, per a hard standing rule) — anyone doing a deeper audit of this feature should log in as
-  each of those four identities once and confirm a non-party agent gets `permission-denied` on a
-  `submissionDocs` read that isn't theirs, their TL's, or backend's.
-- **Firestore LIST-query gotcha (found during this session's regression, see the submissions data model section above for full detail):** a `list` query is rejected outright unless Firestore can prove EVERY possible matched doc satisfies the read rule, unlike a single `get()`. A bare `where('leadId','==',id)` query only provable for manager; team_lead/agent queries must ALSO include the same field their rule clause checks (`teamId`/`agentId` respectively) to match that specific OR-branch. This is a general Firestore rules lesson, not specific to submissions — any future collection with a role-scoped OR-clause read rule needs the same query-side treatment.
+- **Cross-role read verification (resolved, Phase D):** the earlier caveat here — that
+  agent/team_lead/backend read paths for `submissionDocs` hadn't been independently re-verified
+  with real distinct logins (the assistant never types credentials into a login form itself) — was
+  closed out this session. The org's first-ever backend department + user were created, and the
+  full backend flow (claim, verify, submit, activate, reject) plus the agent's own Fix & Resubmit
+  were driven live across three real identities (manager, the new backend user, the existing
+  agent), each logged in by the human, confirming the read/write rules behave correctly in
+  practice, not just on paper. Genuine `permission-denied` bugs were found and fixed this way (see
+  the Phase D history entry) that pure code review had missed.
+- **Firestore LIST-query gotcha** (found across two sessions, see the submissions data model
+  section above and the Phase D history entry for full detail): a `list` query is rejected
+  outright unless Firestore can prove EVERY possible matched doc satisfies the read rule, unlike a
+  single `get()`. A bare `where('leadId','==',id)` or `where('bundleId','==',id)` query is only
+  provable for manager/backend (clauses that don't touch `resource.data` at all); every other
+  role's query must ALSO include the same field their rule clause checks (`teamId`/`agentId`) to
+  match that specific OR-branch. General lesson, not specific to any one collection — any future
+  list query against a role-scoped OR-clause read rule needs the same query-side treatment.
+- **Denied `get()` on a nonexistent document (found in Phase D):** a related but distinct gotcha —
+  Firestore denies (throws `permission-denied`) rather than resolving with `exists()===false` when
+  a SINGLE-document `get()` target doesn't exist and the rule's non-manager/backend clauses
+  reference `resource.data` — those clauses error on a null `resource`, and an evaluation error
+  denies the whole rule regardless of a later `||` branch that would have allowed it. Only clauses
+  that don't touch `resource.data` (manager, `isActiveBackend()`) get a clean miss. Any code that
+  "probes" a document that might not exist (e.g. trying a new id shape, falling back to a legacy
+  one) needs to catch the thrown error and treat it as a miss, not rely on `.exists()`.
 
 ---
 
@@ -812,6 +873,148 @@ and an `appendEvent` transaction/timestamp hardening fix done alongside it. Regr
 real synthetic JPG/PDF files and a real backdated bundle, all cleaned up back to baseline
 afterward; the one gap is the cross-role read-rule check noted above, left for a human to verify
 with real logins.
+
+### Phase D (shipped) — Backend working UI + five UX/data fixes
+Per `ARCHITECTURE.md` §4/§5. Two clusters of work, both fully regression-tested live with real
+manager, backend, and agent identities (the org's first-ever backend department + user were
+created during this session's testing).
+
+**UX/data fixes (found live in earlier sessions' testing):**
+- **Header team name** — agents and team leads now see their team in the header role badge (e.g.
+  "Agent · Retention Team"), resolved from `teamId` at login. Manager is unscoped to one team, so
+  unchanged. Cosmetic-only lookup — a failed fetch just leaves the role-only label.
+- **Close-to-submit flow** — saving a lead into `Closed` (with a company linked, submit
+  permission, and nothing already submitted) transitions the edit modal straight into Submit to
+  Backend instead of just closing, with a "Submit later" button to dismiss without submitting.
+- **Stage dropdown clipping** — the New Lead modal's stage select was filtering OUT Closed/Lost
+  entirely (the more literal reading of "can't be seen or selected"); restored to the full
+  `STAGES` list matching the edit modal, plus a focus-time `scrollIntoView` safeguard
+  (`helpers.js fixSelectScrollClip`) on both modals' stage selects so a select near the bottom of
+  a scrollable modal body always gets centered in the viewport before its native popup opens.
+- **Pipeline submission badge** — `lead.submissionSummary` (see Data Model above), a small badge
+  on Closed pipeline rows: none = "Not submitted" (attention-styled — the gap a TL needs to
+  catch), else submitted/inProgress/activated/rejected each with their own style (rejected red).
+  Collapse rule (`submissions.js collapseSubmissionSummary`): any rejected line wins regardless of
+  siblings; all-activated only if EVERY line is; otherwise the furthest-along in-flight state.
+  Stamped by `createSubmissions` and `appendEvent` in the SAME batch/transaction as the write that
+  changes it — `appendEvent` enumerates the bundle's siblings via a plain query BEFORE its own
+  transaction (Firestore transactions can't run queries) and re-reads them by ref inside it for a
+  consistent collapse.
+- **Stale denormalized team data (root cause + repair cascade)** — a lead created without
+  `teamId` used to get that blank value frozen permanently onto every submission created from it
+  (`createSubmissions` copied `lead.teamId||''` verbatim). Root cause: the New Lead modal's
+  self-assign skip condition fired for an AGENT self-assigning their own lead (the most common
+  creation path), not just a manager. Fixed at both ends — `createSubmissions` (and the document
+  upload path, which had the identical bug) now resolves teamId/tlId from the ASSIGNED AGENT's
+  live profile first, falls back to the lead's own fields, and refuses the submission outright if
+  both are empty; the create-lead modal resolves from the agent's own already-loaded profile
+  instead of skipping. `repairLeadTeamData` (Org tab) now cascades into already-created
+  submissions with the same stale value (submissionDocs pages are left alone — deliberately
+  immutable, see Phase C — counted and reported instead of a write the rules would reject).
+
+**Backend working UI (all new, `js/queue.js` + `js/pdfExport.js`):**
+- **Queue tab** — gated to managers and active backend-department staff (`department:'backend' &&
+  active!==false`, independent of `role`, mirroring the submissions read rule's
+  `isActiveBackend()`). Three views (Unassigned/My Queue/All), a status filter, oldest-first sort,
+  activated/rejected hidden by default. Deliberately fetches the whole `submissions` collection
+  once (bounded) rather than several narrower server-side queries, specifically to avoid needing
+  new Firestore composite indexes — the manager/backend read clause doesn't reference
+  `resource.data` at all, so a bare fetch is provable for any query shape; everything else
+  filters/sorts client-side over that one fetch (same "manager/backend needs a full view"
+  exception already used by the Org tab and `fetchCompanies()`).
+- **Claim + reassignment** (`submissions.js claimSubmission`/`reassignSubmission`) — both just set
+  `assignedBackendAgent`, logged as a `note` event atomic with it via a new `extraFields` param on
+  `appendEvent` (internal-only — merges extra fields into the same transactional update, not a
+  general escape hatch). Any active backend user can claim an unassigned submission; only a
+  backend coordinator (`team_lead` + `department:'backend'`) or manager gets the reassign picker —
+  a CLIENT-SIDE workflow policy only, since the rule already gives the whole backend department
+  unrestricted submission-update rights.
+- **Action panel** — opens from a Queue row. Full submission detail (company block with
+  `hasDuAccount` badge + account code, product line, categoryFields, SPR, accTransfer,
+  requiredDocs with on-demand page viewing), full events timeline, and every `appendEvent` action:
+  quick one-click buttons for the no-payload events plus small inline forms for
+  activityNo/workOrderNo/appointment/sprObtained/correction/note/rejected (reason dropdown from
+  `ORG_DEFAULTS.rejectionReasons`). Only ever calls `appendEvent` — never sets status directly —
+  and re-fetches the submission fresh after each action.
+- **Versioned document resubmission (Fix & Resubmit)** — `submissionDocs` docIds gained a version
+  segment (`{bundleId}_{docType}_v{n}_{pageIndex}`; `get()` falls back to the pre-versioning id
+  shape when v1 isn't found, rather than migrating old docs). Reachable only by the submitting
+  agent on their own rejected line (`js/leads.js`): editable categoryFields, optional per-doc-type
+  re-upload that writes `v{n+1}` pages as a fresh CREATE (pages are immutable — this is the only
+  replacement path), then a `resubmit` event; categoryFields + the updated requiredDocs pointer
+  ride the SAME transaction via `extraFields`. Old versions are deliberately retained as evidence,
+  never deleted individually — only the whole-bundle retention sweep clears them, once every
+  sibling submission is terminal (the sweep's existing `bundleId`-field query already catches
+  every version with no changes needed). Both the timeline viewer and the action panel show the
+  latest version with an "older versions" expander (probes sequentially for pages, since an older
+  version's page count isn't stored anywhere but the CURRENT `requiredDocs` pointer).
+- **Combined-PDF export** (`js/pdfExport.js downloadBundlePdf`) — compiles every doc type's LATEST
+  version pages for a bundle into one PDF via jsPDF, one stored page per PDF page, labeled header
+  per doc type. Siblings each carry their own `requiredDocs` copy, so a partial rejection+fix can
+  leave them pointing at different versions of the same docType — takes the highest version seen
+  across all siblings. Available from both the agent's Submission Timeline (per bundle) and the
+  backend action panel.
+- **Backend document attachments** (`submissions.js attachBackendDocument`) — backend can attach
+  an ADDITIONAL document (Affidavit/Email Extension/Other, distinct from the agent's required
+  checklist) to a bundle through the same capture pipeline, fanned out to every sibling
+  submission's `requiredDocs` (same duplication pattern as the agent's original upload). The
+  page's `agentId`/`teamId` stay the ORIGINAL submitting agent's own values, not the backend
+  uploader's, so the read rule's agent/TL-scoped clauses keep working; `uploadedBy` (already a
+  separate field) records who actually attached it. Required a rules change — see below.
+- **Copy tools** — a copy icon next to every copyable field on the action panel (company name,
+  account code, contacts, address, product, qty, category fields incl. MSISDN/GAID) plus "Copy
+  All" in a fixed field order (`COPY_ALL_FIELDS`, a const — TODO: make org-configurable later once
+  du's actual ticket field order is known, hardcoded for now since there's no org-config UI yet).
+
+**Rules changes (both published this session):**
+- `leads` gained a narrow `submissionSummary`-only exception (same pattern as
+  `teams.assignmentCursor`), scoped to `isActiveBackend()` only after review — the agent/manager/
+  team_lead clauses already covered their own writes of that field without needing it.
+- `submissionDocs` create now also allows `isActiveBackend()`, needed for backend document
+  attachments (a backend upload's `agentId` never equals the uploader's own uid the way the
+  existing `agentId==self` clause expects).
+
+**Real bugs found and fixed during live regression, not just written and assumed correct:**
+1. `storage/firestore-b64.js get()` — Firestore denies (throws `permission-denied`) rather than
+   resolving with `exists()===false` when a read target doesn't exist and the rule's non-manager/
+   backend clauses reference `resource.data` — those clauses error on a null `resource`, and an
+   evaluation error denies the whole rule regardless of a later `||` branch that would have
+   allowed it. That broke the new-id-then-legacy-id-fallback probe for any role whose OWN clause
+   needs `resource.data` (agent, team_lead) — only manager/backend's `resource.data`-free clauses
+   got a clean miss. Fixed by wrapping each `getDoc()` attempt so a denial is treated as "not
+   found" and falls through to the next attempt.
+2. `pdfExport.js` — jsPDF's own published ESM build (`dist/jspdf.es.min.js`) references internal
+   Babel helpers via bare npm-style specifiers that only resolve inside a bundler; a raw browser
+   `import()` throws. Switched to jsdelivr's `+esm` endpoint, which re-bundles the whole package
+   with dependencies inlined.
+3. `submissions.js appendEvent` — same LIST-query provability gotcha as the earlier f0c34bd fix:
+   the sibling bundle enumeration query was a bare `where('bundleId','==',bundleId)`, only
+   provable for manager/backend. For the SUBMITTING AGENT calling this (Fix & Resubmit's
+   `resubmit` event), Firestore couldn't prove every result satisfies
+   `resource.data.agentId==request.auth.uid` without that field in the query, and denied the
+   whole call. Mirrored the query with the known `agentId` from the already-fetched single-doc
+   read (every sibling in a bundle always shares one `agentId`, so this is correct for
+   manager/backend's broader case too).
+4. `leads.js showSubmissionTimelineModal` — the Fix & Resubmit success callback re-rendered the
+   timeline using the stale `submissions` array captured when the modal first opened, instead of
+   re-fetching; the just-completed resubmit's new status/requiredDocs never showed up without a
+   manual reload.
+
+**Full regression, real identities throughout (manager + a newly-created backend user + the
+existing agent, not simulated):** claim, verify (call), submit to du, log activity number and
+appointment, activate one submission; skip verification on another, confirmed
+`proceededWithoutVerification` fired, then reject with a reason; as the agent, Fix & Resubmit the
+rejected one with a real replacement image (new version recorded and viewable, old version still
+separately viewable, confirmed via a genuinely-never-uploaded v1 slot correctly reporting "No
+pages found" rather than erroring); downloaded the bundle PDF twice (before and after the
+resubmit) and verified page count/order/labels both times via `pypdf`; verified the close-to-
+submit flow, the stage dropdown fix, and the pipeline badge transitioning live through the whole
+flow (submit → badge, reject → attention badge, resubmit → back to submitted, activate →
+activated) on the agent's own real screen. Cleaned up all test data back to baseline (deleted
+every test lead/company/submission/document page created, reverted the one pre-existing test
+submission touched during regression back to its original pendingVerification/unclaimed state)
+— the newly-created backend team and user were kept, since they're real org infrastructure, not
+test data.
 
 ---
 
