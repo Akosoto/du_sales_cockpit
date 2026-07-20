@@ -1198,7 +1198,19 @@ function showSubmissionTimelineModal(lead, submissions){
 
   document.querySelectorAll('[data-fix-resubmit]').forEach(btn => btn.onclick = () => {
     const line = submissions.find(s => s.id === btn.dataset.fixResubmit);
-    if(line) showFixResubmitModal(line, () => showSubmissionTimelineModal(lead, submissions));
+    if(line) showFixResubmitModal(line, async () => {
+      // Re-fetch rather than reusing the stale `submissions` closure — a
+      // resubmit just changed this line's status/requiredDocs, and the
+      // timeline needs to show that, not what was true when this modal
+      // first opened. Same role-mirrored query shape as showLeadModal's own
+      // fetch (see its comment for the LIST-query gotcha this avoids).
+      const role = CP.role;
+      const subConstraints = [where('leadId','==',lead.id)];
+      if(role==='team_lead') subConstraints.push(where('teamId','==',CP.teamId));
+      else if(role!=='manager') subConstraints.push(where('agentId','==',CU.uid));
+      const subSnap = await getDocs(query(collection(db,'submissions'), ...subConstraints));
+      showSubmissionTimelineModal(lead, subSnap.docs.map(d=>({id:d.id,...d.data()})));
+    });
   });
 
   document.querySelectorAll('[data-download-bundle]').forEach(btn => btn.onclick = async () => {

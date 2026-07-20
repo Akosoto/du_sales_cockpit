@@ -294,10 +294,22 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
   // fresh INSIDE the transaction below, so the actual collapse is still
   // computed from consistent, as-of-commit data (and retried automatically
   // if a sibling changes between this enumeration and the commit).
+  //
+  // LIST-query gotcha (found live in this session's regression, same class
+  // of bug as f0c34bd): a bare where('bundleId','==',bundleId) query is
+  // only provable for manager/backend, whose read-rule clauses don't touch
+  // resource.data at all — for the SUBMITTING AGENT calling this (e.g. Fix &
+  // Resubmit's resubmit event), Firestore can't prove every possible result
+  // satisfies resource.data.agentId==request.auth.uid without that field IN
+  // the query, and denies the whole thing. Mirrored here with the known
+  // agentId from the single-doc read above (provable for any role, unlike a
+  // list query) — every sibling in a bundle always shares the same agentId
+  // (one bundle = one agent's Submit-to-Backend session), so this is both
+  // correct for manager/backend's broader case AND provable for the agent's.
   const preSnap = await getDoc(subRef);
   if(!preSnap.exists()) throw new Error('Submission not found.');
-  const { bundleId, leadId } = preSnap.data();
-  const siblingsSnap = await getDocs(query(collection(db,'submissions'), where('bundleId','==',bundleId)));
+  const { bundleId, leadId, agentId: bundleAgentId } = preSnap.data();
+  const siblingsSnap = await getDocs(query(collection(db,'submissions'), where('bundleId','==',bundleId), where('agentId','==',bundleAgentId)));
   const otherSiblingRefs = siblingsSnap.docs.map(d => d.ref).filter(r => r.id !== submissionId);
 
   await runTransaction(db, async (transaction) => {
