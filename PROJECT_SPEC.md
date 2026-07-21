@@ -1,5 +1,13 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **ARCHITECTURE.md v2.0 Phase B (submissions v2) shipped** — `js/submissions.js` rewritten around one-doc-per-product-line + `bundleId` (replaces the old 5-fixed-stage `items[]` design), the `appendEvent` timeline engine, company enrichment + scalable accountCode/type-ahead lookups (no more full-collection company scans), `auditLog` gateway writes, and a real batch-chunking bug fix (auditLog was silently doubling writes-per-op past Firestore's 500-write cap). See Phase B below for the full list. Phase A0/A (multi-tenancy foundation — `js/db.js` gateway, `orgId` migration, `sameOrg()` rules) shipped in the prior session, unchanged since. **`ARCHITECTURE.md` is the authoritative spec for all future work** — this file stays as historical/reference documentation for what's already shipped.
+**Last updated:** July 2026 | **Session B4 (Manager's Cockpit) shipped** — category identity
+refactor (permanent IDs replacing name-strings, `orgs/{orgId}` org-config doc, one-time migration),
+Products config panel, the Manager's Cockpit dashboard (donuts, role metrics, target-remaining +
+run-rate toggle) behind a swappable `getDashboardData(period)` module, and a real users-collection
+privilege-escalation fix found and closed during this session's rules review. See the Session B4
+history entry below for the full list, and `ARCHITECTURE.md` §12 for the design rationale. Phase D
+(backend working UI) and Phase B (submissions v2) shipped in prior sessions, unchanged since.
+**`ARCHITECTURE.md` is the authoritative spec for all future work** — this file stays as
+historical/reference documentation for what's already shipped.
 
 ---
 
@@ -51,7 +59,11 @@ js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLead
                         (manager-only, downloads one timestamped JSON of every org-scoped
                         collection), commitBulkOps (shared chunked-bulk-commit helper for this
                         file's 4 cascades — team delete, member removal, hard-delete,
-                        department-change — CHUNK 200 + skipAudit + one summary logBulkAudit call)
+                        department-change — CHUNK 200 + skipAudit + one summary logBulkAudit call),
+                        runCategoryMigration (Session B4, one-off manager-triggered
+                        products.category/users.specialties[] name-string→ID conversion + orgs
+                        doc creation — dry-run preview modal before writing, same banner+button
+                        pattern, safe to re-run, unmapped values flagged not guessed at)
 js/leads.js           — Pipeline tab (incl. bulk-assign, submissionSummary badge on Closed rows),
                         lead modal (close-to-submit flow: saving into Closed transitions straight
                         into Submit to Backend), add-lead modal (type-ahead company picker via
@@ -99,13 +111,39 @@ js/submissions.js     — computeRequiredDocs, docExpiryWarnings (company docExp
                         stamps the bundle's collapsed submissionSummary onto the lead in the same
                         transaction; extraFields param merges additional field changes into the
                         same atomic write for claim/reassign/resubmit), collapseSubmissionSummary
-                        (pure — the pipeline badge's collapse rule), claimSubmission/
+                        (pure — the pipeline badge's collapse rule), claimSubmission (Session B4:
+                        also stamps a queryable claimedAt on the unassigned->claimed transition
+                        only, never on a later reassignSubmission — feeds the Manager's Cockpit's
+                        queue-wait metric; pre-B4 claims and auto-assigned submissions have no
+                        claimedAt and surface as N/A rather than a fabricated value)/
                         reassignSubmission, attachBackendDocument (backend-only additional
                         documents) — pure logic; the modal UI lives in leads.js and queue.js
-js/dashboard.js       — Dashboard tab
+js/dashboard.js       — Dashboard tab (all roles: leads/stage-based KPIs, agent performance,
+                        monthly history, follow-ups, activity log) PLUS (Session B4, manager-only)
+                        the Manager's Cockpit section: period/AED-count selector, donuts, role
+                        metrics, target-remaining + run-rate toggle — see the three new files below
+js/dashboardData.js   — getDashboardData(period): swappable client-side aggregation over
+                        `submissions` (Phase C will later swap the internals for rollup reads, same
+                        call signature/output shape); resolvePeriodRange (presets + custom ≤92-day
+                        range)
+js/dashboardCharts.js — renderDonutCard: dependency-free hand-rolled SVG donut (stroke-dasharray
+                        arcs), AED/count mode, empty state
+js/dashboardCards.js  — renderRoleMetricsSection: sales-agent + backend role-metrics cards, KAM/
+                        escalations reserved placeholder
+js/orgConfig.js       — orgs/{orgId} org-config doc (categories, contractTermLabels,
+                        runRateDefaultVisible): loadOrgConfig, categoryLabel/termLabel (render-time
+                        resolvers with graceful fallback-to-raw-value), findCategoryIdByLabel
+                        (migration-only), currentCategories/currentTermLabels, saveOrgConfig/
+                        withOrgConfigSave (shared merge-then-set write path + graceful
+                        permission-denied handling, used by both Products' category/term config and
+                        the Dashboard's run-rate default toggle)
 js/scripts.js         — Scripts tab, channels, approval workflow
-js/products.js        — Products tab, seed catalog, discounts, waivers, PRODUCT_CATEGORIES
-                        (shared with js/org.js's backend agent specialties checklist)
+js/products.js        — Products tab, seed catalog, discounts, waivers, Categories & Contract Terms
+                        config panel (manager-only — showCategoryConfigModal; category rename/add/
+                        delete-if-unreferenced, contract-term label rename). Categories now resolved
+                        via js/orgConfig.js (currentCategories/categoryLabel), not a local constant —
+                        the old PRODUCT_CATEGORIES export was removed in Session B4's category
+                        identity refactor.
 js/main.js            — getTabs/renderNav/switchTab — the only place that imports every
                         render*Tab function and routes between them. Queue tab is gated to
                         manager or isBackendUser() (department:'backend' && active!==false,
@@ -156,11 +194,18 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
                                     // null for manager and for anyone currently unassigned to a team.
                                     // Cascaded automatically if a team's department is later changed
                                     // (showEditTeamModal batch-updates every member's department).
-  specialties: string[],           // NEW (Phase 6) — backend agents only; product category names
-                                    // (js/products.js PRODUCT_CATEGORIES); empty/omitted = generalist,
+  specialties: string[],           // NEW (Phase 6) — backend agents only; CATEGORY IDS as of Session
+                                    // B4 (was product category name-strings pre-migration — see
+                                    // js/orgConfig.js categoryLabel()); empty/omitted = generalist,
                                     // handles anything. Not set for sales agents or TLs.
-  available: boolean               // NEW (Phase 6) — backend agents only; manual "I'm out today"
+  available: boolean,              // NEW (Phase 6) — backend agents only; manual "I'm out today"
                                     // toggle, default true. Not set for sales agents or TLs.
+  runRateVisible: true | false | null  // NEW (Session B4) — per-user override for the Manager's
+                                    // Cockpit's run-rate/days-left visibility; null/absent = no
+                                    // override, defer to orgs/{orgId}.runRateDefaultVisible. Always
+                                    // wins over the org default in either direction when set. Any
+                                    // user may self-write ONLY this field (see Firestore Security
+                                    // Rules below) — a self-write touching any other field is denied.
 }
 ```
 
@@ -243,10 +288,16 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
 ### `products`
 ```
 {
-  category: 'Starter' | 'Essential' | 'Ultimate' | 'Mobile',
+  category: 'starter' | 'essential' | 'ultimate' | 'mobile',  // CATEGORY ID as of Session B4 (was
+                                    // the display name pre-migration) — resolve the label via
+                                    // js/orgConfig.js categoryLabel(), never read this raw for
+                                    // display. See orgs below for where the id->label map lives.
   name,                            // e.g. "Ultimate 600 Mbps"
   pricingOptions: [                // at least one required
-    { term, label, price }         // term in months (0 = no contract)
+    { term, label, price }         // term in months (0 = no contract); label is the FALLBACK
+                                    // display when no orgs/{orgId}.contractTermLabels[term]
+                                    // override exists — resolve via js/orgConfig.js termLabel(),
+                                    // never read this raw for display.
   ],
   activationFee,
   specs: { key: value },           // free-form key-value pairs, displayed on card
@@ -261,6 +312,27 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
   lastEditedBy, lastEditedAt
 }
 ```
+
+### `orgs` (NEW, Session B4, ARCHITECTURE.md §12)
+```
+// One doc per deployment, doc ID == the org's own orgId constant (config.js) —
+// not a field on it conceptually, though js/db.js's dbSet() gateway does stamp
+// a redundant `orgId` field on every write as a side effect of the shared
+// write path; the doc ID is what the Firestore rule actually keys off.
+{
+  categories: [ { id, label } ],   // permanent IDs, editable label — see js/orgConfig.js. Seeded
+                                    // with DEFAULT_CATEGORIES (starter/essential/ultimate/mobile)
+                                    // by the one-time category migration (js/org.js).
+  contractTermLabels: { [term]: label },  // OPTIONAL override on top of each product's own
+                                    // pricingOption.label — absent/partial is fine, never migrated.
+  runRateDefaultVisible: true | false     // org-wide default for the Manager's Cockpit's run-rate
+                                    // visibility toggle; absent = false. See users.runRateVisible
+                                    // above for the per-user override that always wins over this.
+}
+```
+Read: any same-org authenticated user (every role's `loadOrgConfig()` runs at login). Write:
+manager unrestricted; team_lead narrowed to `runRateDefaultVisible` only. See Firestore Security
+Rules below for the exact rule (key-matched, not `sameOrg()`-gated like every other collection).
 
 **Seed data (19 products, auto-seeded by manager on first Products tab open):**
 
@@ -371,13 +443,24 @@ line activate while a sibling is still pending (the normal case, not an edge cas
                                      // at the LATEST replacement; older versions stay in storage as
                                      // evidence, never overwritten
   assignedBackendAgent: userId|null,
+  claimedAt,                        // NEW (Session B4) — queryable, stamped ONLY on the
+                                     // unassigned->claimed transition (claimSubmission), never on
+                                     // a later reassignSubmission. Absent for pre-B4 claims and
+                                     // auto-assigned submissions — the Manager's Cockpit's queue-
+                                     // wait metric treats a missing value as N/A, never 0.
+  submittedToDuAt, activatedAt, rejectedAt,  // queryable top-level timestamps, stamped by
+                                     // appendEvent on the FIRST corresponding status transition
+                                     // (see appendEvent below) — feed both reporting and the
+                                     // Manager's Cockpit's period-range queries (js/dashboardData.js)
   createdAt, lastEditedBy, lastEditedAt
 }
 ```
 - `SUBMISSION_STATUSES` (replaces the old `SUBMISSION_STAGES`) and
   `MANDATORY_DOC_TYPES = ['Trade License','Emirates ID (Front)','Emirates ID (Back)']` live in
-  `js/state.js`, alongside the new `ORG_DEFAULTS` (typeOfRequestList, rejectionReasons,
-  itemFieldsByCategory) — hardcoded for now, shaped to match a future `orgs/{orgId}` config doc.
+  `js/state.js`, alongside `ORG_DEFAULTS` (typeOfRequestList, rejectionReasons,
+  itemFieldsByCategory — the last re-keyed to category IDs in Session B4) — still hardcoded, NOT
+  moved into `orgs/{orgId}` (Session B4's new org-config doc only holds categories,
+  contractTermLabels, and runRateDefaultVisible — see the `orgs` schema above).
 - `hasDuAccount` skip logic is **gone** — every submission starts at `pendingVerification`
   regardless; `hasDuAccount` is purely an informational badge now.
 - **Event engine (`js/submissions.js appendEvent`)** — every timeline entry goes through here,
@@ -632,11 +715,12 @@ acting manager's own `orgId` immediately, and every subsequent collection's `sam
 then compare a real orgId against still-unmigrated docs and fail closed, silently locking the
 migration out of everything after `users`.
 
-All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, ten collections:
+All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, eleven collections:
 
 | Collection | Read | Write |
 |---|---|---|
-| `users` | Any auth | Self or manager (create/update); manager-only (delete) |
+| `users` | Any auth | Create: self or manager. Update: manager unrestricted; **self-write narrowed (Session B4 — fixes a real privilege-escalation gap found during review, see below) to exclude `role`, `department`, `orgId`, `teamId`, `tlId`, `active`, `monthlyTarget`, `targetSource`, `autoTarget`, `permissions`, `specialties`, `available`, `email`, `createdBy`, `createdAt`** — a self-write touching any of those is denied outright, even bundled with an otherwise-fine field. Delete: manager-only. |
+| `orgs` (Session B4, ARCHITECTURE.md §12) | Any auth, same org (key match: `oid == userDoc().orgId`) | Manager unrestricted; team_lead narrowed to `runRateDefaultVisible` only (`hasOnly()`); create/delete: manager only. Authorized by KEY MATCH, not `sameOrg()`/`sameOrgWrite()` — the doc ID itself is the org identity. |
 | `teams` | Any auth | Manager only, **plus** any auth may update ONLY the `assignmentCursor` field (`affectedKeys().hasOnly(['assignmentCursor'])`) — needed so an agent's own submission-create call can advance the rotation cursor without being manager |
 | `companies` | Any auth | Create: any auth, must set `createdBy == request.auth.uid` (same pattern as `leads`/`scripts`); update/delete: manager only |
 | `leads` | Any auth | Manager unrestricted; TL within own `teamId` for general edits, blocked from `ownerLocked`/`createdBy`/`createdByRole`/`teamId`; **`tlId` reassignment additionally gated** — a TL may only change `tlId` if the lead is currently unowned or already theirs, and the result must land back in their own sub-group; Agent own assigned leads, blocked from admin fields; delete guards on `ownerLocked`; **narrow exception (Phase D): active backend department staff may update ONLY `submissionSummary`** (`affectedKeys().hasOnly(['submissionSummary'])`, gated on `isActiveBackend()`) — the pipeline badge is stamped by `appendEvent` on a lead backend has no other write access to; agent/TL/manager don't need this exception since it was never in their own clauses' blocked-fields lists |
@@ -683,6 +767,29 @@ All rules changes have been treated with extra care after one earlier bug (a fra
   that don't touch `resource.data` (manager, `isActiveBackend()`) get a clean miss. Any code that
   "probes" a document that might not exist (e.g. trying a new id shape, falling back to a legacy
   one) needs to catch the thrown error and treat it as a miss, not rely on `.exists()`.
+- **`getDoc()` on a nonexistent document can be denied even when the rule never references
+  `resource.data` at all (Session B4)** — extends the gotcha above, which was scoped to rules that
+  DO touch `resource.data`. Observed on `orgs/{oid}`'s pure key-match read rule (`oid ==
+  userDoc().orgId`, no `resource` reference whatsoever) before that doc existed; the identical read
+  succeeded immediately after creation. `js/orgConfig.js loadOrgConfig()` and `js/org.js
+  computeCategoryMigrationPlan()` already wrapped this in a try/catch treating any failure as
+  "doesn't exist" (written defensively before this was known), so no code fix was needed — but any
+  new single-`get()` probe against a possibly-nonexistent doc should assume the same, regardless of
+  whether its rule touches `resource.data`.
+- **LIST-query provability re-litigated and confirmed correct (Session B4) — a real privilege-
+  escalation bug was ALSO found and fixed in the same review pass, see the `users` row above.**
+  A manager's list query against `submissions` succeeds with NO `where('orgId',...)` filter even
+  though `sameOrg()` references `resource.data.orgId` — `role()=='manager'` is a request-time-only
+  fact (one `get()` on the caller's own doc), sufficient to satisfy the whole conjunction
+  regardless of what the resource.data-dependent branches would otherwise require. This does NOT
+  contradict the LIST-query gotcha two notes above — that gotcha is about roles whose ONLY viable
+  branch needs an unconstrained `resource.data` field; manager's branch needs none. Settled with a
+  purpose-built, in-repo adversarial probe — **`tools/rules-probe.html`, deliberately NOT deleted
+  as a throwaway** — run as manager (four query shapes, all succeeded) and a sales-agent control
+  (all four correctly denied, proving the probe itself isn't bypassing rules). **Re-run this probe,
+  as both a privileged and a non-privileged account, before merging any future change to
+  `sameOrg()`/`sameOrgWrite()` or a similarly-shaped rule** — the result is a property of this
+  specific rule shape, not a general Firestore guarantee.
 
 ---
 
@@ -1015,6 +1122,100 @@ every test lead/company/submission/document page created, reverted the one pre-e
 submission touched during regression back to its original pendingVerification/unclaimed state)
 — the newly-created backend team and user were kept, since they're real org infrastructure, not
 test data.
+
+### Session B4 (shipped) — Manager's Cockpit
+Per `ARCHITECTURE.md` §12. Session-sequence label, not a Phase-A–G item — sits ahead of Phase C's
+rollup counters in delivery order but deliberately doesn't build them (see below).
+
+**Category identity refactor + migration (`js/orgConfig.js`, `js/org.js`):** categories
+(`Starter`/`Essential`/`Ultimate`/`Mobile`) moved from name-string identity to permanent IDs in a
+new `orgs/{orgId}.categories: [{id,label}]` org-config doc; `products.category` and
+`users.specialties[]` migrated to store the ID, `categoryLabel()` resolves the label at render
+time with a fallback-to-raw-value for anything not a known ID (safe for both migrated and
+not-yet-migrated data at the same call site). `submissions.category` was deliberately left
+un-migrated — a submission is an immutable snapshot, not live config, and the fallback already
+displays a legacy value correctly. One-time migration (Org tab, manager-only): dry-run preview
+before writing, `skipAudit`+one summary `logBulkAudit` entry, safe to re-run. Contract-term labels
+(`orgs/{orgId}.contractTermLabels`) are a separate, optional override layered on top of each
+product's own stored `pricingOption.label` — no migration needed, nothing breaks if never set.
+
+**Products config panel (`js/products.js showCategoryConfigModal`):** manager-only — rename
+(label edit; IDs are permanent), add, and delete (blocked while any product references the
+category, blocking products listed by name) for categories; rename for contract-term labels.
+
+**Manager's Cockpit dashboard:** `js/dashboardData.js getDashboardData(period)` — a swappable
+client-side aggregation module (period presets + custom ≤92-day range) that Phase C will later
+replace internally with rollup-counter reads, same call signature/output shape.
+`js/dashboardCharts.js` — dependency-free hand-rolled SVG donut (`renderDonutCard`). Wired into
+`js/dashboard.js`'s manager-only `#mgr-cockpit` section: period/AED-count selector shared by
+donuts (Share by Team, Share by Contributor), role-metrics cards (`js/dashboardCards.js` — sales
+agent AED closed/lines submitted; backend submissions handled/queue wait/handling time/du
+turnaround, the last explicitly labeled du's own clock; KAM/escalations reserved placeholder), and
+target-remaining (AED remaining vs. sum of agent targets, This Month only — N/A for every other
+period) with a run-rate toggle (days-left + required daily run-rate, default OFF). Donut/role
+attribution rule: a normal line credits the submitting agent; an `accTransfer`-flagged line
+credits that partner (or "Outsourced Revenue" if no partner name recorded) — independent of a
+sales agent's own `aedClosed`/`linesSubmitted`, which is keyed on `agentId` directly regardless of
+that split.
+
+**Run-rate visibility resolution:** per-user override (`users/{uid}.runRateVisible`) always wins
+over the org default (`orgs/{orgId}.runRateDefaultVisible`) in either direction — verified live
+across all four combinations. The org-default toggle is manager-AND-team-lead-writable at the
+rule level, verified live, but **no UI currently exposes it to a TL** (the whole Manager's Cockpit
+section is manager-only) — not an open-ended gap: the TL toggle UI ships with the TL/agent-facing
+target views phase, since the toggle governs a manager-only view today and TL-facing UI for it
+would be meaningless until those views exist.
+
+**Rules changes (published this session, both required a live-tested republish after an initial
+publish mismatch — see below):**
+- New `orgs/{oid}` collection, authorized by key match (`oid == userDoc().orgId`) rather than
+  `sameOrg()`/`sameOrgWrite()` — the doc ID itself is the identity, and this avoids depending on
+  `js/db.js`'s `dbSet()` gateway continuing to stamp a redundant `orgId` field. Read: any same-org
+  user (`loadOrgConfig()` runs for every role at login). Write: manager unrestricted, team_lead
+  narrowed to `runRateDefaultVisible` only (`hasOnly()`).
+- **`users` self-write privilege-escalation fix, found during this step's review (not something
+  this session set out to change):** the prior clause let any user update ANY field on their own
+  doc, including `role`/`department` — an agent could self-write `role:'manager'` or
+  `department:'backend'` and pass every `role()=='manager'`/`isActiveBackend()` check in the
+  entire rules file. Narrowed self-write to exclude a blocklist (`role`, `department`, `orgId`,
+  `teamId`, `tlId`, `active`, `monthlyTarget`, `targetSource`, `autoTarget`, `permissions`,
+  `specialties`, `available`, `email`, `createdBy`, `createdAt`); manager stays unrestricted.
+  Verified live as an agent, twice — the first publish turned out to be a stale pre-fix version
+  (self-promotion to manager briefly succeeded against live data, immediately reverted, root-caused
+  to a publish mismatch rather than a rule-logic bug, republished, reverified clean on all three
+  cases: `runRateVisible` self-write succeeds, `role`/`monthlyTarget` self-writes denied).
+- One composite index: `submissions (status ASC, activatedAt ASC)`, for the dashboard's
+  activated-in-period query. The other two dashboard queries (`createdAt` range, `claimedAt`
+  range) are single-field ranges, already auto-indexed.
+
+**Rules-engine findings:**
+1. **LIST-query provability, re-litigated and confirmed correct.** A manager's list query against
+   `submissions` succeeds with no `where('orgId',...)` filter even though `sameOrg()` references
+   `resource.data.orgId` — `role()=='manager'` is a request-time-only fact (one `get()` on the
+   caller's own doc), sufficient to satisfy the whole conjunction regardless of what the
+   resource.data-dependent branches would otherwise require. Settled with a purpose-built
+   adversarial probe (`tools/rules-probe.html`, kept in-repo, NOT a throwaway — independent of the
+   app's own Firebase module instance) run as both manager (four query shapes, all succeeded) and
+   a sales-agent control (all four correctly denied). Re-run obligation recorded in
+   `ARCHITECTURE.md` §12: this must be re-run before any future change to
+   `sameOrg()`/`sameOrgWrite()` or a similarly-shaped rule.
+2. **`getDoc()` on a nonexistent document can be denied even when the rule never references
+   `resource.data` at all** — observed on `orgs/{oid}`'s pure key-match read rule before the doc
+   existed; the identical read succeeded immediately after creation. Extends the existing
+   `submissionDocs`-era "denied get() on nonexistent doc" gotcha (Phase C) — that pattern is not
+   conditional on the rule touching `resource.data`. No code fix needed: `loadOrgConfig()` and
+   `computeCategoryMigrationPlan()` already treated any read failure as "doesn't exist."
+
+**Regression:** donut totals, byTeam, byContributor (both the accTransfer-with-partner and
+accTransfer-without-partner "Outsourced Revenue" fallback), sales-agent role metrics, and all
+three backend timing averages reconciled exactly against a 6-line hand-calculated fixture (normal
+agent line, two manager-kept/external-source lines, a 2-line partial-activation bundle, one
+activated line with no `claimedAt`) — every field matched, which also proved partial-activation
+handling and the queue-wait N/A mechanism in the same pass. Category rename propagation verified
+live across Products display, the category filter, and the Org tab specialty checklist with no
+page reload. Migration integrity verified live: zero dangling name-strings in `products`/`users`.
+Queue tab, action panel, copy tools, and the pipeline `submissionSummary` badge all still render
+correctly against post-migration category IDs. All fixture/test data cleaned up after use.
 
 ---
 

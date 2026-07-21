@@ -408,33 +408,96 @@ lead the pitch: rejection analytics, suspension-risk early warning
 (docs + bills), live daily numbers without compiling, du order-form
 export, projections/commitments, escalation memory.
 
-## 12. Session B4 — Manager's Cockpit (STUB — finalized in Step 10)
+## 12. Session B4 — Manager's Cockpit (shipped)
 
 Session-sequence label ("B4"), not a Phase-B feature — sits ahead of
 §10's Phase C in delivery order but deliberately does NOT build Phase
-C's rollup counters (see below). Scope: (A) category identity
-refactor + Products config panel, (B) Manager Dashboard — donuts +
+C's rollup counters (see below). Delivered: (A) category identity
+refactor + one-time migration + Products config panel (categories +
+contract-term labels), (B) Manager's Cockpit dashboard — donuts +
 role-based performance metrics, (C) target-remaining metrics with a
-run-rate visibility toggle. Out of scope this session: SOF template
+run-rate visibility toggle. Out of scope, unchanged: SOF template
 library (deferred), escalation/KAM metrics (reserved placeholder slots
 only), rollup counters (still Phase C, a later session — this
 session's dashboard aggregates client-side behind a swappable
-`getDashboardData(period)` module whose internals Phase C replaces
-with rollup reads, not its call signature or output shape).
+`getDashboardData(period)` module, `js/dashboardData.js`, whose
+internals Phase C replaces with rollup reads, not its call signature
+or output shape — verified: `js/dashboardCharts.js` and
+`js/dashboardCards.js` only ever consume that module's output shape,
+never a raw query).
 
 **Category identity model (replaces name-string identity):**
-Categories (`Starter`, `Essential`, `Ultimate`, `Mobile`, …) get
+Categories (`Starter`, `Essential`, `Ultimate`, `Mobile`, …) have
 permanent immutable IDs in org-config (`orgs/{orgId}.categories: [{id,
 label}]`); the display name is a label on the ID, editable via the
-Products config panel. Every reference that used to store the name
-string directly — `products.category`, `submissions.category`,
+Products config panel (manager-only UI). Every LIVE-CONFIG reference
+that used to store the name string directly — `products.category`,
 `users.specialties[]`, `ORG_DEFAULTS.itemFieldsByCategory` keys —
-migrates to store the ID instead, resolving the label at render time.
-Rename = one label edit, reflects everywhere by construction (specialty
-checklists, field-mapping lookups, dashboard breakdowns) with no
-per-reference update needed. Category delete is blocked while any
-product still references the ID, with the blocking products listed to
-the manager.
+migrated to store the ID instead, resolving the label at render time
+via `categoryLabel()` (`js/orgConfig.js`), which falls back to the raw
+value unchanged for anything not a known ID — makes the same call site
+safe for both migrated and not-yet-migrated data. `submissions.category`
+was deliberately left OUT of the migration: a submission is an
+immutable point-in-time snapshot, not live config, and `categoryLabel()`'s
+fallback already displays a pre-migration submission's raw legacy value
+correctly with no code change needed. Rename = one label edit, reflects
+everywhere immediately by construction (specialty checklists,
+field-mapping lookups, Products display) — verified live. Category
+delete is blocked while any product still references the ID, with the
+blocking products listed to the manager. Contract-term labels
+(`orgs/{orgId}.contractTermLabels: {term: label}`) are a parallel,
+separate override — unlike categories, a pricingOption's own stored
+label is NEVER migrated away; the override is optional and falls back
+to each product's own label, so nothing breaks if it's never set.
+
+**Manager's Cockpit dashboard** (`js/dashboard.js`'s `#mgr-cockpit`,
+manager-only): period selector (This Month/Last Month/This
+Quarter/Custom ≤92 days) + AED/Count mode toggle, shared by all three
+sections below. "Share by Team" and "Share by Contributor" donuts
+(`js/dashboardCharts.js`, dependency-free hand-rolled SVG arcs).
+Donut/role-metric attribution rule: a normal line credits the
+submitting agent (`agentId`); an `accTransfer`-flagged line (the only
+existing schema signal for "brought in via an external partner, not
+the funnel") credits that partner instead, falling back to the literal
+"Outsourced Revenue" bucket when no partner name was recorded. A sales
+agent's own `aedClosed`/`linesSubmitted` role-metric row is independent
+of that attribution split — it's keyed on `agentId` directly (their
+personal output), not on who the donut credits. Role metrics
+(`js/dashboardCards.js`): sales agent = AED closed + lines submitted;
+backend = submissions handled + queue wait (created→claimed) +
+handling time (claimed→submittedToDu) + du turnaround
+(submittedToDu→activated, explicitly labeled du's own clock, not the
+backend agent's performance) — each duration is an average of raw
+per-submission samples, rendered N/A (never a fabricated 0) when a
+backend agent has no qualifying samples that period; KAM/escalations
+is a reserved placeholder card only.
+
+**Target-remaining + run-rate toggle:** AED remaining vs. the sum of
+active agents' `monthlyTarget`, shown for This Month only — every
+other period has no directly comparable target in this schema and
+renders N/A rather than a guessed pro-rated figure. Days-left (calendar
+days remaining in the month, today inclusive) and required daily
+run-rate (AED remaining / days left) are gated behind a visibility
+toggle, default OFF. Resolution: a per-user override
+(`users/{uid}.runRateVisible`) always wins over the org-config default
+(`orgs/{orgId}.runRateDefaultVisible`) in either direction — verified
+live across all four combinations (org on/user null, org off/user
+null, org off/user true, org on/user false), each producing the
+correct effective value. The per-user override needs no dedicated rule
+— it's already covered by the `users` collection's existing self-write
+clause. The org-default toggle is manager-**and-team-lead**-writable at
+the rule level (`orgs/{oid}`'s `hasOnly(['runRateDefaultVisible'])`
+narrow exception, verified live: a TL can write that field alone, is
+denied for `categories`/`contractTermLabels` alone, and is denied for
+both together with no partial application) — **but no UI currently
+exposes it to a TL**: the entire Manager's Cockpit section, including
+the only "Set as Org Default" button in the app, is manager-only
+(`role === 'manager'` gate in `js/dashboard.js`). This is intentionally
+NOT built this session, and is not an open-ended gap: **the TL
+org-default toggle UI ships with the TL/agent-facing target views
+phase; rule-level support already live and verified.** Rationale: the
+toggle governs a manager-only view today, so TL-facing UI for it is
+meaningless until TL/agent-facing target views exist to put it in.
 
 **Escalation attribution rule (recorded now, applied when the
 escalations module itself ships in Phase E):** whoever RESOLVES an
@@ -444,3 +507,70 @@ since backend already fields plenty of escalation-adjacent work today.
 This session only reserves "coming with escalations module" placeholder
 slots in the role-metrics cards; no escalation data model or UI ships
 here.
+
+**Rules (Step 8, published):** new `orgs/{oid}` collection —
+authorized by KEY MATCH (`oid == userDoc().orgId`), not
+`sameOrg()`/`sameOrgWrite()`, since the doc ID itself is the identity
+(no bootstrap-window guard needed either — brand-new collection, no
+pre-migration legacy data). Read: any same-org user. Write: manager
+unrestricted; team_lead narrowed to `runRateDefaultVisible` only.
+Separately, **a real privilege-escalation gap was found and fixed
+during this step's review**: the `users` collection's self-write
+clause previously let any user update ANY field on their own doc,
+including `role`/`department` — an agent could self-promote to manager
+or self-assign to backend and pass every `role()=='manager'`/
+`isActiveBackend()` check in the whole rules file. Fixed by narrowing
+self-write to exclude a blocklist of privileged/compensation/identity
+fields (`role`, `department`, `orgId`, `teamId`, `tlId`, `active`,
+`monthlyTarget`, `targetSource`, `autoTarget`, `permissions`,
+`specialties`, `available`, `email`, `createdBy`, `createdAt`) — manager
+stays unrestricted. Verified live, twice: the first publish attempt
+turned out to be a stale pre-fix version (agent self-promotion to
+manager briefly succeeded against live data, immediately reverted,
+root-caused to a publish mismatch not a logic bug, republished and
+reverified clean). One composite index: `submissions (status ASC,
+activatedAt ASC)` for the dashboard's activated-in-period query — the
+two other dashboard queries (`createdAt` range, `claimedAt` range) are
+single-field ranges, already auto-indexed.
+
+**Rules-engine finding (LIST-query provability):** a manager's list
+query against `submissions` succeeds with NO `where('orgId',...)`
+filter, even though the read rule's `sameOrg()` clause references
+`resource.data.orgId` — `role()=='manager'` being a request-time-only
+fact (one `get()` on the caller's own doc) is sufficient to satisfy the
+whole conjunction, confirmed via `tools/rules-probe.html` (an
+adversarial probe built specifically to settle this, independent of
+the app's own Firebase module instance) run against both a manager
+account (four query shapes, all succeeded) and a sales-agent control
+(all four correctly denied, proving the probe isn't itself bypassing
+rules). This is a property of THIS rule shape (a request-time-only
+role escape ORed with resource.data-dependent branches), not a general
+guarantee — **re-run `tools/rules-probe.html` as manager AND as a
+non-privileged control account before merging any future change to
+`sameOrg()`/`sameOrgWrite()` or any similarly-shaped rule.**
+
+**Rules-engine finding (get-on-nonexistent-doc, extends the
+existing gotcha):** `getDoc()` on a nonexistent document can be denied
+even when the rule never references `resource.data` at all — observed
+live on `orgs/{oid}`'s pure key-match read rule (`oid ==
+userDoc().orgId`, no `resource` reference whatsoever) before that doc
+existed; the identical read succeeded immediately after the doc was
+created. `js/orgConfig.js`'s `loadOrgConfig()` and `js/org.js`'s
+`computeCategoryMigrationPlan()` already wrapped this read in a
+try/catch treating any failure as "doesn't exist" (originally written
+defensively for "rule not published yet"), so this needed no code fix
+— but it means the earlier-documented "denied get() on nonexistent
+doc" pattern (submissionDocs, Phase B) is broader than first scoped:
+it is not conditional on the rule touching `resource.data`.
+
+**Regression:** donut totals, byTeam, byContributor (including both
+the accTransfer-with-partner and accTransfer-without-partner
+"Outsourced Revenue" fallback), sales-agent role metrics, and all
+three backend timing averages were reconciled against a 6-line
+hand-calculated fixture (one normal agent-attributed line, two
+manager-kept/external-source lines, a 2-line partial-activation bundle,
+and one activated line with no `claimedAt`) — every field matched the
+hand calculation exactly, which also proves partial-bundle-activation
+handling (the pending sibling's AED correctly excluded from totals)
+and the queue-wait N/A mechanism (the no-`claimedAt` line correctly
+excluded from the average, not fabricated as 0) in the same pass.

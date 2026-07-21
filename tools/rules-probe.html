@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Firestore Rules Adversarial Probe</title>
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#eee;padding:24px;max-width:800px;margin:0 auto}
+  h2{color:#f87171}
+  input{padding:8px;margin:4px 4px 4px 0;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:4px}
+  button{padding:8px 16px;margin:4px 4px 4px 0;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer}
+  button:disabled{opacity:.4;cursor:default}
+  .ok{color:#4ade80}
+  .err{color:#f87171}
+  .dim{color:#888}
+  pre{background:#1a1a1a;padding:14px;border-radius:6px;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+</style>
+</head>
+<body>
+<!--
+  Firestore rules adversarial probe — Session B4 Step 8 review.
+
+  Origin: built to resolve a contested LIST-query provability claim
+  (does sameOrg()'s resource.data.orgId reference block a manager's
+  filterless/partially-filtered submissions query without an explicit
+  where('orgId','==',...)?). Independent of index.html/js/state.js —
+  its own Firebase app instance, own login form — specifically to rule
+  out any app-state/harness artifact from Claude-run in-app console
+  testing skewing the result.
+
+  RESULT MATRIX (2026-07-21, run by Ashok, rules as of commit prior to
+  this session's Step 8 orgs/users changes — i.e. the ORIGINAL sameOrg()-
+  gated submissions read rule, unmodified by this session):
+
+    Manager account:
+      (1) bare collection('submissions')                 -> OK
+      (2) where('status','==','activated')                -> OK
+      (3) where('createdAt', range)                        -> OK
+      (4) where('orgId','==','shauntech')                  -> OK
+      (5) own user doc                                     -> contains orgId field
+
+    Sales agent account (control):
+      (1)-(4), all four shapes                             -> permission-denied
+
+  Conclusion: role()=='manager' being a request-time-only fact (one
+  get() on the caller's own doc) IS sufficient to satisfy the whole
+  conjunction (isAuth() && sameOrg() && (role()=='manager' || ...)) for
+  a manager's list query, with NO where('orgId',...) filter needed —
+  confirmed live, not just reasoned. The agent control confirms the
+  harness itself is not bypassing rules (agent is correctly denied on
+  every shape, exactly as the agent-only OR-branches require). The
+  original Firestore-index-only diagnosis for the dashboard's
+  status+activatedAt query stands; no orgId filter was ever needed.
+
+  RE-RUN OBLIGATION: any future change to sameOrg()/sameOrgWrite() (or
+  any rule that gates a LIST query on a resource.data-dependent
+  condition ANDed with a request-time-only role escape) must re-run
+  this probe as manager AND as a non-privileged control account before
+  merging — this result is a property of the SPECIFIC rule shape tested,
+  not a general guarantee about Firestore's rules engine.
+-->
+<h2>Firestore Rules Adversarial Probe</h2>
+<p class="dim">Standalone page, independent of index.html/js/state.js — signs in and queries directly against the SAME Firebase project this app uses. See the file header comment for this probe's origin and the last recorded result matrix. Re-run after any change to sameOrg()/sameOrgWrite() or any resource.data-dependent rule clause.</p>
+
+<div id="login">
+  <input type="email" id="email" placeholder="email" size="30"><br>
+  <input type="password" id="pw" placeholder="password" size="30"><br>
+  <button id="signin">Sign In</button>
+</div>
+<div id="status" class="dim">Not signed in.</div>
+<button id="signout" style="display:none">Sign Out</button>
+<button id="run" style="display:none">Run Tests</button>
+
+<pre id="out"></pre>
+
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+  import { getFirestore, doc, getDoc, collection, query, where, getDocs } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+  import { firebaseConfig, orgId } from '../config.js';
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  const out      = document.getElementById('out');
+  const statusEl = document.getElementById('status');
+  const runBtn   = document.getElementById('run');
+  const signoutBtn = document.getElementById('signout');
+
+  document.getElementById('signin').onclick = async () => {
+    const email = document.getElementById('email').value.trim();
+    const pw    = document.getElementById('pw').value;
+    statusEl.textContent = 'Signing in…';
+    try { await signInWithEmailAndPassword(auth, email, pw); }
+    catch(e){ statusEl.textContent = 'Sign-in failed: ' + e.message; }
+  };
+  signoutBtn.onclick = () => signOut(auth);
+
+  onAuthStateChanged(auth, user => {
+    if(user){
+      statusEl.innerHTML = `Signed in as <b>${user.email}</b> (uid <span class="dim">${user.uid}</span>)`;
+      runBtn.style.display = 'inline-block';
+      signoutBtn.style.display = 'inline-block';
+    } else {
+      statusEl.textContent = 'Not signed in.';
+      runBtn.style.display = 'none';
+      signoutBtn.style.display = 'none';
+      out.textContent = '';
+    }
+  });
+
+  function log(line, cls){
+    const div = document.createElement('div');
+    if(cls) div.className = cls;
+    div.textContent = line;
+    out.appendChild(div);
+  }
+
+  async function test(label, fn){
+    try {
+      const result = await fn();
+      log(`OK   ${label} — ${result}`, 'ok');
+    } catch(e) {
+      log(`FAIL ${label} — code: ${e.code || '(none)'} — ${e.message}`, 'err');
+    }
+  }
+
+  runBtn.onclick = async () => {
+    out.textContent = '';
+    const uid = auth.currentUser.uid;
+    log(`project: ${firebaseConfig.projectId}   orgId constant: ${orgId}\n`, 'dim');
+
+    // (5) own user doc, verbatim
+    try {
+      const snap = await getDoc(doc(db,'users',uid));
+      log('(5) own user doc: ' + (snap.exists() ? JSON.stringify(snap.data(), null, 2) : 'DOES NOT EXIST'));
+    } catch(e) {
+      log(`FAIL (5) own user doc read — code: ${e.code || '(none)'} — ${e.message}`, 'err');
+    }
+    log('');
+
+    await test("(1) bare collection('submissions')", async () => {
+      const s = await getDocs(collection(db,'submissions'));
+      return `${s.size} docs`;
+    });
+
+    await test("(2) where('status','==','activated')", async () => {
+      const s = await getDocs(query(collection(db,'submissions'), where('status','==','activated')));
+      return `${s.size} docs`;
+    });
+
+    await test("(3) where('createdAt', range 2000-01-01..2099-01-01)", async () => {
+      const s = await getDocs(query(collection(db,'submissions'), where('createdAt','>=','2000-01-01'), where('createdAt','<=','2099-01-01')));
+      return `${s.size} docs`;
+    });
+
+    await test(`(4) where('orgId','==','${orgId}')`, async () => {
+      const s = await getDocs(query(collection(db,'submissions'), where('orgId','==',orgId)));
+      return `${s.size} docs`;
+    });
+  };
+</script>
+</body>
+</html>
