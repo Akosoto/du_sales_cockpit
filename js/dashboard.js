@@ -1,9 +1,11 @@
-import { db, CU, CP, doc, getDoc, collection, query, where, getDocs } from './state.js';
+import { db, CU, CP, OC, doc, getDoc, collection, query, where, getDocs } from './state.js';
 import { esc, fmtDate, stagePill, toast } from './helpers.js';
+import { dbUpdate } from './db.js';
 import { showLeadModal } from './leads.js';
 import { getDashboardData } from './dashboardData.js';
 import { renderDonutCard } from './dashboardCharts.js';
 import { renderRoleMetricsSection } from './dashboardCards.js';
+import { saveOrgConfig, withOrgConfigSave } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // DASHBOARD TAB
@@ -251,11 +253,11 @@ function renderManagerCockpit(){
 
   async function refresh(){
     box.innerHTML = '<div class="loading"><div class="spin"></div> Loading…</div>';
-    let data, err = '';
+    let data, err = '', users = [];
     try {
       const allTeams = await fetchAllTeams();
       const usersSnap = await getDocs(collection(db,'users'));
-      const users = usersSnap.docs.map(d=>({id:d.id,...d.data()}));
+      users = usersSnap.docs.map(d=>({id:d.id,...d.data()}));
       const periodArg = period === 'custom' ? { preset:'custom', from:customFrom, to:customTo } : period;
       data = await getDashboardData(periodArg, { teams: allTeams, users });
     } catch(e){
@@ -271,6 +273,54 @@ function renderManagerCockpit(){
     const periodBtn = (id,label) => `<button class="ch-tag${period===id?' active':''}" data-period="${id}">${esc(label)}</button>`;
     const modeBtn = (id,label) => `<button class="ch-tag${mode===id?' active':''}" data-mode="${id}">${esc(label)}</button>`;
 
+    // Target Remaining + run-rate toggle (Session B4 Step 7, ARCHITECTURE.md
+    // §12 fixed decisions). Only "This Month" has a defined equivalent to
+    // compare against — monthlyTarget is the only target this schema
+    // tracks, so every other period is N/A rather than guessing at a
+    // pro-rated figure nobody asked for. Visibility: a per-user override
+    // (CP.runRateVisible, already coverable by the EXISTING users/{uid}
+    // update rule's self-write clause — no Step 8 dependency) always wins
+    // over the org default (orgs/{orgId}.runRateDefaultVisible, which DOES
+    // need Step 8's rule) in either direction; default is OFF (hidden).
+    function targetRemainingHtml(usersList){
+      if(period !== 'thisMonth'){
+        return `<div class="section-card" style="margin-bottom:14px">
+          <div style="font-weight:700;font-size:14px;margin-bottom:4px">🎯 Target Remaining</div>
+          <p class="text-dim text-xs" title="monthlyTarget is the only target this schema tracks — only This Month has a directly comparable figure.">N/A for ${esc(data.period.label)} — target-remaining only applies to This Month.</p>
+        </div>`;
+      }
+      const target = usersList.filter(u=>u.role==='agent').reduce((s,u)=>s+(Number(u.monthlyTarget)||0),0);
+      if(!target){
+        return `<div class="section-card" style="margin-bottom:14px">
+          <div style="font-weight:700;font-size:14px;margin-bottom:4px">🎯 Target Remaining</div>
+          <p class="text-dim text-xs">No target set for any agent.</p>
+        </div>`;
+      }
+      const achieved  = data.totals.activatedAed;
+      const exceeded  = achieved > target;
+      const remaining = Math.abs(target - achieved);
+      const showRunRate = CP.runRateVisible != null ? CP.runRateVisible : !!(OC?.runRateDefaultVisible);
+      const t = new Date();
+      const daysLeft = new Date(t.getFullYear(), t.getMonth()+1, 0).getDate() - t.getDate() + 1; // today inclusive
+      const runRate = daysLeft > 0 ? remaining / daysLeft : remaining;
+      return `<div class="section-card" style="margin-bottom:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+          <div style="font-weight:700;font-size:14px">🎯 Target Remaining</div>
+          <div class="flex gap-8">
+            <button class="btn btn-ghost btn-xs" id="mc-runrate-toggle">${showRunRate?'Hide':'Show'} Run-Rate</button>
+            <button class="btn btn-ghost btn-xs" id="mc-runrate-default">Set as Org Default</button>
+          </div>
+        </div>
+        <div class="kpi-grid" style="margin-bottom:0">
+          <div class="kpi-card"><div class="kpi-val" style="color:${exceeded?'var(--green)':'var(--t1)'}">AED ${Number(remaining).toLocaleString()}</div><div class="kpi-lbl">${exceeded?'Exceeded By':'Remaining'}</div></div>
+          <div class="kpi-card"><div class="kpi-val">AED ${Number(target).toLocaleString()}</div><div class="kpi-lbl">Target</div></div>
+          ${showRunRate ? `
+          <div class="kpi-card"><div class="kpi-val">${daysLeft}</div><div class="kpi-lbl">Days Left</div></div>
+          <div class="kpi-card"><div class="kpi-val" style="color:var(--amber)">AED ${Number(Math.round(runRate)).toLocaleString()}</div><div class="kpi-lbl">Required Daily Run-Rate</div></div>` : ''}
+        </div>
+      </div>`;
+    }
+
     box.innerHTML = `
       <div class="pg-hdr" style="margin-bottom:12px">
         <div><h2 style="font-size:1.05rem">🎯 Manager's Cockpit</h2><p class="pg-hdr-sub">Activated submissions${data?` · ${esc(data.period.label)}`:''}</p></div>
@@ -285,6 +335,7 @@ function renderManagerCockpit(){
       <button class="btn btn-ghost btn-sm mb-12" id="mc-apply-range">Apply Range</button>` : ''}
       <div class="filters" style="margin-bottom:12px">${modeBtn('aed','AED')}${modeBtn('count','Count')}</div>
       ${err ? `<p class="err">${esc(err)}</p>` : `
+      ${targetRemainingHtml(users)}
       <div class="dash-donut-grid">
         ${renderDonutCard('Share by Team', data.byTeam.map(t=>({name:t.teamName, aed:t.aed, count:t.count})), mode)}
         ${renderDonutCard('Share by Contributor', data.byContributor.map(c=>({name:c.name, aed:c.aed, count:c.count})), mode)}
@@ -302,6 +353,23 @@ function renderManagerCockpit(){
       customFrom = document.getElementById('mc-from').value;
       customTo = document.getElementById('mc-to').value;
       if(!customFrom || !customTo){ toast('Pick both dates.','err'); return; }
+      refresh();
+    });
+    box.querySelector('#mc-runrate-toggle')?.addEventListener('click', async ()=>{
+      // Per-user override — covered by the users/{uid} rule's EXISTING
+      // self-write clause (request.auth.uid == uid), so this works today,
+      // no Step 8 dependency, unlike the org-default save below.
+      const current = CP.runRateVisible != null ? CP.runRateVisible : !!(OC?.runRateDefaultVisible);
+      try {
+        await dbUpdate('users', CU.uid, { runRateVisible: !current });
+        CP.runRateVisible = !current;
+        refresh();
+      } catch(e){ toast('Error: '+e.message,'err'); }
+    });
+    box.querySelector('#mc-runrate-default')?.addEventListener('click', async ()=>{
+      const current = CP.runRateVisible != null ? CP.runRateVisible : !!(OC?.runRateDefaultVisible);
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({ runRateDefaultVisible: current }));
+      if(ok) toast('Org default updated.');
       refresh();
     });
 

@@ -1,11 +1,10 @@
 import {
-  db, CU, CP, OC,
+  db, CU, CP,
   collection, query, where, getDocs
 } from './state.js';
-import { dbAdd, dbSet, dbUpdate, newBatch, batchAdd } from './db.js';
+import { dbAdd, dbUpdate, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
-import { currentCategories, categoryLabel, currentTermLabels, termLabel, loadOrgConfig } from './orgConfig.js';
-import { orgId } from '../config.js';
+import { currentCategories, categoryLabel, currentTermLabels, termLabel, loadOrgConfig, saveOrgConfig, withOrgConfigSave } from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // PRODUCTS — SEED DATA  (du Business, June 2026)
@@ -699,25 +698,10 @@ function showManageWaiversModal(product, onUpdate){
 // termLabel()) — no product data migration needed, renaming just adds/
 // updates the override.
 //
-// orgs/{orgId} has no published Firestore rule yet as of this step — its
-// rule ships in Step 8 (PAUSE POINT). Every write here goes through
-// withOrgConfigSave() so a permission-denied failure surfaces a clear
-// "not yet available" message instead of a raw Firestore error, without
-// blocking the rest of the panel.
-function saveOrgConfig(patch){
-  return dbSet('orgs', orgId, { ...(OC||{}), ...patch }, {skipAudit:true});
-}
-async function withOrgConfigSave(fn){
-  try {
-    await fn();
-    await loadOrgConfig();
-    return true;
-  } catch(e){
-    const denied = e.code === 'permission-denied' || /insufficient permissions/i.test(e.message||'');
-    toast(denied ? "Can't save yet — org config rules ship in Step 8 of this build. Not saved." : 'Error: '+e.message, 'err');
-    return false;
-  }
-}
+// saveOrgConfig/withOrgConfigSave now live in js/orgConfig.js (Step 7 added
+// a second consumer — the Dashboard's run-rate default toggle — so the
+// merge-then-set + graceful-degradation pattern moved to the shared module
+// instead of staying a products.js-local helper).
 
 function showCategoryConfigModal(products, onSaved){
   function countFor(catId){ return products.filter(p=>p.category===catId); }

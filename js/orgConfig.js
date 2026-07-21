@@ -1,4 +1,6 @@
 import { db, OC, setOrgConfig, doc, getDoc } from './state.js';
+import { dbSet } from './db.js';
+import { toast } from './helpers.js';
 import { orgId } from '../config.js';
 
 // ════════════════════════════════════════════════════
@@ -91,4 +93,32 @@ export function termLabel(term, fallbackLabel){
 // config panel to render/edit directly.
 export function currentTermLabels(){
   return OC?.contractTermLabels || {};
+}
+
+// ── SHARED ORG-CONFIG WRITE PATH (Session B4 Steps 3 & 7) ──
+// Every write to orgs/{orgId} — from more than one feature now (Products'
+// category/term config, the Dashboard's run-rate default toggle) — goes
+// through here so they share one merge-then-set pattern instead of each
+// hand-rolling it. Always spreads the current OC first and dbSet()s the
+// WHOLE doc (never a partial update), so a category edit can't clobber a
+// concurrently-set contractTermLabels/runRateDefaultVisible field or vice
+// versa.
+//
+// orgs/{orgId} has no published Firestore rule yet as of Step 3 — it ships
+// in Step 8 (PAUSE POINT). withOrgConfigSave() surfaces that as a clear
+// "not yet available" toast instead of a raw Firestore error, and never
+// blocks whatever else the caller's UI is doing.
+export function saveOrgConfig(patch){
+  return dbSet('orgs', orgId, { ...(OC||{}), ...patch }, {skipAudit:true});
+}
+export async function withOrgConfigSave(fn){
+  try {
+    await fn();
+    await loadOrgConfig();
+    return true;
+  } catch(e){
+    const denied = e.code === 'permission-denied' || /insufficient permissions/i.test(e.message||'');
+    toast(denied ? "Can't save yet — org config rules ship in Step 8 of this build. Not saved." : 'Error: '+e.message, 'err');
+    return false;
+  }
 }
