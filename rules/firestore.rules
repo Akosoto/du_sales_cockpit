@@ -61,7 +61,26 @@ service cloud.firestore {
         request.auth.uid == uid ||
         (role() == 'manager' && sameOrgWrite())
       );
-      allow update: if isAuth() && (request.auth.uid == uid || role() == 'manager') && sameOrg();
+      // Step 8 review fix: the old clause let a user update ANY field on
+      // their own doc, including role/department/orgId/teamId — an agent
+      // could self-write role:'manager' or department:'backend' and pass
+      // every role()=='manager'/isActiveBackend() check in this whole file.
+      // Manager stays unrestricted; self-write is now narrowed to exclude
+      // every privileged/compensation-relevant/identity field. Traced
+      // db.js's dbUpdate() to confirm the actual payload for a self-write
+      // (e.g. the run-rate preference, js/dashboard.js) also carries
+      // lastEditedBy/lastEditedAt (auditUpdate(), not in this blocklist),
+      // so ordinary self-writes still pass with this narrower rule.
+      allow update: if isAuth() && sameOrg() && (
+        role() == 'manager' ||
+        (request.auth.uid == uid
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                'role','department','orgId','teamId','tlId','active',
+                'monthlyTarget','targetSource','autoTarget',
+                'permissions','specialties','available','email',
+                'createdBy','createdAt'
+              ]))
+      );
       allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
@@ -191,6 +210,50 @@ service cloud.firestore {
       allow read: if isAuth() && sameOrg();
       allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
       allow update, delete: if isAuth() && role() == 'manager' && sameOrg();
+    }
+
+    // ── ORGS (Session B4, ARCHITECTURE.md §3/§12) ───
+    // Single per-deployment config doc, keyed by the org's own orgId — the
+    // doc ID IS the identity, so this collection is authorized by KEY MATCH
+    // (oid == userDoc().orgId) instead of sameOrg()/sameOrgWrite(). Step 8
+    // review fix: those two helpers read resource.data.orgId /
+    // request.resource.data.orgId, and while js/db.js's dbSet() gateway
+    // actually does stamp an orgId FIELD onto every write today (so the
+    // original sameOrgWrite()-based create wouldn't have errored in
+    // practice), relying on that was fragile — a future edit to stop
+    // stamping a redundant field (since the doc ID already carries the
+    // identity) would silently break create with no warning. Key-matching
+    // has no such dependency and needs no bootstrap-window guard: this is a
+    // brand-new collection, so there's no pre-migration legacy data to
+    // support, unlike sameOrg()'s 'orgId' in resource.data checks elsewhere
+    // in this file.
+    //
+    // Read is open to every authenticated same-org user since
+    // loadOrgConfig() runs for every role at login — category labels and
+    // specialty checklists need it before first paint, not just for
+    // managers. Write is split per-field: manager can touch anything on
+    // this doc (categories, contractTermLabels, Step 3), team_lead is
+    // narrowed to ONLY runRateDefaultVisible (Step 7's fixed decision),
+    // same hasOnly() narrow-exception pattern as teams.assignmentCursor and
+    // leads.submissionSummary above — a team_lead write that touches
+    // categories or contractTermLabels alongside it is rejected outright,
+    // not silently partially applied.
+    //
+    // Doc creation: no code path has created this doc yet (Step 2's
+    // migration and Steps 3/7's saveOrgConfig() all attempt it but every
+    // attempt so far predates these rules being published). First real
+    // creation happens at the start of Step 9 (regression), by re-running
+    // the Step 2 migration as manager — verified with a live getDoc()
+    // immediately after, not assumed.
+    match /orgs/{oid} {
+      allow read: if isAuth() && oid == userDoc().orgId;
+      allow create: if isAuth() && role() == 'manager' && oid == userDoc().orgId;
+      allow update: if isAuth() && oid == userDoc().orgId && (
+        role() == 'manager' ||
+        (role() == 'team_lead'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['runRateDefaultVisible']))
+      );
+      allow delete: if isAuth() && role() == 'manager' && oid == userDoc().orgId;
     }
 
     // ── SUBMISSIONS ──────────────────────────────────

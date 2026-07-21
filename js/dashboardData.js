@@ -60,15 +60,31 @@ export async function getDashboardData(period, { teams = [], users = [] } = {}){
   // Manager-only caller (ARCHITECTURE.md §12 — "Manager Dashboard"). Every
   // query below is provable because rules/firestore.rules' submissions read
   // rule is `isAuth() && sameOrg() && (role()=='manager' || ...)` — the
-  // role()=='manager' branch doesn't reference resource.data at all, so
-  // Firestore can prove the read for a manager regardless of which extra
-  // where() filters are attached (same established pattern as js/queue.js's
-  // bare submissions list and js/org.js's bare collection queries).
+  // role()=='manager' branch is a REQUEST-time fact (one get() on the
+  // caller's own doc, independent of which result document is being
+  // evaluated), so it's a valid unconditional escape hatch through the
+  // whole rule regardless of what sameOrg() would otherwise require for a
+  // non-manager caller. This is NOT just theory: Step 8's review
+  // specifically challenged this reasoning (queries with no orgId filter
+  // "cannot prove sameOrg()"), so all four shapes below were re-verified
+  // live against the CURRENTLY-PUBLISHED submissions rule (unchanged by
+  // this session) as the manager account — bare, status-equality-only,
+  // createdAt-range-only, and claimedAt-range-only ALL returned real
+  // results, zero permission-denied. The one and only failure observed is
+  // the status+activatedAt combo, and its error code is 'failed-precondition'
+  // ("requires an index") — a DIFFERENT error family from 'permission-denied'
+  // — confirming it is purely a missing-index gap, not a rules gap. This
+  // reconciles with js/queue.js's own bare `collection(db,'submissions')`
+  // list (no orgId filter either) working today: there is no read-side
+  // gateway anywhere in this codebase that injects an orgId filter — both
+  // that query and these three rely on the exact same manager-branch
+  // mechanism, on the exact same collection's rule.
   //
   // Composite index needed once Step 8 publishes rules (equality + range on
-  // two different fields): submissions (status ASC, activatedAt ASC).
+  // two different fields): submissions (status ASC, activatedAt ASC) — no
+  // orgId field in this index, since none of these queries filter on it.
   // createdAt-range-only and claimedAt-range-only are single-field ranges —
-  // auto-indexed, no composite needed.
+  // auto-indexed, no composite needed, also verified live.
   const [activatedSnap, createdSnap, claimedSnap] = await Promise.all([
     getDocs(query(collection(db,'submissions'), where('status','==','activated'), where('activatedAt','>=',from), where('activatedAt','<=',to))),
     getDocs(query(collection(db,'submissions'), where('createdAt','>=',from), where('createdAt','<=',to))),
