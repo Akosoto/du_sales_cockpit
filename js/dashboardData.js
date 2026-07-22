@@ -108,15 +108,21 @@ export async function getDashboardData(period, { teams = [], users = [] } = {}){
     const t = byTeamMap[teamKey] || (byTeamMap[teamKey] = { teamId: s.teamId||null, teamName: teamById[s.teamId]?.name || 'Unassigned', aed:0, count:0 });
     t.aed += aed; t.count++;
 
-    // Attribution rule (ARCHITECTURE.md §12): assigned leads credit the
-    // submitting agent; an accTransfer-flagged line (account brought in via
-    // an external partner, not the normal funnel — the only "manager-kept
-    // external-source" signal this schema already tracks) credits that
-    // partner instead, falling back to the literal "Outsourced Revenue"
-    // bucket when no partner name was recorded.
-    const isExternal = !!s.accTransfer?.flag;
-    const key  = isExternal ? (s.accTransfer.fromPartner || 'Outsourced Revenue') : (s.agentId || 'unknown');
-    const name = isExternal ? (s.accTransfer.fromPartner || 'Outsourced Revenue') : (s.agentName || 'Unknown');
+    // Attribution rule (ARCHITECTURE.md §13, Session B5 — replaces the B4
+    // accTransfer-based proxy): a normal line credits the submitting agent;
+    // a sourcedBy-flagged line (brought in by an external partner/
+    // freelancer/subcontractor, not the normal funnel) credits that
+    // partner instead, falling back to "Outsourced Revenue" when no partner
+    // name was recorded. accTransfer is deliberately NOT read here anymore
+    // — it's an operational account-takeover marker (custody moving from a
+    // losing partner to us, reversible by du), orthogonal to sourcing;
+    // crediting revenue to fromPartner (often the losing competitor) was
+    // wrong by design, not just imprecise. See js/submissions.js for where
+    // sourcedBy is captured (create-time only, same pattern accTransfer
+    // already used).
+    const isExternal = !!s.sourcedBy?.flag;
+    const key  = isExternal ? (s.sourcedBy.partnerName || 'Outsourced Revenue') : (s.agentId || 'unknown');
+    const name = isExternal ? (s.sourcedBy.partnerName || 'Outsourced Revenue') : (s.agentName || 'Unknown');
     const c = byContribMap[key] || (byContribMap[key] = { key, name, type: isExternal?'partner':'agent', aed:0, count:0 });
     c.aed += aed; c.count++;
   });
