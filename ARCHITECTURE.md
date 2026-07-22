@@ -574,3 +574,32 @@ hand calculation exactly, which also proves partial-bundle-activation
 handling (the pending sibling's AED correctly excluded from totals)
 and the queue-wait N/A mechanism (the no-`claimedAt` line correctly
 excluded from the average, not fabricated as 0) in the same pass.
+
+## 13. Session B5 — Sourcing & Transfer Tracking (STUB — finalized in Step 6)
+
+**Why this session exists:** B4's donut/contributor attribution used
+`accTransfer.fromPartner` as a proxy for "sourced by an external
+partner." Domain review after B4 shipped established that
+`accTransfer` is actually an operational TAKEOVER marker — it records
+du account custody moving from a losing partner to us, a transfer du
+itself can reject — and is orthogonal to sourcing: a freelancer- or
+subcontractor-sourced sale may still need an account transfer, and a
+transfer may happen on a deal that was never externally sourced.
+Crediting revenue to `fromPartner` (frequently the LOSING competitor
+in a takeover) was wrong by design, not merely imprecise. Zero
+submissions have ever had `accTransfer.flag == true` in production
+(confirmed via a live data pull before this session started), so there
+is no data to migrate — this is a pure go-forward correction.
+
+Scope: (1) repoint donut/contributor attribution onto a new, separate
+`sourcedBy` field instead of `accTransfer`; (2) capture `sourcedBy` on
+the Submit-to-Backend modal, alongside (not replacing) the existing
+`accTransfer` capture — both concepts are real and both stay; (3) add
+manager/backend-driven transfer OUTCOME tracking
+(`pending`/`completed`/`rejected`+reason) for `accTransfer`-flagged
+lines, since a takeover request being rejected by du is a real
+operational stall worth surfacing, distinct from and non-blocking to
+the document-rejection lifecycle. No rules or index changes are
+expected — `sourcedBy` rides the same agent-create path `accTransfer`
+already used, `transferStatus` rides backend/manager's existing
+unrestricted submissions update.
