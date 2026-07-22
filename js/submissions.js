@@ -158,7 +158,7 @@ export function generateBundleId(){
 // commits ONCE itself — this function then adds its writes to that batch
 // WITHOUT committing. Omit both for the normal standalone case (this
 // function generates its own bundleId and commits its own batch, as before).
-export async function createSubmissions({ lead, company, items, requiredDocs, accTransfer, teams, users, bundleId: providedBundleId, externalBat }){
+export async function createSubmissions({ lead, company, items, requiredDocs, accTransfer, sourcedBy, teams, users, bundleId: providedBundleId, externalBat }){
   const backendTeam   = teams.find(t => t.department === 'backend');
   const backendAgents = backendTeam
     ? users.filter(u => u.role === 'agent' && u.teamId === backendTeam.id)
@@ -169,6 +169,13 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
   const bundleId = providedBundleId || generateBundleId();
   const requiredDocsPayload = requiredDocs.map(rd => ({ type: rd.type, status: rd.status || 'attested', expiryDate: rd.expiryDate || null, storageRef: rd.storageRef || null }));
   const accTransferPayload = accTransfer?.flag ? { flag: true, fromPartner: accTransfer.fromPartner || '' } : { flag: false, fromPartner: '' };
+  // sourcedBy (ARCHITECTURE.md §13, Session B5) — captures whether an
+  // external partner/freelancer/subcontractor brought in the deal, an
+  // ORTHOGONAL concept to accTransfer above (that's an account-custody
+  // takeover, this is deal origin): a deal can be sourced externally with
+  // no transfer needed, or transferred with no external sourcing involved.
+  // Create-time only, immutable thereafter — same pattern as accTransfer.
+  const sourcedByPayload = sourcedBy?.flag ? { flag: true, partnerName: sourcedBy.partnerName || '' } : { flag: false, partnerName: '' };
 
   // Resolve teamId/tlId from the ASSIGNED AGENT's own profile at submit time
   // (step 0e root-cause fix) — the lead's own teamId/tlId can be stale or
@@ -207,6 +214,7 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
       typeOfRequest: it.typeOfRequest || 'NEW', contractTerm: it.contractTerm || null,
       categoryFields: it.categoryFields || {}, sprFlag: !!it.sprFlag, sprNote: it.sprNote || '',
       accTransfer: accTransferPayload,
+      sourcedBy: sourcedByPayload,
       status: 'pendingVerification',
       events: [{ type:'created', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} }],
       verification: null,

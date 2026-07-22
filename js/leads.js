@@ -843,6 +843,8 @@ async function showSubmitModal(lead, byId){
   let docFiles = {};
   let accTransferFlag = false;
   let accTransferFromPartner = ''; // same re-render survival issue as selectedProductId below — persisted here, not read from the DOM after the fact
+  let sourcedByFlag = false;
+  let sourcedByPartnerName = ''; // same re-render survival issue as accTransferFromPartner above
   // Persisted across render() calls — render() fully replaces the modal's
   // innerHTML (including <select id="sm-prod">), so reading the DOM's
   // .value AFTER a re-render would see a freshly-created, unselected
@@ -934,7 +936,14 @@ async function showSubmitModal(lead, byId){
         <input type="checkbox" id="sm-acctxfer" ${accTransferFlag?'checked':''} style="width:auto;margin:0;cursor:pointer">
         <label for="sm-acctxfer" style="margin:0;cursor:pointer">Account transfer from another partner</label>
       </div>
+      <p class="text-dim text-xs mt-4">Account custody is moving from another partner to us — du must approve the transfer, and it can be rejected.</p>
       <input type="text" id="sm-acctxfer-from" placeholder="Transferring from (partner name)" value="${esc(accTransferFromPartner)}" class="mt-8" style="display:${accTransferFlag?'':'none'}">
+      <div class="mt-8" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="sm-sourcedby" ${sourcedByFlag?'checked':''} style="width:auto;margin:0;cursor:pointer">
+        <label for="sm-sourcedby" style="margin:0;cursor:pointer">Sourced by external partner (freelancer/subcontractor)</label>
+      </div>
+      <p class="text-dim text-xs mt-4">This deal was brought to us by an outside partner — separate from account transfer above; a sourced deal may or may not also need a transfer.</p>
+      <input type="text" id="sm-sourcedby-name" placeholder="Sourcing partner name" value="${esc(sourcedByPartnerName)}" class="mt-8" style="display:${sourcedByFlag?'':'none'}">
       <div class="divider"></div>
       <div class="field">
         <label>Documents ${req.length?`<span class="text-dim text-xs">(attest each with its expiry date; attaching a file is encouraged but not required)</span>`:''}</label>
@@ -981,6 +990,13 @@ async function showSubmitModal(lead, byId){
     };
     document.getElementById('sm-acctxfer-from').oninput = function(){
       accTransferFromPartner = this.value;
+    };
+    document.getElementById('sm-sourcedby').onchange = function(){
+      sourcedByFlag = this.checked;
+      document.getElementById('sm-sourcedby-name').style.display = this.checked ? '' : 'none';
+    };
+    document.getElementById('sm-sourcedby-name').oninput = function(){
+      sourcedByPartnerName = this.value;
     };
 
     document.getElementById('sm-add-item').onclick = () => {
@@ -1067,9 +1083,10 @@ async function showSubmitModal(lead, byId){
           storageRef: storageRefsByType[type] || null
         }));
         const accTransfer = accTransferFlag ? { flag:true, fromPartner: accTransferFromPartner.trim() } : null;
+        const sourcedBy = sourcedByFlag ? { flag:true, partnerName: sourcedByPartnerName.trim() } : null;
 
         try {
-          await createSubmissions({ lead, company, items, requiredDocs: requiredDocsPayload, accTransfer, teams, users, bundleId, externalBat: combinedBat||undefined });
+          await createSubmissions({ lead, company, items, requiredDocs: requiredDocsPayload, accTransfer, sourcedBy, teams, users, bundleId, externalBat: combinedBat||undefined });
           if(combinedBat) await combinedBat.commit();
         } catch(subErr){
           if(!combinedBat && docTypesWithFiles.length){
