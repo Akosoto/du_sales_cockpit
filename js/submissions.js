@@ -20,7 +20,8 @@ export const BACKEND_ATTACHMENT_TYPES = ['Affidavit', 'Email Extension', 'Other'
 const EVENT_TYPES = [
   'docsVerified','verificationCall','verificationEmail','submittedToDu',
   'activityNo','workOrderNo','appointment','biometric','sprObtained',
-  'correction','note','activated','rejected','resubmit'
+  'correction','note','activated','rejected','resubmit',
+  'transferCompleted','transferRejected'
 ];
 
 // Display labels/colors — shared by every submission-status-rendering UI
@@ -40,8 +41,20 @@ export const EVENT_LABELS = {
   proceededWithoutVerification:'Proceeded Without Verification',
   activityNo:'Activity Number', workOrderNo:'Work Order Number', appointment:'Appointment Scheduled',
   biometric:'Biometric', sprObtained:'SPR Obtained', correction:'Correction', note:'Note',
-  activated:'Activated', rejected:'Rejected', resubmit:'Resubmitted'
+  activated:'Activated', rejected:'Rejected', resubmit:'Resubmitted',
+  transferCompleted:'Account Transfer Completed', transferRejected:'Account Transfer Rejected'
 };
+
+// transferStatus values (ARCHITECTURE.md §13, Session B5) — a SEPARATE
+// tracker for accTransfer-flagged submissions only, distinct from the
+// submission's own status/rejected lifecycle. 'pending' is the default
+// stamped at creation when accTransfer.flag is true (js/submissions.js
+// createSubmissions); 'rejected' here means du rejected the TAKEOVER
+// REQUEST, not a document/verification rejection — the submission's own
+// document-review reject/resubmit flow is completely unaffected and
+// remains the only thing that changes `status`.
+export const TRANSFER_STATUS_LABELS = { pending:'Transfer Pending', completed:'Transfer Completed', rejected:'⚠ Transfer Rejected' };
+export const TRANSFER_STATUS_COLORS = { pending:'var(--amber)', completed:'var(--green)', rejected:'var(--red)' };
 
 // ════════════════════════════════════════════════════
 // SUBMISSIONS — agent → backend handoff (ARCHITECTURE.md Section 5)
@@ -214,6 +227,13 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
       typeOfRequest: it.typeOfRequest || 'NEW', contractTerm: it.contractTerm || null,
       categoryFields: it.categoryFields || {}, sprFlag: !!it.sprFlag, sprNote: it.sprNote || '',
       accTransfer: accTransferPayload,
+      // transferStatus (Session B5): only meaningful for accTransfer-flagged
+      // lines — defaults to 'pending' at creation so the queue/timeline have
+      // something to render immediately; absent (not just falsy) on
+      // non-flagged lines so accTransfer.flag stays the single source of
+      // truth for "is this even a transfer" rather than two fields that
+      // could drift.
+      ...(accTransferPayload.flag ? { transferStatus: 'pending' } : {}),
       sourcedBy: sourcedByPayload,
       status: 'pendingVerification',
       events: [{ type:'created', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} }],
@@ -292,6 +312,12 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
   if(type === 'rejected' && !ORG_DEFAULTS.rejectionReasons.includes(payload.reason)){
     throw new Error(`"${payload.reason}" is not a configured rejection reason.`);
   }
+  // transferRejected's reason is free text, NOT ORG_DEFAULTS.rejectionReasons
+  // — that list is about document/verification rejection causes ("Documents
+  // missing", "Expired document", ...), a different concept from why du
+  // rejected an account-takeover request ("du disputed ownership", "partner
+  // objected", ...). Only non-empty is required.
+  if(type === 'transferRejected' && !payload.reason) throw new Error('A transfer rejection reason is required.');
 
   const subRef = doc(db,'submissions',submissionId);
   let finalStatus;
@@ -355,6 +381,12 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
       if(!sub.rejectedAt) update.rejectedAt = now();
     } else if(type === 'resubmit'){
       update.status = 'pendingVerification';
+    } else if(type === 'transferCompleted'){
+      // Session B5 — transferStatus is a SEPARATE tracker from status; never
+      // touches status/rejectedAt/the document-review lifecycle at all.
+      update.transferStatus = 'completed';
+    } else if(type === 'transferRejected'){
+      update.transferStatus = 'rejected';
     } else if(sub.status === 'submittedToDu'){
       update.status = 'inProgress';
     }
@@ -420,6 +452,18 @@ export async function reassignSubmission(submissionId, newAgentId, oldAgentName,
     payload: { text: `Reassigned from ${oldAgentName||'Unassigned'} to ${newAgentName}` },
     extraFields: { assignedBackendAgent: newAgentId }
   });
+}
+
+// Transfer outcome tracking (ARCHITECTURE.md §13, Session B5) — backend or
+// manager action on an accTransfer-flagged submission, recording whether du
+// actually completed the account-takeover request. No rules dependency:
+// rides the same unrestricted manager/backend submissions update the rest
+// of appendEvent's callers already use.
+export async function setTransferCompleted(submissionId){
+  return appendEvent(submissionId, { type: 'transferCompleted', payload: {} });
+}
+export async function setTransferRejected(submissionId, reason){
+  return appendEvent(submissionId, { type: 'transferRejected', payload: { reason } });
 }
 
 // Backend attachment (step 5b, ARCHITECTURE.md §5/§6) — adds an ADDITIONAL

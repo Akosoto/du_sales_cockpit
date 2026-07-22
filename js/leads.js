@@ -9,7 +9,8 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 import { searchCompanies, findCompanyByAccountCode, findOrCreateCompany, findFuzzyMatch, normalizeCompanyName } from './companies.js';
 import {
   computeRequiredDocs, docExpiryWarnings, createSubmissions, generateBundleId, appendEvent,
-  SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS
+  SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS,
+  TRANSFER_STATUS_LABELS, TRANSFER_STATUS_COLORS
 } from './submissions.js';
 import { captureFile, PDF_PAGE_CAP } from './documents.js';
 import * as storage from './storage/index.js';
@@ -1134,7 +1135,10 @@ function showSubmissionTimelineModal(lead, submissions){
         <div class="mt-8" style="padding-left:12px;border-left:2px solid var(--border2)">
           <div class="flex gap-8" style="justify-content:space-between;align-items:center">
             <strong style="font-size:13px">${esc(l.productName)}</strong>
-            <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
+            <span>
+              <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
+              ${l.transferStatus==='rejected' ? `<span class="text-xs" style="color:${TRANSFER_STATUS_COLORS.rejected};margin-left:6px">${esc(TRANSFER_STATUS_LABELS.rejected)}</span>` : ''}
+            </span>
           </div>
           <div class="text-dim text-xs mt-4">${esc(categoryLabel(l.category))} · Qty ${l.qty} · AED ${Number(l.mrc).toLocaleString()}/mo</div>
           ${(l.requiredDocs||[]).length ? `<div class="mt-8">

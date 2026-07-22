@@ -5,7 +5,9 @@ import {
 import { esc, fmtDate, toast, modal, closeModal, disable, enable, v } from './helpers.js';
 import {
   SUBMISSION_STATUS_LABELS, SUBMISSION_STATUS_COLORS, EVENT_LABELS,
+  TRANSFER_STATUS_LABELS, TRANSFER_STATUS_COLORS,
   claimSubmission, reassignSubmission, appendEvent,
+  setTransferCompleted, setTransferRejected,
   BACKEND_ATTACHMENT_TYPES, attachBackendDocument
 } from './submissions.js';
 import * as storage from './storage/index.js';
@@ -172,7 +174,7 @@ export async function renderQueueTab(){
             <td class="td-company">${esc(companyById[s.companyId]?.name || '—')}</td>
             <td class="td-dim">${esc(s.productName||'—')} <span class="text-dim text-xs">${esc(categoryLabel(s.category)||'')}</span></td>
             <td class="td-dim">${esc(s.agentName||'—')}</td>
-            <td><span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</span></td>
+            <td><span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[s.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[s.status]||s.status)}</span>${s.transferStatus==='rejected'?`<br><span class="text-xs" style="color:${TRANSFER_STATUS_COLORS.rejected}">${esc(TRANSFER_STATUS_LABELS.rejected)}</span>`:''}</td>
             <td class="td-dim text-sm">${s.assignedBackendAgent ? esc(agentName(s.assignedBackendAgent)) : '<span class="text-dim">Unassigned</span>'}</td>
             <td class="td-dim text-sm">${s.createdAt?fmtDate(s.createdAt):'—'}</td>
             <td class="flex gap-8">
@@ -307,7 +309,17 @@ async function showActionPanel(sub, company, onChange){
         ${Object.entries(s.categoryFields).map(([k,val])=>copyField(k, val)).join('')}
       </div>` : ''}
       ${s.sprFlag ? `<div class="locked-note mb-12">⭐ Special Pricing Request${s.sprNote?`: ${esc(s.sprNote)}`:''}</div>` : ''}
-      ${s.accTransfer?.flag ? `<div class="locked-note mb-12">🔄 Account transfer from ${esc(s.accTransfer.fromPartner||'another partner')}</div>` : ''}
+      ${s.accTransfer?.flag ? `<div class="locked-note mb-12">
+        🔄 Account transfer from ${esc(s.accTransfer.fromPartner||'another partner')}
+        <div class="mt-8" style="font-weight:600;color:${TRANSFER_STATUS_COLORS[s.transferStatus]||'var(--t2)'}">${esc(TRANSFER_STATUS_LABELS[s.transferStatus]||s.transferStatus||'—')}</div>
+        ${s.transferStatus==='rejected' ? `<div class="text-xs text-dim mt-4">See timeline below for the rejection reason.</div>` : ''}
+        ${(isBackendUser() || CP.role==='manager') && s.transferStatus==='pending' ? `
+        <div class="flex gap-8 mt-8" style="align-items:center;flex-wrap:wrap">
+          <button type="button" class="btn btn-primary btn-xs" id="ap-transfer-completed">Mark Transfer Completed</button>
+          <input type="text" id="ap-transfer-reject-reason" placeholder="Rejection reason" style="flex:1;min-width:160px">
+          <button type="button" class="btn btn-danger btn-xs" id="ap-transfer-rejected">Mark Transfer Rejected</button>
+        </div>` : ''}
+      </div>` : ''}
       <div class="divider"></div>
       <div class="field"><label>Documents</label>
         ${(s.requiredDocs||[]).map(docRow).join('') || '<p class="text-dim text-xs">None required.</p>'}
@@ -475,6 +487,37 @@ async function showActionPanel(sub, company, onChange){
         btn.disabled = false; btn.textContent = 'Attach';
       }
     };
+
+    // Transfer outcome tracking (Session B5, ARCHITECTURE.md §13) — separate
+    // from the quick/payload action buttons below since it's gated on
+    // s.transferStatus==='pending', not a fixed EVENT_TYPES list rendered
+    // unconditionally.
+    document.getElementById('ap-transfer-completed')?.addEventListener('click', async function(){
+      const err = document.getElementById('ap-err');
+      this.disabled = true;
+      try {
+        await setTransferCompleted(s.id);
+        toast('Transfer marked completed.');
+        await refresh();
+      } catch(e){
+        err.textContent = e.message;
+        this.disabled = false;
+      }
+    });
+    document.getElementById('ap-transfer-rejected')?.addEventListener('click', async function(){
+      const err = document.getElementById('ap-err');
+      const reason = v('ap-transfer-reject-reason');
+      if(!reason){ err.textContent = 'A transfer rejection reason is required.'; return; }
+      this.disabled = true;
+      try {
+        await setTransferRejected(s.id, reason);
+        toast('Transfer marked rejected.');
+        await refresh();
+      } catch(e){
+        err.textContent = e.message;
+        this.disabled = false;
+      }
+    });
 
     // Quick (no-payload) actions
     document.querySelectorAll('[data-act]').forEach(btn => btn.onclick = async () => {
