@@ -35,6 +35,27 @@ export const DEFAULT_CATEGORIES = [
   { id: 'mobile',    label: 'Mobile' }
 ];
 
+// Product FAMILIES (Session C0, ARCHITECTURE.md §14) — a coarser grouping
+// ABOVE categories, for Phase C's rollup counters (keyed by family, not
+// category). Same permanent-id/editable-label pattern as DEFAULT_CATEGORIES
+// above: id never changes once assigned, label is manager-editable. Every
+// category gets a `familyId` (js/products.js's family migration/CRUD),
+// resolved to a label at render time via familyLabel() — never a name
+// string stored anywhere.
+export const DEFAULT_FAMILIES = [
+  { id: 'fixed',  label: 'Fixed' },
+  { id: 'sim',    label: 'SIM Cards' },
+  { id: 'others', label: 'Others' }
+];
+
+// Default category->family mapping, applied once by the one-time migration
+// (js/products.js runFamilyMigration) — any category id not listed here
+// (a manager-created category with no explicit assignment) defaults to
+// 'others', not left unmapped.
+export const DEFAULT_FAMILY_MAPPING = {
+  starter: 'fixed', essential: 'fixed', ultimate: 'fixed', mobile: 'sim'
+};
+
 // Single get() on a known doc id — always provable for any role once the
 // orgs/{orgId} read rule is `isAuth() && sameOrgDoc()`-style (step 8); not
 // a list query, so the LIST-query provability question doesn't apply here.
@@ -42,11 +63,11 @@ export async function loadOrgConfig(){
   try {
     const snap = await getDoc(doc(db, 'orgs', orgId));
     if(snap.exists()){
-      setOrgConfig({ categories: DEFAULT_CATEGORIES, ...snap.data() });
+      setOrgConfig({ categories: DEFAULT_CATEGORIES, families: DEFAULT_FAMILIES, ...snap.data() });
       return;
     }
   } catch(e){ /* orgs/{orgId} rule may not be published yet, or the doc genuinely doesn't exist — degrade to defaults either way */ }
-  setOrgConfig({ categories: DEFAULT_CATEGORIES });
+  setOrgConfig({ categories: DEFAULT_CATEGORIES, families: DEFAULT_FAMILIES });
 }
 
 // Resolves a category id to its display label. Falls back to the raw value
@@ -74,6 +95,29 @@ export function findCategoryIdByLabel(label){
 // same shape regardless of whether OC has loaded yet.
 export function currentCategories(){
   return OC?.categories || DEFAULT_CATEGORIES;
+}
+
+// Resolves a family id to its display label — same fallback-to-raw-value
+// behavior as categoryLabel() above, for the same reason (safe at any call
+// site regardless of whether the id is recognized).
+export function familyLabel(idOrLegacy){
+  if(!idOrLegacy) return idOrLegacy;
+  const fams = OC?.families || DEFAULT_FAMILIES;
+  return fams.find(f => f.id === idOrLegacy)?.label || idOrLegacy;
+}
+
+// Case-insensitive label->id lookup — mirrors findCategoryIdByLabel(),
+// used by the family config UI to reject a duplicate label on add.
+export function findFamilyIdByLabel(label){
+  const fams = OC?.families || DEFAULT_FAMILIES;
+  const norm = String(label||'').trim().toLowerCase();
+  return fams.find(f => f.label.toLowerCase() === norm)?.id || null;
+}
+
+// Current family list — always an array of {id,label}, same shape
+// guarantee as currentCategories().
+export function currentFamilies(){
+  return OC?.families || DEFAULT_FAMILIES;
 }
 
 // Contract-term display labels (Session B4 Step 3, Products config panel).

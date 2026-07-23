@@ -4,7 +4,10 @@ import {
 } from './state.js';
 import { dbAdd, dbUpdate, newBatch, batchAdd } from './db.js';
 import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confirmModal } from './helpers.js';
-import { currentCategories, categoryLabel, currentTermLabels, termLabel, loadOrgConfig, saveOrgConfig, withOrgConfigSave } from './orgConfig.js';
+import {
+  currentCategories, categoryLabel, currentTermLabels, termLabel, loadOrgConfig, saveOrgConfig, withOrgConfigSave,
+  currentFamilies, familyLabel, findFamilyIdByLabel, DEFAULT_FAMILIES, DEFAULT_FAMILY_MAPPING
+} from './orgConfig.js';
 
 // ════════════════════════════════════════════════════
 // PRODUCTS — SEED DATA  (du Business, June 2026)
@@ -703,6 +706,62 @@ function showManageWaiversModal(product, onUpdate){
 // merge-then-set + graceful-degradation pattern moved to the shared module
 // instead of staying a products.js-local helper).
 
+// ── PRODUCT FAMILIES — one-time migration (Session C0, ARCHITECTURE.md
+// §14) — a coarser grouping ABOVE categories, for Phase C's rollup
+// counters. Unlike B4's category migration (many product/user documents),
+// this touches ONE document (orgs/{orgId}): seed the families array if
+// missing, and stamp familyId onto any category that doesn't have one yet,
+// per DEFAULT_FAMILY_MAPPING (falling back to 'others' for any category id
+// not in that mapping — e.g. one a manager already added). Both parts are
+// independently idempotent — safe to re-run, skips whatever's already
+// migrated. currentFamilies()===DEFAULT_FAMILIES (reference equality) is a
+// cheap "families need seeding" check without importing OC directly here.
+function computeFamilyMigrationPlan(){
+  const familiesNeedSeeding = currentFamilies() === DEFAULT_FAMILIES;
+  const categoryOps = currentCategories()
+    .filter(c => !c.familyId)
+    .map(c => ({ id: c.id, label: c.label, familyId: DEFAULT_FAMILY_MAPPING[c.id] || 'others' }));
+  return { familiesNeedSeeding, categoryOps, alreadyMigrated: !familiesNeedSeeding && categoryOps.length===0 };
+}
+
+function showFamilyMigrationPreview(onSaved){
+  const plan = computeFamilyMigrationPlan();
+  modal('Migrate Categories to Families — Preview', `
+    <p class="text-dim text-sm mb-12">Dry run only — nothing has been written yet.</p>
+    ${plan.familiesNeedSeeding ? `<p>Families config does not exist yet — will be created: ${DEFAULT_FAMILIES.map(f=>esc(f.label)).join(', ')}.</p>` : ''}
+    <p style="margin-top:12px"><strong>Categories to assign a family (${plan.categoryOps.length})</strong></p>
+    ${plan.categoryOps.length ? `<div class="tbl-wrap"><table><tbody>
+      ${plan.categoryOps.map(o=>`<tr><td>${esc(o.label)}</td><td class="td-dim">→ ${esc(familyLabel(o.familyId))}</td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="text-dim text-xs">None — every category already has a family.</p>'}
+    <div class="flex gap-8 mt-12">
+      <button class="btn btn-primary" id="btn-family-migration-run" ${plan.alreadyMigrated?'disabled':''}>Run Migration</button>
+      <button class="btn btn-ghost" onclick="document.getElementById('modal').style.display='none'">Cancel</button>
+    </div>`, true);
+  document.getElementById('btn-family-migration-run').onclick = () => runFamilyMigration(plan, onSaved);
+}
+
+async function runFamilyMigration(plan, onSaved){
+  const runBtn = document.getElementById('btn-family-migration-run');
+  if(runBtn){ runBtn.disabled = true; runBtn.textContent = '⏳ Migrating…'; }
+  try {
+    const patch = {};
+    if(plan.familiesNeedSeeding) patch.families = DEFAULT_FAMILIES;
+    if(plan.categoryOps.length){
+      const opById = Object.fromEntries(plan.categoryOps.map(o=>[o.id,o.familyId]));
+      patch.categories = currentCategories().map(c => opById[c.id] ? {...c, familyId: opById[c.id]} : c);
+    }
+    const ok = await withOrgConfigSave(()=>saveOrgConfig(patch));
+    if(ok){
+      closeModal();
+      toast(`✅ Migrated ${plan.categoryOps.length} categor${plan.categoryOps.length!==1?'ies':'y'} to families.`);
+      onSaved();
+    } else if(runBtn){ runBtn.disabled=false; runBtn.textContent='Run Migration'; }
+  } catch(e){
+    toast('Error: '+e.message,'err');
+    if(runBtn){ runBtn.disabled=false; runBtn.textContent='Run Migration'; }
+  }
+}
+
 function showCategoryConfigModal(products, onSaved){
   function countFor(catId){ return products.filter(p=>p.category===catId); }
 
@@ -711,9 +770,14 @@ function showCategoryConfigModal(products, onSaved){
     const terms = {}; // term -> a stored label to use as the default/fallback
     products.forEach(p => (p.pricingOptions||[]).forEach(po => { if(terms[po.term]==null) terms[po.term] = po.label; }));
     const termLabels = currentTermLabels();
+    const familyMigrationPlan = computeFamilyMigrationPlan();
 
     modal('Categories & Contract Terms', `
       <p class="text-dim text-sm mb-12">Renaming a label updates it everywhere immediately (products, specialty checklists, dashboards). Category ids are permanent — delete only works once no product uses that category.</p>
+      ${!familyMigrationPlan.alreadyMigrated ? `<div class="seed-banner">
+        <p>Some categories don't have a product family assigned yet (used by Phase C's reports). This seeds the default family list if needed and assigns each unmapped category — safe to re-run.</p>
+        <button class="btn btn-primary btn-sm" id="btn-family-migration">🏷️ Migrate Categories to Families</button>
+      </div>` : ''}
       <p><strong>Categories</strong></p>
       <div class="tbl-wrap"><table><tbody>
         ${categories.map(c=>{
@@ -746,6 +810,8 @@ function showCategoryConfigModal(products, onSaved){
       <div class="flex gap-8 mt-12">
         <button class="btn btn-ghost" onclick="document.getElementById('modal').style.display='none'">Close</button>
       </div>`, true);
+
+    document.getElementById('btn-family-migration')?.addEventListener('click', () => showFamilyMigrationPreview(() => { onSaved(); render(); }));
 
     document.querySelectorAll('[data-cat-save]').forEach(b=>b.addEventListener('click', async ()=>{
       const id = b.dataset.catSave;
