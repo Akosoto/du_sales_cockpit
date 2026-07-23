@@ -144,8 +144,8 @@ async function renderDailyTeamReport(body){
         <tbody>${bodyRows || `<tr><td colspan="7" class="text-dim">No teams found.</td></tr>`}</tbody>
       </table>
     </div>
-    <p class="text-dim text-xs mt-8" title="roleMetrics.agents is role=='agent'-gated (ARCHITECTURE.md §12) — a team_lead submitting their own leads directly is not included in this sum.">
-      Team "Submitted" totals are a sum of that team's AGENTS' own submitted lines — a team_lead's own directly-submitted leads (rare) are not counted in the team row.
+    <p class="text-dim text-xs mt-8" title="roleMetrics.agents is role=='agent'-gated (ARCHITECTURE.md §12) — any line whose submitter isn't a role='agent' user (a team_lead or manager submitting on an agent's behalf) is not included in this sum.">
+      Team "Submitted" totals are a sum of that team's AGENTS' own submitted lines — a line submitted by a team_lead or manager on an agent's behalf is not counted in the team row.
     </p>
   `;
 

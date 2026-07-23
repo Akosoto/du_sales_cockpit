@@ -127,10 +127,30 @@ js/dashboard.js       — Dashboard tab (all roles: leads/stage-based KPIs, agen
                         monthly history, follow-ups, activity log) PLUS (Session B4, manager-only)
                         the Manager's Cockpit section: period/AED-count selector, donuts, role
                         metrics, target-remaining + run-rate toggle — see the three new files below
-js/dashboardData.js   — getDashboardData(period): swappable client-side aggregation over
-                        `submissions` (Phase C will later swap the internals for rollup reads, same
-                        call signature/output shape); resolvePeriodRange (presets + custom ≤92-day
-                        range)
+js/dashboardData.js   — getDashboardData(period): the three PRESET periods (This/Last Month, This
+                        Quarter) read totals/byTeam/byContributor from rollups/{YYYY-MM} docs
+                        (Session C1); CUSTOM ranges keep the original live client-side aggregation
+                        over `submissions`. roleMetrics (agent + backend role metrics) stays live in
+                        BOTH modes — agentId-keyed, attribution-independent, which the
+                        attribution-based byContributor can't serve (Session C2's Report 1 reuses
+                        this exact distinction). Same call signature/output shape either way.
+                        resolvePeriodRange (presets + custom ≤92-day range)
+js/rollups.js         — (Session C1) pure delta engine for the rollups/{YYYY-MM} write-time
+                        counters: monthKey (local-time bucketing), contributorOf/slug (B5-identical
+                        attribution, Firestore-safe slugged map keys), familyResolverFrom, the
+                        per-transition delta builders (createDeltas/activationDeltas/
+                        transitionDeltas/submissionContribution/negate), applyRollupDeltas (creation-
+                        safe set-merge writer, sums same-path deltas into one increment per doc),
+                        buildRollupsFromSubmissions + diffRollups (the recompute/backfill tool's
+                        core, js/org.js). Unit-tested in tools/rollups-test.html (Session C2).
+js/reports.js         — (Session C2) manager-only Reports tab: Live Daily Team Table (today+MTD
+                        submitted/activated per team/agent, two getDashboardData() calls, zero new
+                        queries), Daily Summary (+ Copy Summary plain-text export, reuses
+                        dashboard.js's target/run-rate resolution verbatim), Master Tracker
+                        (filterable submissions grid, createdAt-range server query + client-side
+                        filters, CSV export), Rejection Analytics (rollup-sourced monthly trend +
+                        a live rejectedAt-range scan: top reasons, by team/agent/family, recovery
+                        rate, avg resubmit count, CSV export). No schema/rules/index changes.
 js/dashboardCharts.js — renderDonutCard: dependency-free hand-rolled SVG donut (stroke-dasharray
                         arcs), AED/count mode, empty state
 js/dashboardCards.js  — renderRoleMetricsSection: sales-agent + backend role-metrics cards, KAM/
@@ -1451,6 +1471,77 @@ pre-create it); the backfill drift isolated exactly the one pre-wiring baseline 
 preset view == custom view byte-for-byte (only the internal slugged contributor key differs, not
 read by any renderer). Full cleanup to baseline + a final recompute restored `rollups` to the
 baseline; B5/C0 re-smoked clean. See `ARCHITECTURE.md` §15.7.
+
+### Session C2 (shipped) — Reports
+Per `ARCHITECTURE.md` §16. A new manager-only Reports tab (`js/reports.js`), four reports, built on
+C1's `rollups/` docs plus bounded live queries — no schema, rules, or index changes. Out of scope
+(Session C3): TL/agent-facing report views, targets/commitments/projections/commissions, SOF
+library. Every report reuses `getDashboardData()`/`js/rollups.js` helpers directly rather than
+re-implementing attribution or aggregation logic at the report layer.
+
+**Report 1 — Live Daily Team Table:** today's + MTD submitted/activated per team and per agent,
+built from exactly two `getDashboardData()` calls (today-custom, thisMonth-preset) — zero new query
+shapes. Per-team activated: rollup-sourced `byTeam`. Per-agent activated (AED + a new
+`activatedCount` field, additively extended onto `roleMetrics.agents` in `js/dashboardData.js`) +
+submitted (lines): `roleMetrics.agents`, deliberately NOT `byContributor` (attribution-based, would
+misattribute a `sourcedBy` line away from its actual submitter). Per-team submitted lines are
+DERIVED by summing per-agent `roleMetrics` grouped by teamId — undercounts any line whose submitter
+isn't itself a `role==='agent'` user (a team_lead OR a manager submitting on an agent's behalf,
+confirmed live in regression), footnoted in-UI.
+
+**Report 2 — Daily Summary:** today's numbers + MTD-vs-target, reusing `js/dashboard.js`'s
+target/run-rate resolution logic verbatim (run-rate line only renders when the org/user visibility
+toggle resolves true). "Copy Summary" produces plain text via `navigator.clipboard.writeText` (same
+pattern `js/queue.js`'s copy tools already use).
+
+**Report 3 — Master Tracker:** filterable grid over `submissions`. Server query: `createdAt` range
+(≤92 days, `resolvePeriodRange`'s custom validation reused) + `orderBy('createdAt','desc')` +
+`limit(200)` + `startAfter` cursor ("Load more") — the same cursor-pagination shape the Pipeline tab
+established, single field, auto-indexed. Every OTHER filter (status, team, agent, family,
+transferStatus) is client-side over the accumulating loaded set, deliberately, so no filter
+combination can ever require a new composite index. Sortable columns re-sort client-side. CSV
+export (client-side `Blob`, mirrors `js/org.js`'s backup-export pattern) exports all
+currently-filtered rows.
+
+**Report 4 — Rejection Analytics (priority report):** (a) monthly trend — trailing 6 months of
+`rollups/{YYYY-MM}.totals` (linesRejected vs linesSubmitted), one `getDoc` per month, never
+list-queried. (b) live scan for a selected ≤92-day window — `submissions` where `rejectedAt` in
+range (the one genuinely new query field this session, single-field range, auto-indexed;
+`rejectedAt` is sticky — stamped once on first rejection, never cleared — so the window captures
+both still-rejected AND since-recovered lines). From the scanned set: top rejection reasons (each
+submission's FIRST rejected event only, exact-string grouped, no taxonomy invented — avoids
+double-counting one line across the tally), rejections by team/agent/family, recovery rate (share
+now `activated`), average resubmit count. CSV export of the scanned detail.
+
+**Debt clearance:** `tools/rollups-test.html` — Session C1's 62 pure-function assertions (previously
+a throwaway, uncommitted Node script) recreated as a committed, browser-runnable page importing the
+REAL `js/rollups.js` directly (72 assertions total, all green — some additional guard-path coverage
+added). Found and fixed one real coupling in the process: `js/helpers.js` wires `#modal`/`#m-close`
+click handlers at MODULE TOP LEVEL (an `index.html` DOM assumption), which threw when
+`js/rollups.js`'s import chain loaded outside the main app — resolved with inert hidden stand-in
+elements on the test page only, no shipped app file touched.
+
+**Regression:** the delta-engine unit suite (72 green) plus a live four-line fixture (as manager,
+cleaned up to baseline afterward) driven through the REAL `createSubmissions`/`appendEvent` paths —
+two distinctly-reasoned single rejections, one recovered line (reject→resubmit→activate), one
+multi-resubmit line (reject→resubmit→reject→resubmit). An independent hand-tally was computed from
+the raw `submissions` docs BEFORE checking any report. Report 1's MTD team/contributor figures
+matched the Dashboard's Manager's Cockpit exactly (same rollup read); Report 4a's trend matched
+`rollups/2026-07`'s raw doc exactly, including the transition-vs-distinct-submission count
+difference from Report 4b (5 rejection TRANSITIONS vs 4 distinct rejected LINES, both correct for
+what they each measure — the multi-resubmit line was rejected twice); Report 4b's reason/team/
+agent/family breakdowns and recovery rate/avg-resubmit all matched the hand-tally exactly. Both
+reports' CSV exports were verified by intercepting the actual `Blob` content (not just watching for
+a thrown error) — row counts matched their filtered-set counts exactly. The fixture also surfaced
+and confirmed Report 1's flagged per-team-submitted limitation (broadened from "team_lead direct
+submission" to "any non-agent-role submitter," since `createSubmissions` always stamps the CALLER as
+`agentId`, never the lead's `assignedTo`). Cleanup used direct `dbDelete` (bypassing
+`deleteSubmission()`) specifically to exercise the recompute tool as an out-of-band-delete safety
+net — the resulting drift report reversed exactly the fixture's footprint, restoring
+`rollups/2026-07` to its true pre-session baseline. B5/C0/C1 re-smoked clean (Queue, Products &
+Pricing, Dashboard, Recompute Rollups); non-manager tab visibility confirmed by code inspection
+(`getTabs()`'s manager-only branch, matching the Org tab's own gating). Zero console errors across
+the session. See `ARCHITECTURE.md` §16.7.
 
 ---
 

@@ -965,7 +965,7 @@ appendEvent / deleteSubmission) as manager:
 **Post-activation `mrc` edits remain the one untracked case** (§15.4) — the
 recompute tool is its correction path.
 
-## 16. Session C2 — Reports (IN PROGRESS)
+## 16. Session C2 — Reports (shipped)
 
 **Purpose:** a manager-only Reports tab, four reports, built on C1's
 `rollups/` docs plus bounded live queries. Explicitly OUT of scope this
@@ -1008,11 +1008,20 @@ sites" mandate.
   (role-gated to `role==='agent'`) carries natively. Derived by summing
   `roleMetrics.agents.linesSubmitted` grouped by each agent's `teamId`
   (from the already-fetched `users` list) — zero new queries. **Flagged
-  limitation:** undercounts a team where the team_lead submits their own
-  leads directly (ARCHITECTURE.md §4 permits this), since `roleMetrics`
-  only ever includes `role==='agent'` rows. Rare in practice; footnoted in
-  the report UI rather than adding a new query or rollup dimension this
-  session.
+  limitation, confirmed live in §16.7's regression:** undercounts a team
+  whenever the submission's `agentId` isn't itself a `role==='agent'` user
+  — not just a team_lead submitting their own leads directly (the
+  originally-anticipated case), but ALSO a manager submitting on an
+  agent's behalf via the Submit-to-Backend flow (`createSubmissions`
+  always stamps `agentId`/`agentName` from the CALLER, `CU`/`CP`, never
+  from the lead's `assignedTo` — ARCHITECTURE.md §5), which the regression
+  fixture hit directly (all 4 fixture lines were manager-submitted, so
+  neither `abimanyu` nor `Arun Gopi`'s `roleMetrics` row picked them up,
+  correctly zeroing team KEY Accounts management's derived "Submitted"
+  column even though `byTeam`'s activation/live figures for that same team
+  were unaffected and correct). Both are the same root cause — any non-
+  agent-role submitter — footnoted in the report UI rather than adding a
+  new query or rollup dimension this session.
 - Refresh button; last-fetch timestamp shown (both calls re-run together).
 
 ### 16.2 Report 2 — Daily Summary
@@ -1117,8 +1126,11 @@ calls out.
    (attribution-based) — see §16.1.
 2. Report 1's per-team submitted-line totals are a derived sum over
    per-agent `roleMetrics`, not a native rollup or live-query dimension —
-   may undercount a team_lead's own direct submissions (rare); footnoted
-   in-UI rather than adding a new query/rollup field this session.
+   undercounts any line whose submitter isn't itself a `role==='agent'`
+   user (a team_lead OR a manager submitting on an agent's behalf —
+   confirmed live in §16.7's regression fixture, all manager-submitted);
+   footnoted in-UI rather than adding a new query/rollup field this
+   session.
 3. Report 3's date-range filter is `createdAt`-based; every other filter is
    client-side, specifically to guarantee no new composite index is ever
    needed regardless of filter combination.
@@ -1128,3 +1140,100 @@ calls out.
    only (matching its sticky `rejectedAt`), not every rejected event across
    its lifetime — avoids double-counting one submission; repeat-rejection
    volume is captured separately by "average resubmit count."
+
+### 16.7 Regression
+
+**Unit suite:** `tools/rollups-test.html` — 72 assertions, all green (§16.5).
+
+**Live fixture (as manager, cleaned up to baseline afterward):** four
+submissions against one throwaway company/leads set, driven through the
+REAL `createSubmissions`/`appendEvent` paths — L1 rejected once
+("Documents missing"), L2 rejected once ("Verification failed"), L3
+rejected ("Expired document") → resubmit → activated (the RECOVERED
+line), L4 rejected ("Documents missing") → resubmit → rejected again
+("Wrong/incomplete details") → resubmit (the MULTI-RESUBMIT line, ends
+mid-flight). An independent hand-tally was computed from the raw
+`submissions` docs (category, mrc, teamId, status, `rejectedAt`,
+resubmit-event count, first-rejected-event reason) BEFORE checking any
+report, so every reconciliation below compares two independently-derived
+numbers, not a report against itself.
+
+- **Report 1 ↔ Dashboard ↔ hand-tally, exact match:** MTD Team "Tele
+  sales Team" activated AED 750/1 line (Report 1's rollup-sourced
+  `byTeam`) == Dashboard's "Share by Team" AED 750·100% (same
+  `getDashboardData('thisMonth')` call) == hand-tally (L3's `mrc`, its
+  only activation). Contributor credit "Sales Manager" AED 750 (both
+  Report 1's underlying rollup and the Dashboard's "Share by
+  Contributor") correctly matches — every fixture line's `agentId` was
+  the MANAGER's own uid (createSubmissions always stamps the CALLER as
+  agent, never the lead's `assignedTo` — this is what surfaced §16.6
+  Flag 2's broader trigger, below). Sajin hussain's OWN `roleMetrics` row
+  correctly stayed at aedClosed=0/submitted=1 (the pre-existing baseline
+  only) on both Report 1 and the Dashboard's "Sales Agent Performance" —
+  confirming `roleMetrics.agents` (agentId-keyed) and `byContributor`
+  (attribution-keyed) diverged EXACTLY where Report 1's design (§16.1)
+  says they should, with neither report misattributing the other's
+  figure.
+- **§16.6 Flag 2 confirmed live, and broadened:** because every fixture
+  line was manager-submitted, team "KEY Accounts management" (3 raw
+  submitted lines: L1, L2, L4) showed Report 1's derived "Submitted"
+  column as 0 — exactly predicted, since neither of that team's agents
+  (`abimanyu`, `Arun Gopi`) had a matching `roleMetrics.agents` entry.
+  `byTeam`'s activation figures for the SAME team were correct and
+  unaffected (0 activations, actually true) — proving the limitation is
+  scoped to the derived "Submitted" column only, not a wider bug. The
+  ARCHITECTURE.md and in-UI wording (§16.1, `js/reports.js`) was
+  broadened from "team_lead direct submission" to "any non-agent-role
+  submitter" to match what was actually observed.
+- **Report 4a (trend) ↔ raw rollup doc, exact match:** `rollups/2026-07`
+  after the fixture read `linesSubmitted:5` (1 baseline + 4 fixture),
+  `linesRejected:5` — NOT 4, because the rollup counts TRANSITIONS
+  (`totals.linesRejected` increments once per INTO-rejected transition,
+  §15.3 site 4) and L4 was rejected TWICE (1+1+1+2=5) — Report 4a's trend
+  row for Jul 2026 showed exactly `5 / 5 / 100%`, matching the raw doc
+  read directly via `getDoc`, not just the report's own rendering.
+- **Report 4b (live-scan) ↔ hand-tally, exact match, and correctly
+  DIFFERENT from 4a where it should be:** 4 lines rejected-in-window (not
+  5) — the live scan counts DISTINCT SUBMISSIONS by their sticky
+  `rejectedAt`, so L4 contributes once here despite contributing twice to
+  4a's transition count; both numbers are independently correct for what
+  they each measure. Recovery rate 25% (1/4, L3 only). Avg resubmit count
+  0.8 (rendered, from the exact value 0.75 = (0+0+1+2)/4 — `toFixed(1)`
+  rounding, not a discrepancy). Top reasons: "Documents missing":2 (L1
+  and L4's FIRST reason each — L4's SECOND reason, "Wrong/incomplete
+  details", is correctly excluded from the tally per §16.6 Flag 5),
+  "Verification failed":1, "Expired document":1 — three buckets from two
+  literal reason-strings reused, satisfying "two distinct reasons"
+  comfortably. By team: KEY Accounts management 3, Tele sales Team 1. By
+  family: Fixed 3 (starter/essential/ultimate), SIM Cards 1 (mobile) — all
+  matching the hand-tally exactly.
+- **CSV exports, both reports:** Report 4b's export produced 1 header +
+  4 data rows (intercepted via a temporary `URL.createObjectURL` spy,
+  reading the actual `Blob` content, not just watching for a thrown
+  error) — matching "4 lines rejected in window" exactly, with every
+  field (reason, resubmit count, recovered flag) correct per-row. Report
+  3's export produced 1 header + 5 data rows against its own
+  "Loaded 5 rows (5 match current filters)" — exact match.
+- **Non-manager tab visibility:** confirmed by code inspection —
+  `js/main.js getTabs()` returns the `reports` entry ONLY under the
+  `role==='manager'` branch (the exact same gating `org` already uses),
+  plus the defensive `CP.role!=='manager'` check inside
+  `renderReportsTab()` itself (Step 3). No live non-manager login was
+  available this session to additionally verify end-to-end; the static
+  gate is the same mechanism every other manager-only tab in this
+  codebase already relies on.
+- **B5/C0/C1 smoke:** Queue tab (renders, correct status/assignment
+  counts including the fixture's transient lines), Products & Pricing tab
+  (categories/families unaffected — this session touched neither
+  `js/orgConfig.js` nor `js/products.js`), Dashboard's Manager's Cockpit
+  and the Recompute Rollups tool (both already exercised directly above)
+  — zero console errors across the entire session.
+- **Cleanup + post-cleanup recompute:** all 4 fixture submissions, 4
+  leads, and the 1 fixture company deleted via direct `dbDelete` (NOT
+  `deleteSubmission()` — deliberately, to exercise the recompute tool as
+  the safety net for an out-of-band delete, per §15.6 Flag 3's own
+  reasoning). The resulting drift report (`rollups/2026-07`, dry-run then
+  Apply) reversed EXACTLY the fixture's live-incremented footprint — 13
+  buckets, every one matching the fixture's known contribution — leaving
+  `{linesSubmitted:1, everything else 0}`, the true pre-session baseline.
+  Reports tab re-rendered clean against the restored baseline.
