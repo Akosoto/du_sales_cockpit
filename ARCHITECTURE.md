@@ -964,3 +964,167 @@ appendEvent / deleteSubmission) as manager:
 
 **Post-activation `mrc` edits remain the one untracked case** (§15.4) — the
 recompute tool is its correction path.
+
+## 16. Session C2 — Reports (IN PROGRESS)
+
+**Purpose:** a manager-only Reports tab, four reports, built on C1's
+`rollups/` docs plus bounded live queries. Explicitly OUT of scope this
+session (Session C3): TL/agent-facing report views, targets/commitments/
+projections/commissions, SOF template library, any schema change. No rules
+or index changes are expected — every new query below is designed to avoid
+one; if that turns out wrong, standing protocol is PAUSE and hand over the
+rule/index diff, not guess.
+
+Monthly figures come from rollups; DAILY figures come from live
+`createdAt`/`activatedAt` today-range queries (rollups are monthly buckets
+only — no daily buckets added). Quota discipline: every report fetches on
+tab-open + a manual Refresh button — no polling, no `onSnapshot` listeners.
+
+### 16.1 Report 1 — Live Daily Team Table
+
+Built from **two existing `getDashboardData()` calls, zero new query
+shapes**: `getDashboardData('thisMonth', {teams,users})` for MTD,
+`getDashboardData({preset:'custom', from:today, to:today}, {teams,users})`
+for today — reusing the exact machinery §15.5 already swapped onto rollups
+for presets, live for custom, per this session's own "reuse dashboardData/
+rollups helpers; no re-implementation of aggregation logic at report call
+sites" mandate.
+
+- **Per-team activated (AED + lines), today and MTD** — `byTeam` from each
+  call (rollup-sourced for MTD, live for today). Unaffected by attribution
+  (team credit isn't diverted to a partner the way contributor credit is).
+- **Per-agent activated (AED) + submitted (lines), today and MTD** — from
+  `roleMetrics.agents` (`{userId,name,aedClosed,linesSubmitted}`), NOT from
+  `byContributor`. Deliberate: `byContributor` is attribution-based (a
+  `sourcedBy`-flagged line credits the partner, not the submitting agent —
+  §15.3), while `roleMetrics.agents` is `agentId`-keyed regardless of
+  attribution (ARCHITECTURE.md §12: "a sales agent's own aedClosed/
+  linesSubmitted role-metric row is independent of that attribution
+  split"). Report 1 wants the agent's own production, not who a donut
+  credits, so `roleMetrics.agents` is the correct source, already live in
+  both preset and custom mode (§15.6 Flag 2).
+- **Per-team submitted lines, today and MTD** — the one figure neither
+  `byTeam` (activation-only, both live and rollup) nor `roleMetrics.agents`
+  (role-gated to `role==='agent'`) carries natively. Derived by summing
+  `roleMetrics.agents.linesSubmitted` grouped by each agent's `teamId`
+  (from the already-fetched `users` list) — zero new queries. **Flagged
+  limitation:** undercounts a team where the team_lead submits their own
+  leads directly (ARCHITECTURE.md §4 permits this), since `roleMetrics`
+  only ever includes `role==='agent'` rows. Rare in practice; footnoted in
+  the report UI rather than adding a new query or rollup dimension this
+  session.
+- Refresh button; last-fetch timestamp shown (both calls re-run together).
+
+### 16.2 Report 2 — Daily Summary
+
+Today's numbers (the same today-custom `getDashboardData` call as Report 1,
+fetched independently — separate tab state) + MTD vs org target, reusing
+`js/dashboard.js`'s **exact** target/run-rate resolution logic verbatim (not
+re-derived): target = Σ active agents' `monthlyTarget`; run-rate visibility
+= `CP.runRateVisible != null ? CP.runRateVisible : !!(OC?.runRateDefaultVisible)`
+(per-user override always wins, §12). The run-rate line renders **only**
+when that resolves visible — never forced on. One-click "Copy summary"
+producing clean plain text via `navigator.clipboard.writeText` — the exact
+pattern `js/queue.js`'s `copyToClipboard()` already established.
+
+### 16.3 Report 3 — Master Tracker
+
+A filterable grid over `submissions`. **Server query:** `createdAt` range
+(≤92 days, reusing `resolvePeriodRange`'s custom-range validation — same
+throw-on-invalid/throw-over-92-days behavior) + `orderBy('createdAt','desc')`
++ `limit(200)` + `startAfter` cursor for "Load more" — the exact cursor-
+pagination shape the Pipeline tab already established (`js/leads.js`), single
+field, auto-indexed, no composite index needed. **Every other filter**
+(status, team, agent, family/category, transferStatus) is applied
+**client-side** over the accumulating loaded set — deliberately, so no
+filter combination can ever require a new composite index this session;
+"Load more" fetches the next raw page and the client-side filters re-apply
+over the larger accumulated set. Sortable columns = client-side re-sort of
+the loaded set, not a server `orderBy` per column. CSV export (client-side
+`Blob`, mirroring `js/org.js`'s `runBackupExport` download pattern) exports
+**all currently-filtered rows** in the accumulated set, not just the visible
+page.
+
+**Provability (new query — createdAt range + orderBy + limit + startAfter):**
+same field/shape as `dashboardData.js`'s own `created` query (already
+proven live, single-field range, auto-indexed); pagination clauses
+(`orderBy`/`limit`/`startAfter`) don't change what the read rule evaluates
+— rules reference `resource.data` fields, never query shape — so the
+manager clause's request-time-only `role()` escape (§12's empirical
+provability record) is satisfied identically regardless of page size or
+cursor position.
+
+### 16.4 Report 4 — Rejection Analytics (priority report)
+
+**(a) Monthly rejection trend** — trailing **6 months** (a fixed, small
+bound — not "every month since the earliest submission," which would
+itself require a live scan to discover; a manager wanting deeper history is
+a later-session widening, not this one) of `rollups/{YYYY-MM}.totals.
+{linesRejected,linesSubmitted}`, one `getDoc` per month — same single-doc-
+by-key pattern as every other rollup read (§15.5), never list-queried, no
+index.
+
+**(b) Live scan for a selected ≤92-day window** (custom-range validation
+reused) — `submissions` where `rejectedAt` in `[from,to]`: single-field
+range, auto-indexed, the one genuinely new field/query shape this session
+(explicitly anticipated by this session's own fixed decisions). `rejectedAt`
+is **sticky** — stamped once on the first rejection, never cleared by a
+later resubmit/activation (`js/submissions.js appendEvent`) — so this
+window correctly captures both still-rejected AND since-recovered
+(now-activated) lines, which is exactly what "recovery rate" needs.
+Computed client-side over the fetched set, reusing `js/rollups.js`'s
+`familyResolverFrom`/`currentFamilyResolver` for the family dimension
+(never re-implemented):
+- **Top rejection reasons** — each submission's **first** rejected event's
+  `payload.reason` (the one matching its sticky `rejectedAt`), exact-string
+  grouped, no taxonomy invented. A line rejected twice under different
+  reasons is counted once, under its first reason — avoids double-counting
+  one submission across the reason tally; "average resubmit count" (below)
+  already captures repeat-rejection volume separately. Free-text limitation
+  (reason variants/typos split into separate buckets) noted in the UI.
+- **Rejections by team/agent/family** — plain groupBy over the fetched set.
+- **Recovery rate** — share of the fetched (ever-rejected-in-window) set
+  whose CURRENT `status==='activated'`.
+- **Average resubmit count** — mean count of `'resubmit'` events across
+  each fetched submission's `events[]`.
+- CSV export of the scanned detail (same client-side `Blob` pattern).
+
+**Provability (new query — `rejectedAt` range):** single-field range,
+auto-indexed by Firestore automatically (no composite needed, matching
+`createdAt`/`claimedAt`'s existing single-field-range precedent in
+`dashboardData.js`); the manager-only tab's request-time-only `role()`
+escape (§12) covers it identically to every other submissions query in
+this codebase, regardless of which field the range targets.
+
+### 16.5 Debt clearance — `tools/rollups-test.html`
+
+Recreates Session C1's delta-engine assertion suite (previously only a
+throwaway, uncommitted verification script) as a committed, browser-
+runnable page — imports the REAL `js/rollups.js` directly (no stubbing, no
+re-implementation, so the tests can never silently drift from the actual
+module), renders pass/fail counts and any failure detail on the page.
+Covers: `createDeltas`, `transitionDeltas` (every guard — into/out of
+activated, into rejected, resubmit-from-rejected), `negate` symmetry, the
+sticky-month reversal (activate→reverse nets to zero in the SAME month),
+and the `applyRollupDeltas` payload shape (summed same-path increments,
+one write per month doc). Closes the C1 residual this session's prompt
+calls out.
+
+### 16.6 Flagged design decisions (reconciled, not silent)
+
+1. Per-agent figures (Reports 1, implicitly 4) use `roleMetrics.agents`
+   (agentId-keyed, attribution-independent), never `byContributor`
+   (attribution-based) — see §16.1.
+2. Report 1's per-team submitted-line totals are a derived sum over
+   per-agent `roleMetrics`, not a native rollup or live-query dimension —
+   may undercount a team_lead's own direct submissions (rare); footnoted
+   in-UI rather than adding a new query/rollup field this session.
+3. Report 3's date-range filter is `createdAt`-based; every other filter is
+   client-side, specifically to guarantee no new composite index is ever
+   needed regardless of filter combination.
+4. Report 4a's trend window is a fixed trailing 6 months, not an
+   open-ended history scan.
+5. Report 4b's reason tally uses each submission's FIRST rejected event
+   only (matching its sticky `rejectedAt`), not every rejected event across
+   its lifetime — avoids double-counting one submission; repeat-rejection
+   volume is captured separately by "average resubmit count."
