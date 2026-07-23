@@ -661,3 +661,30 @@ timeline to the acting backend user, not the original agent) and as
 manager (`transferRejected` with a reason, badge visible in the Queue
 list and action panel, submission `status` and Quick Actions
 confirmed completely unaffected — the lifecycle guarantee holds).
+
+## 14. Session C0 — Product Family Layer (STUB — finalized in Step 4)
+
+**Purpose:** Phase C's rollup counters (§10) will be keyed by product
+FAMILY, not category — a coarser grouping for reporting (e.g. every
+fiber-plan category rolled into one "Fixed" line, mobile plans into
+"SIM Cards"). This session builds the family layer FIRST, before any
+rollup counter exists, so those counters are born with their final
+keys and never need a re-bucketing migration later. Families use the
+exact same permanent-id/editable-label identity pattern B4 already
+established for categories (`ARCHITECTURE.md` §12) — every category
+gets a permanent `familyId`, resolved to a label at render time, never
+stored as a name string anywhere.
+
+**Seeded families:** `fixed` → "Fixed", `sim` → "SIM Cards", `others`
+→ "Others".
+
+**Default category→family mapping (existing four categories):**
+`starter`, `essential`, `ultimate` → `fixed`; `mobile` → `sim`. No
+existing category defaults to `others` — that bucket exists for
+future categories a manager creates without picking a family, or an
+explicit reassignment.
+
+No rules or index changes are expected — the `orgs` update path is
+already manager-unrestricted for the sections this session touches,
+and `products.category` is already manager-editable. No new queries
+are expected either.
