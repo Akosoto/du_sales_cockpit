@@ -575,7 +575,7 @@ handling (the pending sibling's AED correctly excluded from totals)
 and the queue-wait N/A mechanism (the no-`claimedAt` line correctly
 excluded from the average, not fabricated as 0) in the same pass.
 
-## 13. Session B5 — Sourcing & Transfer Tracking (STUB — finalized in Step 6)
+## 13. Session B5 — Sourcing & Transfer Tracking (shipped)
 
 **Why this session exists:** B4's donut/contributor attribution used
 `accTransfer.fromPartner` as a proxy for "sourced by an external
@@ -599,7 +599,65 @@ manager/backend-driven transfer OUTCOME tracking
 (`pending`/`completed`/`rejected`+reason) for `accTransfer`-flagged
 lines, since a takeover request being rejected by du is a real
 operational stall worth surfacing, distinct from and non-blocking to
-the document-rejection lifecycle. No rules or index changes are
-expected — `sourcedBy` rides the same agent-create path `accTransfer`
+the document-rejection lifecycle. No rules or index changes were
+needed — `sourcedBy` rides the same agent-create path `accTransfer`
 already used, `transferStatus` rides backend/manager's existing
-unrestricted submissions update.
+unrestricted submissions update (confirmed live, both self-serve).
+
+**Attribution repoint (`js/dashboardData.js`):** the `byContributor`
+loop now reads `sourcedBy.flag`/`sourcedBy.partnerName` exclusively —
+`accTransfer` is no longer read anywhere in the aggregation. A normal
+line still credits the submitting agent; a `sourcedBy`-flagged line
+credits `partnerName` (falling back to "Outsourced Revenue" when
+empty). Verified with a synthetic 5-case logic check AND a live
+4-line Firestore fixture (normal agent line, `sourcedBy` with a name,
+`sourcedBy` with no name, and an `accTransfer`-flagged-but-not-
+`sourcedBy` line) — every case matched, critically including proof
+that the `accTransfer`-only line is credited to the agent exactly like
+a normal line, not diverted to `fromPartner`.
+
+**Sourcing capture (`js/leads.js` Submit-to-Backend modal,
+`js/submissions.js createSubmissions`):** a second checkbox + name
+input, `sourcedBy: {flag, partnerName}`, alongside the existing
+`accTransfer` checkbox — same re-render-survival state handling,
+same toggle-reveals-input UX, create-time-only and immutable
+thereafter (mirrors `accTransfer` exactly). Each checkbox carries one
+line of helper text so agents can't confuse the two: **"Account
+custody is moving from another partner to us — du must approve the
+transfer, and it can be rejected"** vs. **"This deal was brought to us
+by an outside partner — separate from account transfer above; a
+sourced deal may or may not also need a transfer."** Written onto
+every line in the bundle via `sourcedByPayload` (same
+normalize-to-`{flag,partnerName}` shape `accTransferPayload` already
+used).
+
+**Transfer outcome tracking:** a new `transferStatus` field
+(`'pending' | 'completed' | 'rejected'`), completely separate from
+the submission's own `status`/document-review lifecycle — enforced by
+construction, not just convention: `appendEvent`'s new
+`transferCompleted`/`transferRejected` event branches each set ONLY
+`update.transferStatus`, structured as their own `else if` arms
+mutually exclusive with every branch that touches `status`
+(`submittedToDu`/`activated`/`rejected`/`resubmit`, and the generic
+`submittedToDu`→`inProgress` bump). `transferStatus:'pending'` is
+stamped at creation (`createSubmissions`) whenever `accTransfer.flag`
+is true; absent entirely on non-flagged lines, so `accTransfer.flag`
+remains the single source of truth for "is this a transfer at all."
+`transferRejected` requires a free-text reason (distinct from
+`ORG_DEFAULTS.rejectionReasons`, which governs document rejection
+only) via its own validation branch in `appendEvent`. UI: the Queue
+action panel (`js/queue.js`) shows Mark Transfer Completed / Mark
+Transfer Rejected buttons only while `transferStatus==='pending'` and
+only to backend or manager (`isBackendUser() || CP.role==='manager'`)
+— no rule change needed, backend/manager already have unrestricted
+submissions update. A rejected transfer renders a red "⚠ Transfer
+Rejected" stall badge in three places: the Queue list's compact status
+column, the action panel's transfer block, and the agent's own
+Submission Timeline (`js/leads.js`) — all three read the same
+`TRANSFER_STATUS_LABELS`/`TRANSFER_STATUS_COLORS` constants
+(`js/submissions.js`) so they can't drift apart. Verified live end to
+end as backend (`transferCompleted`, correctly attributed in the
+timeline to the acting backend user, not the original agent) and as
+manager (`transferRejected` with a reason, badge visible in the Queue
+list and action panel, submission `status` and Quick Actions
+confirmed completely unaffected — the lifecycle guarantee holds).

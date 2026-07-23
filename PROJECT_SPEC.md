@@ -1,11 +1,14 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Session B4 (Manager's Cockpit) shipped** — category identity
-refactor (permanent IDs replacing name-strings, `orgs/{orgId}` org-config doc, one-time migration),
-Products config panel, the Manager's Cockpit dashboard (donuts, role metrics, target-remaining +
-run-rate toggle) behind a swappable `getDashboardData(period)` module, and a real users-collection
-privilege-escalation fix found and closed during this session's rules review. See the Session B4
-history entry below for the full list, and `ARCHITECTURE.md` §12 for the design rationale. Phase D
-(backend working UI) and Phase B (submissions v2) shipped in prior sessions, unchanged since.
+**Last updated:** July 2026 | **Session B5 (Sourcing & Transfer Tracking) shipped** — corrects a
+B4 design mistake: donut/contributor attribution now reads a new `sourcedBy` field instead of
+`accTransfer` (which is an operational account-takeover marker, not a sourcing signal — crediting
+revenue to it was wrong by design), plus a new `transferStatus` tracker
+(`pending`/`completed`/`rejected`+reason) for `accTransfer`-flagged lines, structurally isolated
+from the submission's own document-review lifecycle. No rules or index changes needed. See the
+Session B5 history entry below and `ARCHITECTURE.md` §13. Session B4 (Manager's Cockpit — category
+identity refactor, Products config panel, the dashboard itself, a real users-collection
+privilege-escalation fix found during its rules review) shipped in the prior session, unchanged
+since except for the attribution repoint above — see `ARCHITECTURE.md` §12.
 **`ARCHITECTURE.md` is the authoritative spec for all future work** — this file stays as
 historical/reference documentation for what's already shipped.
 
@@ -78,7 +81,9 @@ js/queue.js           — Backend Queue tab (manager + active backend department
                         Unassigned/My Queue/All views, claim/reassign, the submission action panel
                         (every appendEvent action, on-demand doc viewing with an older-versions
                         expander, backend document attachments, Download bundle PDF, copy tools —
-                        COPY_ALL_FIELDS + per-field copy icons)
+                        COPY_ALL_FIELDS + per-field copy icons), transfer outcome buttons (Session
+                        B5 — Mark Transfer Completed/Rejected, accTransfer-flagged lines only,
+                        pending-state only) + the rejected stall badge in the list and action panel
 js/pdfExport.js       — downloadBundlePdf: compiles a bundle's latest-version document pages into
                         one combined PDF via jsPDF (loaded from jsdelivr's `+esm` endpoint — the
                         package's own published ESM build has an unresolvable bare import)
@@ -426,8 +431,34 @@ line activate while a sibling is still pending (the normal case, not an edge cas
                                      // (fiber categories: gaid; Mobile: msisdn/simSerial/passcode/
                                      // commitmentPlan/handset)
   sprFlag, sprNote,                 // Special Pricing Request
-  accTransfer: { flag, fromPartner }, // bundle-level; when flagged, ALSO appends a partnerHistory
-                                     // 'gained' event to the company (same batch, atomic)
+  accTransfer: { flag, fromPartner }, // OPERATIONAL TAKEOVER marker (Session B5 clarification) —
+                                     // du account custody moving from fromPartner to us, a request
+                                     // du itself can reject (see transferStatus below). NOT a
+                                     // revenue-attribution signal (that was B4's mistake, corrected
+                                     // in B5 — see sourcedBy). When flagged, ALSO appends a
+                                     // partnerHistory 'gained' event to the company (same batch,
+                                     // atomic).
+  sourcedBy: { flag, partnerName }, // NEW (Session B5) — deal ORIGIN: was this brought to us by an
+                                     // external partner/freelancer/subcontractor? Orthogonal to
+                                     // accTransfer above — a sourced deal may or may not need a
+                                     // transfer, and vice versa. Captured on the same Submit-to-
+                                     // Backend modal as accTransfer, own checkbox + name input,
+                                     // create-time-only and immutable thereafter. Drives the
+                                     // Manager's Cockpit's byContributor attribution
+                                     // (js/dashboardData.js) — accTransfer is no longer read there.
+  transferStatus: 'pending' | 'completed' | 'rejected',  // NEW (Session B5) — ONLY present when
+                                     // accTransfer.flag is true (absent on every other line, so
+                                     // accTransfer.flag stays the single source of truth for
+                                     // "is this a transfer at all"). Defaulted to 'pending' at
+                                     // creation, set via appendEvent's transferCompleted/
+                                     // transferRejected events (backend or manager only,
+                                     // js/queue.js). COMPLETELY SEPARATE from status below — never
+                                     // altered by and never alters the document-review lifecycle.
+                                     // 'rejected' here means du rejected the TAKEOVER REQUEST, not
+                                     // a document rejection — requires a free-text reason (distinct
+                                     // from ORG_DEFAULTS.rejectionReasons), rendered as a red
+                                     // "⚠ Transfer Rejected" stall badge in the Queue list, the
+                                     // action panel, and the agent's own Submission Timeline.
   status: 'pendingVerification' | 'submittedToDu' | 'inProgress' | 'activated' | 'rejected', // coarse, PER SUBMISSION
   events: [ { type, actorId, actorName, ts, payload } ],  // append-only timeline, see below
   verification: { done, method: 'call'|'email'|null, ts } | null,  // structured summary,
@@ -467,11 +498,17 @@ line activate while a sibling is still pending (the normal case, not an edge cas
   never a direct `dbUpdate`. Event types: `docsVerified`, `verificationCall`, `verificationEmail`,
   `submittedToDu`, `activityNo{value}`, `workOrderNo{value}`, `appointment{date,time,person}`,
   `biometric`, `sprObtained{note}`, `correction{note}`, `note{text}`, `activated`,
-  `rejected{reason,note}`, `resubmit{note}`. Status transitions ride the same call:
+  `rejected{reason,note}`, `resubmit{note}`, **`transferCompleted`, `transferRejected{reason}`
+  (Session B5)**. Status transitions ride the same call:
   `submittedToDu`/`activated`/`rejected`/`resubmit` set status directly; `submittedToDu` with no
   prior verification auto-appends a `proceededWithoutVerification` event; any other event bumps
   `submittedToDu` → `inProgress` (first real backend touch implies work has started); `rejected`
-  requires `payload.reason` from `ORG_DEFAULTS.rejectionReasons`.
+  requires `payload.reason` from `ORG_DEFAULTS.rejectionReasons`. **`transferCompleted`/
+  `transferRejected` (Session B5) are structurally isolated from all of the above** — each sets
+  ONLY `transferStatus`, in its own `else if` branch mutually exclusive with every status-setting
+  branch, so a transfer outcome can never touch `status` by construction; `transferRejected`
+  requires `payload.reason` (free text, NOT `ORG_DEFAULTS.rejectionReasons` — a different concept,
+  du rejecting the takeover request rather than a document).
 - **Assignment (`js/submissions.js pickBackendAgent`, per SUBMISSION not per bundle):** candidates
   are available backend-department agents in the team who either have no `specialties`
   (generalist) or list the item's category. **No match at all (not even a generalist) now falls
@@ -1153,10 +1190,20 @@ agent AED closed/lines submitted; backend submissions handled/queue wait/handlin
 turnaround, the last explicitly labeled du's own clock; KAM/escalations reserved placeholder), and
 target-remaining (AED remaining vs. sum of agent targets, This Month only — N/A for every other
 period) with a run-rate toggle (days-left + required daily run-rate, default OFF). Donut/role
-attribution rule: a normal line credits the submitting agent; an `accTransfer`-flagged line
-credits that partner (or "Outsourced Revenue" if no partner name recorded) — independent of a
-sales agent's own `aedClosed`/`linesSubmitted`, which is keyed on `agentId` directly regardless of
-that split.
+attribution rule (**repointed in Session B5 — see below**): a normal line credits the submitting
+agent; a `sourcedBy`-flagged line credits that partner (or "Outsourced Revenue" if no partner name
+recorded) — independent of a sales agent's own `aedClosed`/`linesSubmitted`, which is keyed on
+`agentId` directly regardless of that split.
+
+**Session B5 correction (attribution now reads `sourcedBy`, not `accTransfer`):** B4's attribution
+used `accTransfer.fromPartner` as a sourcing proxy. Domain review established `accTransfer` is
+actually an operational account-TAKEOVER marker (custody moving from a losing partner to us,
+reversible by du) — orthogonal to sourcing, and crediting revenue to `fromPartner` (often the
+LOSING competitor) was wrong by design. `js/dashboardData.js`'s `byContributor` loop now reads a
+new, separate `sourcedBy` field exclusively; `accTransfer` is never read in the aggregation at all.
+Zero submissions had `accTransfer.flag==true` in production at the time of this correction, so no
+data migration was needed. See the `submissions` schema above for both fields, and the Session B5
+Phase-History entry below for the full writeup (sourcing capture UI, transfer outcome tracking).
 
 **Run-rate visibility resolution:** per-user override (`users/{uid}.runRateVisible`) always wins
 over the org default (`orgs/{orgId}.runRateDefaultVisible`) in either direction — verified live
@@ -1216,6 +1263,56 @@ live across Products display, the category filter, and the Org tab specialty che
 page reload. Migration integrity verified live: zero dangling name-strings in `products`/`users`.
 Queue tab, action panel, copy tools, and the pipeline `submissionSummary` badge all still render
 correctly against post-migration category IDs. All fixture/test data cleaned up after use.
+
+### Session B5 (shipped) — Sourcing & Transfer Tracking
+Per `ARCHITECTURE.md` §13. Corrects a B4 design mistake and adds a small new operational tracker —
+no rules or index changes needed for either.
+
+**Why:** B4's donut/contributor attribution used `accTransfer.fromPartner` as a sourcing proxy.
+Domain review established `accTransfer` is actually an operational account-TAKEOVER marker (du
+custody moving from a losing partner to us, reversible by du) — orthogonal to sourcing. Crediting
+revenue to `fromPartner` (often the losing competitor) was wrong by design. Zero submissions had
+`accTransfer.flag==true` in production at the time (confirmed via a live data pull before this
+session started), so this was a pure go-forward correction with no data to migrate.
+
+**Attribution repoint (`js/dashboardData.js`):** `byContributor` now reads a new `sourcedBy` field
+exclusively; `accTransfer` is never read in the aggregation anymore. Verified with a synthetic
+5-case logic check (normal line, `sourcedBy`-with-name, `sourcedBy`-no-name fallback,
+`accTransfer`-flagged-but-not-`sourcedBy` — proving it no longer affects attribution, and both
+flags set simultaneously — proving `sourcedBy` alone decides) AND a live 4-line Firestore fixture
+reconciled exactly against hand-calculated totals, same four scenarios.
+
+**Sourcing capture (`js/leads.js`, `js/submissions.js`):** new `sourcedBy: {flag, partnerName}`
+checkbox + name input on the Submit-to-Backend modal, alongside (not replacing) the existing
+`accTransfer` checkbox — same re-render-survival state pattern, same toggle-reveals-input UX,
+create-time-only and immutable thereafter. Both checkboxes gained one line of helper text so
+agents can't confuse the two concepts (custody transfer vs. deal origin).
+
+**Transfer outcome tracking (`js/submissions.js`, `js/queue.js`):** new `transferStatus:
+'pending'|'completed'|'rejected'` field, present ONLY on `accTransfer`-flagged lines (absent
+elsewhere — `accTransfer.flag` stays the single source of truth for "is this a transfer"). Two new
+`appendEvent` types, `transferCompleted`/`transferRejected`, each in their own branch that touches
+ONLY `transferStatus` — structurally incapable of altering the submission's own `status`/document-
+review lifecycle, not just conventionally kept separate. `transferRejected` requires a free-text
+reason (a different concept from `ORG_DEFAULTS.rejectionReasons`, which governs document
+rejection). UI: Mark Transfer Completed/Rejected buttons in the Queue action panel, visible to
+backend or manager only, only while `transferStatus==='pending'`; a rejected transfer renders a red
+"⚠ Transfer Rejected" stall badge in three places (Queue list, action panel, agent's own Submission
+Timeline) sharing one set of label/color constants so they can't drift apart.
+
+**Regression:** live-tested as backend (`rajubai@shaunapp.ae`) — `transferCompleted` succeeds, is
+correctly attributed in the timeline to the acting backend user (not the original submitting
+agent), no rule changes needed (backend already has unrestricted submissions update). Live-tested
+as manager — `transferRejected` with a reason succeeds, badge renders in both the Queue list and
+the action panel, and the submission's `status`/Quick Actions were confirmed completely unaffected
+(the lifecycle-independence guarantee holds in practice, not just in code structure). B4 smoke
+(Manager's Cockpit dashboard, run-rate toggle, Products tab) re-verified with no regressions —
+Session B5 touched none of those files. All test data (submissions, denormalized lead fields)
+cleaned up back to baseline after use; one pre-existing, unrelated data inconsistency was
+discovered during cleanup verification (a real lead's `submissionSummary` badge reads "submitted"
+with zero backing submissions) and deliberately left untouched, since B5 never wrote to that lead
+and reverting data this session didn't touch, based on an uncertain history, was judged riskier
+than leaving a stale badge — flagged for Ashok to investigate separately.
 
 ---
 
