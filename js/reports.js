@@ -1,5 +1,5 @@
 import {
-  db, CP, OC, collection, getDocs, query, where, orderBy, limit, startAfter
+  db, CP, OC, collection, getDocs, query, where, orderBy, limit, startAfter, doc, getDoc
 } from './state.js';
 import { esc, toast } from './helpers.js';
 import { getDashboardData, resolvePeriodRange } from './dashboardData.js';
@@ -21,10 +21,6 @@ const REPORT_TABS = [
   ['tracker',       '🗂️ Master Tracker'],
   ['rejections',    '🚫 Rejection Analytics']
 ];
-
-function placeholderHtml(name){
-  return `<div class="empty"><div class="empty-icon">🚧</div><div class="empty-title">${esc(name)} — coming in a later step</div></div>`;
-}
 
 // Shared fetch — teams + ALL users (unfiltered), same shape dashboard.js's
 // own Manager's Cockpit fetch uses. Deliberately NOT pre-filtered to
@@ -448,6 +444,180 @@ async function renderMasterTrackerReport(body){
 }
 
 // ════════════════════════════════════════════════════
+// REPORT 4 — Rejection Analytics (ARCHITECTURE.md §16.4, priority report)
+// (a) Monthly trend: trailing 6 months of rollups/{YYYY-MM}.totals — single-
+//     doc getDoc per month (never list-queried, no index), same pattern as
+//     every other rollup read.
+// (b) Live scan for a selected ≤92-day window: submissions where
+//     rejectedAt in [from,to] — the one genuinely new field/query shape
+//     this session (single-field range, auto-indexed). rejectedAt is STICKY
+//     (stamped once on the first rejection, never cleared by a later
+//     resubmit/activation — js/submissions.js appendEvent), so this window
+//     correctly captures both still-rejected AND since-recovered lines.
+//
+// Provability (new query — rejectedAt range): single-field range,
+// auto-indexed by Firestore automatically (no composite needed, matching
+// createdAt/claimedAt's existing single-field-range precedent in
+// dashboardData.js); the manager-only tab's request-time-only role()
+// escape (§12) covers it identically to every other submissions query in
+// this codebase, regardless of which field the range targets.
+// ════════════════════════════════════════════════════
+function trailingMonths(n){
+  const out = [];
+  const now = new Date();
+  for(let i=0;i<n;i++){
+    const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    const lbl = d.toLocaleDateString('en-AE', { month:'short', year:'numeric' });
+    out.push({ key, lbl });
+  }
+  return out.reverse(); // oldest first, left-to-right trend
+}
+
+async function fetchRejectionTrend(){
+  const months = trailingMonths(6);
+  const rows = await Promise.all(months.map(async m => {
+    let data = null;
+    try { const s = await getDoc(doc(db,'rollups',m.key)); if(s.exists()) data = s.data(); }
+    catch(e){ /* absent/denied → treat as empty, same pattern as everywhere else in C1 */ }
+    const submitted = Number(data?.totals?.linesSubmitted)||0;
+    const rejected  = Number(data?.totals?.linesRejected)||0;
+    const rate = submitted ? Math.round(rejected/submitted*100) : 0;
+    return { ...m, submitted, rejected, rate };
+  }));
+  return rows;
+}
+
+// The submission's FIRST rejected event — matches its sticky rejectedAt
+// (§16.6 Flag 5). A line rejected twice under different reasons is counted
+// once, under this first reason, to avoid double-counting one submission
+// across the reason tally — "average resubmit count" captures repeat-
+// rejection volume separately.
+function firstRejectedEvent(sub){
+  const sorted = [...(sub.events||[])].sort((a,b)=> (a.ts<b.ts ? -1 : a.ts>b.ts ? 1 : 0));
+  return sorted.find(e=>e.type==='rejected');
+}
+function resubmitCount(sub){
+  return (sub.events||[]).filter(e=>e.type==='resubmit').length;
+}
+
+async function fetchRejectedInWindow(fromIso, toIso){
+  const snap = await getDocs(query(collection(db,'submissions'),
+    where('rejectedAt','>=',fromIso), where('rejectedAt','<=',toIso)));
+  return snap.docs.map(d=>({id:d.id,...d.data()}));
+}
+
+function rejectionDefaultRange(){
+  const to = todayDateStr();
+  const d = new Date(); d.setDate(d.getDate()-29);
+  const from = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return { from, to };
+}
+
+async function renderRejectionAnalyticsReport(body){
+  const { teams, users } = await fetchTeamsAndUsers();
+  const teamById = Object.fromEntries(teams.map(t=>[t.id,t]));
+  const familyOf = currentFamilyResolver();
+  const teamName = id => teamById[id]?.name || (id ? id : 'Unassigned');
+
+  const trend = await fetchRejectionTrend();
+
+  let range = rejectionDefaultRange();
+  let scanned = [];
+
+  async function loadWindow(){
+    range = { from: document.getElementById('ra-from')?.value || range.from, to: document.getElementById('ra-to')?.value || range.to };
+    let validated;
+    try { validated = resolvePeriodRange({ preset:'custom', from: range.from, to: range.to }); }
+    catch(e){ toast(e.message, 'err'); return; }
+    scanned = await fetchRejectedInWindow(validated.from, validated.to);
+    render();
+  }
+
+  function render(){
+    const trendRows = trend.map(m => `<tr>
+      <td>${esc(m.lbl)}</td><td>${m.submitted}</td><td>${m.rejected}</td>
+      <td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;background:var(--border2);border-radius:3px;height:8px;overflow:hidden"><div style="width:${m.rate}%;background:var(--red);height:100%"></div></div><span style="font-size:11px;min-width:32px">${m.rate}%</span></div></td>
+    </tr>`).join('');
+
+    const total = scanned.length;
+    const recovered = scanned.filter(s=>s.status==='activated').length;
+    const recoveryRate = total ? Math.round(recovered/total*100) : 0;
+    const avgResubmit = total ? (scanned.reduce((s,x)=>s+resubmitCount(x),0)/total) : 0;
+
+    const reasonTally = {}, teamTally = {}, agentTally = {}, familyTally = {};
+    scanned.forEach(s => {
+      const reason = firstRejectedEvent(s)?.payload?.reason || '(no reason recorded)';
+      reasonTally[reason] = (reasonTally[reason]||0)+1;
+      const tk = s.teamId||'none'; teamTally[tk] = (teamTally[tk]||0)+1;
+      const ak = s.agentId||'unknown'; agentTally[ak] = (agentTally[ak]||0)+1;
+      const fk = familyOf(s.category); familyTally[fk] = (familyTally[fk]||0)+1;
+    });
+    const agentNameById = Object.fromEntries(users.map(u=>[u.id,u.name]));
+
+    const sortedEntries = obj => Object.entries(obj).sort((a,b)=>b[1]-a[1]);
+    const breakdownTable = (title, entries, labelFn) => `
+      <div class="section-card" style="margin-bottom:14px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">${esc(title)}</div>
+        ${entries.length ? `<div class="tbl-wrap"><table><tbody>${entries.map(([k,v])=>`<tr><td>${esc(labelFn(k))}</td><td style="text-align:right">${v}</td></tr>`).join('')}</tbody></table></div>` : `<p class="text-dim text-xs">No rejections in this window.</p>`}
+      </div>`;
+
+    body.innerHTML = `
+      <div class="section-card" style="margin-bottom:14px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">📈 Monthly Rejection Trend (trailing 6 months, from rollups)</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Month</th><th>Submitted</th><th>Rejected</th><th>Rejection Rate</th></tr></thead>
+          <tbody>${trendRows}</tbody>
+        </table></div>
+      </div>
+
+      <div class="flex gap-8" style="justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <div style="font-weight:700;font-size:14px">🔍 Live Scan — Rejected-in-Window Detail</div>
+        <button class="btn btn-ghost btn-sm" id="ra-csv">⬇️ Export CSV</button>
+      </div>
+      <div class="row2" style="max-width:420px;margin-bottom:10px">
+        <div class="field"><label>From</label><input type="date" id="ra-from" value="${esc(range.from)}"></div>
+        <div class="field"><label>To <span class="text-dim">(max 92 days)</span></label><input type="date" id="ra-to" value="${esc(range.to)}"></div>
+      </div>
+      <button class="btn btn-ghost btn-sm mb-12" id="ra-apply">Apply Range</button>
+
+      <div class="kpi-grid" style="margin-bottom:14px">
+        <div class="kpi-card"><div class="kpi-val">${total}</div><div class="kpi-lbl">Lines Rejected in Window</div></div>
+        <div class="kpi-card"><div class="kpi-val" style="color:var(--green)">${recoveryRate}%</div><div class="kpi-lbl">Recovery Rate (${recovered}/${total||0} now activated)</div></div>
+        <div class="kpi-card"><div class="kpi-val">${avgResubmit.toFixed(1)}</div><div class="kpi-lbl">Avg Resubmit Count</div></div>
+      </div>
+
+      ${breakdownTable('Top Rejection Reasons', sortedEntries(reasonTally), k=>k)}
+      <p class="text-dim text-xs mb-8" style="margin-top:-10px" title="Free-text field — a typo'd or reworded reason creates its own bucket rather than merging with a similar one.">Reasons are exact-string grouped (free text) — no reason taxonomy is applied. Counted once per line, using its FIRST rejection reason only.</p>
+      ${breakdownTable('Rejections by Team', sortedEntries(teamTally), k=>teamName(k==='none'?null:k))}
+      ${breakdownTable('Rejections by Agent', sortedEntries(agentTally), k=>agentNameById[k]||k)}
+      ${breakdownTable('Rejections by Family', sortedEntries(familyTally), k=>familyLabel(k))}
+    `;
+
+    document.getElementById('ra-apply').addEventListener('click', loadWindow);
+    document.getElementById('ra-csv').addEventListener('click', () => {
+      const columns = [
+        { label:'Submission ID', get:s=>s.id },
+        { label:'Bundle', get:s=>s.bundleId||'' },
+        { label:'Agent', get:s=>s.agentName||'' },
+        { label:'Team', get:s=>teamName(s.teamId) },
+        { label:'Category', get:s=>categoryLabel(s.category) },
+        { label:'Family', get:s=>familyLabel(familyOf(s.category)) },
+        { label:'First Rejection Reason', get:s=>firstRejectedEvent(s)?.payload?.reason||'' },
+        { label:'First Rejected At', get:s=>s.rejectedAt||'' },
+        { label:'Resubmit Count', get:s=>resubmitCount(s) },
+        { label:'Current Status', get:s=>SUBMISSION_STATUS_LABELS[s.status]||s.status||'' },
+        { label:'Recovered (now activated)', get:s=>s.status==='activated'?'Yes':'No' }
+      ];
+      const csv = toCsv(scanned, columns);
+      downloadCsv(`rejection-analytics-${range.from}_to_${range.to}.csv`, csv);
+    });
+  }
+
+  await loadWindow();
+}
+
+// ════════════════════════════════════════════════════
 // TAB SCAFFOLD
 // ════════════════════════════════════════════════════
 export async function renderReportsTab(){
@@ -479,7 +649,7 @@ export async function renderReportsTab(){
       if(active === 'daily-team')         await renderDailyTeamReport(body);
       else if(active === 'daily-summary') await renderDailySummaryReport(body);
       else if(active === 'tracker')       await renderMasterTrackerReport(body);
-      else if(active === 'rejections')    body.innerHTML = placeholderHtml('Rejection Analytics');
+      else if(active === 'rejections')    await renderRejectionAnalyticsReport(body);
     } catch(e){
       body.innerHTML = `<p class="err">Error: ${esc(e.message)}</p>`;
     }
