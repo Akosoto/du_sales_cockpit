@@ -1,4 +1,4 @@
-import { db, collection, query, where, getDocs } from './state.js';
+import { db, collection, query, where, getDocs, doc, getDoc } from './state.js';
 
 // ════════════════════════════════════════════════════
 // DASHBOARD DATA LAYER (Session B4 Step 4, ARCHITECTURE.md §12) —
@@ -49,6 +49,54 @@ export function resolvePeriodRange(period){
 
 function hoursBetween(fromIso, toIso){ return (new Date(toIso) - new Date(fromIso)) / 3600000; }
 function avg(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null; } // null = N/A, never 0
+
+// ── Phase C rollup swap (ARCHITECTURE.md §15.5) ──
+// The three PRESET periods read their donut/KPI aggregation (totals + byTeam
+// + byContributor) from precomputed rollups/{YYYY-MM} docs instead of scanning
+// submissions; CUSTOM ranges keep the live path unchanged. Month keys are the
+// LOCAL-time YYYY-MM the increment sites bucket by (js/rollups.js monthKey), so
+// a preset here reads exactly the months resolvePeriodRange() spans. This
+// Quarter = the (up to) three months of the current quarter, summed
+// client-side. Time metrics + agent role metrics stay on the live queries this
+// session (fixed decision + §12: agent metrics are attribution-independent,
+// keyed by agentId, which the attribution-based byContributor can't serve), so
+// the live scans below still run for roleMetrics in preset mode too — this swap
+// sources the donuts/KPIs from rollups and proves preset==custom, not a full
+// read-elimination (that lands when time/role metrics roll up in a later
+// session).
+const PRESETS = new Set(['thisMonth','lastMonth','thisQuarter']);
+function monthKeyLocal(y, mZeroBased){ const d = new Date(y, mZeroBased, 1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; }
+function presetMonths(period){
+  const t = new Date(); const y = t.getFullYear(), m = t.getMonth();
+  if(period === 'thisMonth') return [monthKeyLocal(y, m)];
+  if(period === 'lastMonth') return [monthKeyLocal(y, m-1)];               // new Date handles Jan→prev-Dec rollover
+  if(period === 'thisQuarter'){ const qs = Math.floor(m/3)*3; return [0,1,2].map(i => monthKeyLocal(y, qs+i)); }
+  return [];
+}
+// Sum the targeted month docs. A missing/denied month doc (the get-on-
+// nonexistent-doc gotcha, §12) degrades to zeros — same try/catch posture as
+// loadOrgConfig()/the recompute tool.
+async function readPresetRollups(period){
+  const acc = { totals:{aedActivated:0, linesActivated:0}, byTeam:{}, byContributor:{} };
+  for(const mk of presetMonths(period)){
+    let data = null;
+    try { const s = await getDoc(doc(db,'rollups',mk)); if(s.exists()) data = s.data(); }
+    catch(e){ /* absent/denied → treat as empty */ }
+    if(!data) continue;
+    acc.totals.aedActivated  += Number(data.totals && data.totals.aedActivated)  || 0;
+    acc.totals.linesActivated += Number(data.totals && data.totals.linesActivated) || 0;
+    for(const [team,v] of Object.entries(data.byTeam || {})){
+      const b = acc.byTeam[team] || (acc.byTeam[team] = { aed:0, count:0 });
+      b.aed += Number(v.aed)||0; b.count += Number(v.count)||0;
+    }
+    for(const [key,v] of Object.entries(data.byContributor || {})){
+      const c = acc.byContributor[key] || (acc.byContributor[key] = { aed:0, count:0, label:v.label, type:v.type });
+      c.aed += Number(v.aed)||0; c.count += Number(v.count)||0;
+      if(v.label) c.label = v.label; if(v.type) c.type = v.type;
+    }
+  }
+  return acc;
+}
 
 // {teams, users}: already-fetched org data (dashboard.js's manager branch
 // already loads these) — avoids this module re-fetching them itself, and
@@ -163,11 +211,34 @@ export async function getDashboardData(period, { teams = [], users = [] } = {}){
     duTurnaroundAvgHours: avg(m.duTurnaroundHours)
   }));
 
+  // ── Donuts/KPIs: presets from rollups, custom from the live scan above ──
+  // roleMetrics is ALWAYS the live computation (below), unchanged in both
+  // modes. Preset totals/byTeam/byContributor come from the rollup docs; the
+  // live byTeamMap/byContribMap/activatedAed are still computed above (the
+  // activated scan feeds roleMetrics regardless) and used only for CUSTOM.
+  let outTotals, outByTeam, outByContributor;
+  if(PRESETS.has(period)){
+    const roll = await readPresetRollups(period);
+    outTotals = { activatedAed: roll.totals.aedActivated, activatedCount: roll.totals.linesActivated };
+    outByTeam = Object.entries(roll.byTeam).map(([teamId,v]) => ({
+      teamId: teamId==='none' ? null : teamId,
+      teamName: teamById[teamId]?.name || (teamId==='none' ? 'Unassigned' : teamId),
+      aed: v.aed, count: v.count
+    })).sort((a,b)=>b.aed-a.aed);
+    outByContributor = Object.entries(roll.byContributor).map(([key,v]) => ({
+      key, name: v.label || key, type: v.type || 'agent', aed: v.aed, count: v.count
+    })).sort((a,b)=>b.aed-a.aed);
+  } else {
+    outTotals = { activatedAed, activatedCount: activated.length };
+    outByTeam = Object.values(byTeamMap).sort((a,b)=>b.aed-a.aed);
+    outByContributor = Object.values(byContribMap).sort((a,b)=>b.aed-a.aed);
+  }
+
   return {
     period: range,
-    totals: { activatedAed, activatedCount: activated.length },
-    byTeam: Object.values(byTeamMap).sort((a,b)=>b.aed-a.aed),
-    byContributor: Object.values(byContribMap).sort((a,b)=>b.aed-a.aed),
+    totals: outTotals,
+    byTeam: outByTeam,
+    byContributor: outByContributor,
     roleMetrics: {
       agents: Object.values(agentMetrics).sort((a,b)=>b.aedClosed-a.aedClosed),
       backend: backendRows.sort((a,b)=>b.submissionsHandled-a.submissionsHandled),
