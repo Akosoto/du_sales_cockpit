@@ -739,3 +739,188 @@ were added. B5 smoke (Submit-to-Backend's `accTransfer`/`sourcedBy`
 checkboxes, Queue tab, Dashboard) re-verified with zero regressions —
 this session's only shared surface, `js/orgConfig.js`, is not imported
 by `js/queue.js` or `js/dashboard*.js` at all.
+
+## 15. Session C1 — Rollup Counters Core (Phase C, IN PROGRESS)
+
+**Purpose:** the write-time rollup counters §7/§10 reserved for Phase C.
+`getDashboardData()`'s donut/KPI aggregations (today a live per-request
+scan of `submissions`, `js/dashboardData.js`) move onto precomputed
+per-month rollup docs, keyed by product FAMILY (Session C0's layer) as
+well as category/team/contributor. **Prime directive: a wrong counter is
+worse than a slow read.** Every increment is (a) paired with the mutation
+that justifies it in the SAME batch/transaction, (b) delta-based on a
+state TRANSITION (never on current state alone), and (c) rebuildable from
+raw `submissions` by the recompute tool below — that reconciliation is the
+safety net, not an afterthought.
+
+### 15.1 Storage — one doc per month, `rollups/{YYYY-MM}`
+
+Doc ID is the **local-time** month key (`YYYY-MM`). Local, not UTC, is
+load-bearing: `resolvePeriodRange()` (`js/dashboardData.js`) computes This
+Month / Last Month / This Quarter boundaries with local `new Date(y,m,…)`,
+so a line whose timestamp falls in a different month under UTC must bucket
+the way the live query sees it. UAE is a fixed UTC+4 with no DST, so
+`monthKey(iso)` = `new Date(iso)`'s local `getFullYear()`/`getMonth()` is
+unambiguous.
+
+```
+rollups/{YYYY-MM}
+{
+  orgId,                       // stamped by js/db.js gateway (redundant field;
+                               //   sameOrg() rule reads it — see 15.5)
+  month: 'YYYY-MM',            // self-describing copy of the doc id
+  totals: {
+    aedActivated,              // Σ mrc of lines CURRENTLY activated, in THIS
+                               //   month's activation bucket (net of any
+                               //   activate→deactivate→reactivate cycles)
+    linesActivated,            // # lines currently activated (same bucketing)
+    linesSubmitted,            // # submission docs created (createdAt month);
+                               //   only ever decremented by a doc DELETE
+    linesRejected,             // # rejection TRANSITIONS (historical event
+                               //   count; NOT decremented by a later resubmit)
+    linesResubmitted           // # resubmit TRANSITIONS (historical)
+  },
+  byFamily:      { [familyId]:      { aed, count } },  // activations only
+  byCategory:    { [categoryId]:    { aed, count } },  // activations only
+  byTeam:        { [teamId|'none']: { aed, count } },  // activations only
+  byContributor: { [key]: { aed, count, label, type } }, // activations only;
+                               //   attribution-based (see 15.3)
+  lastRecomputedAt, lastRecomputedBy   // set by the recompute tool (15.4)
+}
+```
+
+The four per-dimension maps hold **activations only** — `aed` = Σ mrc of
+activated lines, `count` = # activated lines. This matches
+`getDashboardData()`'s existing `byTeam`/`byContributor` output (both
+activation-based today), which Step 6 must preserve. Zero-AED prepaid lines
+flow through identically: `count` +1, `aed` +0, no special-casing.
+
+### 15.2 Month-bucketing rule
+
+- **Submission-count** buckets (`linesSubmitted`) key by `createdAt` month.
+- **Activation** buckets (`aedActivated`/`linesActivated` + all four
+  dimensions) key by `activatedAt` month. `activatedAt` is stamped once, on
+  the FIRST activation, and is never cleared on de-activation
+  (`js/submissions.js appendEvent` — sticky), so an activate→deactivate→
+  reactivate cycle reverses and re-adds in the SAME month bucket and nets
+  correctly. This stickiness is load-bearing for reversal (15.3, site 3).
+- **Historical event** counts (`linesRejected`/`linesResubmitted`) key by
+  the month the event itself occurred (`event.ts` / `rejectedAt`), so a
+  second rejection in a later month counts in that later month.
+
+### 15.3 Increment sites — all delta-based, all in the mutation's own batch/txn
+
+Extends `js/db.js` / `js/submissions.js` client-side (no Cloud Functions in
+this architecture). Guards read the **pre-transaction** status (`sub.status`
+inside `appendEvent`'s `runTransaction`) — the authoritative `prevStatus`.
+`aed` = `Number(sub.mrc)||0`. `familyId` = `currentCategories().find(c =>
+c.id === sub.category)?.familyId || 'others'`. `teamKey` = `sub.teamId ||
+'none'`. Contributor `key`/`label`/`type` per the table note below.
+
+| # | Site (code path) | Trigger | Guard (transition) | Month bucket | Rollup deltas |
+|---|---|---|---|---|---|
+| 1 | **Create line** — `createSubmissions()`, per line, in its `writeBatch` | every created submission doc | — | `monthKey(createdAt)` | `totals.linesSubmitted +1` |
+| 2 | **Into activated** — `appendEvent` type `activated` | status → activated | `prevStatus != 'activated'` | `monthKey(activatedAt)` | `totals.aedActivated +aed`, `totals.linesActivated +1`, and per-dimension `byFamily/byCategory/byTeam/byContributor[.aed +aed, .count +1]`; set `byContributor[key].label/type` |
+| 3 | **Out of activated** — `appendEvent` type `rejected`/`resubmit`/`submittedToDu` | status leaves activated | `prevStatus == 'activated' && next != 'activated'` | `monthKey(activatedAt)` *(original)* | exact negatives of site 2 |
+| 4 | **Into rejected** — `appendEvent` type `rejected` | rejection logged | `prevStatus != 'rejected'` | `monthKey(rejectedAt = event ts)` | `totals.linesRejected +1` *(site 3 also fires if prevStatus was activated)* |
+| 5 | **Resubmit** — `appendEvent` type `resubmit` | rejected → pendingVerification | `prevStatus == 'rejected'` | `monthKey(event ts)` | `totals.linesResubmitted +1` |
+| 6 | **Delete** — `deleteSubmission()` gateway (NEW; manager-only) | manager deletes a submission doc | — | each bucket's own original month | negate the submission's ENTIRE net contribution (replay `events[]`): `−linesSubmitted@createdMonth`; if currently activated, negate site-2 buckets `@activatedMonth`; `−linesRejected`/`−linesResubmitted` per historical event months — so the rollup still equals a fresh recompute over the surviving docs |
+
+A single `appendEvent` can touch TWO month docs (e.g. reject-a-currently-
+activated line: reverse activation in the old month + `linesRejected` in the
+event month) — both writes ride the one transaction. Non-status events
+(`note`, `activityNo`, `docsVerified`, the `submittedToDu`→`inProgress`
+bump, `transferCompleted`/`transferRejected` — the last two are the
+orthogonal transferStatus tracker, §13) produce **no** rollup delta.
+
+**Increment mechanism:** `set(rollupRef, <nested-increment object>,
+{merge:true})` inside the same batch/transaction — the creation-safe
+equivalent of §7's "increment on dotted paths": a dotted-path `update()`
+throws when the month doc doesn't exist yet (first write of a month),
+whereas `set(merge)` deep-merges + applies `FieldValue.increment`
+transforms and creates the doc if absent. `byContributor[key].label/type`
+are plain last-writer sets in the same merge. Recompute (15.4) instead does
+a full `set()` (no merge) to overwrite absolute truth.
+
+**Contributor attribution — semantics identical to B5, key ENCODING
+slugged.** The credit rule matches `js/dashboardData.js` exactly: a normal
+line credits the submitting agent; a `sourcedBy.flag` line credits
+`sourcedBy.partnerName`, falling back to the "Outsourced Revenue" bucket
+when no name was recorded; `accTransfer` is NOT read. The one difference:
+the contributor is now a Firestore **map key** (a dotted-path increment
+target), not a JS object key, so a partner name — which may contain `.`,
+`/`, `~`, `*`, `[`, `]` — must be slugged. Hence:
+
+- normal line → `key = agentId`, `label = agentName`, `type = 'agent'`
+- sourced + partner name → `key = slug(partnerName)`, `label =
+  partnerName` (raw, for display), `type = 'partner'`
+- sourced, no name → `key = 'outsourced'`, `label = 'Outsourced Revenue'`,
+  `type = 'partner'`
+
+`slug()` lowercases and collapses non-alphanumerics to `-`, empty →
+`'outsourced'`. `label` preserves the display string B5 showed; `type`
+lets `getDashboardData` reproduce its `{type}` output field without
+re-deriving it. This reconciles the fixed decision's "slugged sourcedBy
+partnerName OR 'outsourced'" with "attribution identical to B5's
+dashboardData logic."
+
+### 15.4 Reconciliation tool (mandatory safety net) + backfill
+
+Manager-only "Recompute month" — rebuilds one `rollups/{YYYY-MM}` doc from
+raw `submissions` via the B4 query path, by REPLAYING each submission's
+`events[]` through the SAME transition logic the live sites use (so
+recompute == live by construction). It REPORTS drift (old vs new, per
+bucket) BEFORE overwriting. **Backfill** = run recompute for every month
+from the earliest submission to now; idempotent by construction (a full
+`set()` of absolute values). Post-activation edits to a line's `mrc` are
+NOT tracked by the live deltas (activate and any later reversal both use
+the current `mrc`, netting to zero only if it never changed) — **this is
+the one documented gap, and recompute is its correction mechanism.**
+
+### 15.5 Reads, rules, indexes
+
+- **Read pattern:** rollups are read by DOC ID only — `getDoc(rollups/
+  {YYYY-MM})`; This Quarter = three `getDoc`s by key, summed client-side.
+  **Never LIST-queried**, so the LIST-query provability question (§12) does
+  not arise and **no composite index is needed**. A month with no data yet
+  has no doc — `getDoc` on a nonexistent doc can be denied outright (the
+  §12 get-on-nonexistent gotcha); the reader treats absent/denied as
+  all-zeros, same try/catch pattern as `loadOrgConfig()`.
+- **Rules (Step 5 PAUSE POINT):** new `rollups/{m}` block — read: any
+  authed same-org user; create/update: any authed same-org user (increments
+  ride agent creates AND backend activations; client-trust is an explicitly
+  documented tradeoff for the later security overhaul to revisit); delete:
+  manager-only. `sameOrg()`/`sameOrgWrite()` themselves are UNTOUCHED, so
+  the `tools/rules-probe.html` re-run standing protocol does not trigger.
+- **getDashboardData swap (Step 6):** presets (This/Last Month, This
+  Quarter) read rollups for `totals` + `byTeam` + `byContributor`; CUSTOM
+  ranges keep the existing live path unchanged. The charts/cards above
+  `getDashboardData` and its call signature/output shape do not change.
+
+### 15.6 Flagged deviations from this session's prompt (reconciled, not silent)
+
+1. **Per-dimension submitted counts** (the create-site bullet's "(+
+   per-dimension submitted counts)") are NOT built. The fixed schema's
+   dimension buckets are `{aed,count}` = activations, and Step 6 must keep
+   `byTeam`/`byContributor` activation-based; adding parallel submitted
+   buckets would serve no consumer THIS session. Create increments only
+   `totals.linesSubmitted`. Per-family submitted breakdowns land with Phase
+   D reports; recompute makes that a pure additive rebuild.
+2. **`getDashboardData.roleMetrics` stays on live queries** in both preset
+   and custom mode. Agent metrics are keyed by `agentId` (attribution-
+   independent, §12) which the attribution-based `byContributor` cannot
+   serve, and backend metrics are the time metrics the fixed decision keeps
+   live this session. Presets therefore read rollups for the donuts/KPIs
+   but still run the live created/activated/claimed scans to feed
+   roleMetrics — a partial read reduction now, full elimination deferred to
+   a later session (consistent with "time metrics remain on live queries
+   this session").
+3. **No manager submission-delete UI exists today** (rules permit it; no
+   code calls `dbDelete('submissions')`). Step 3 adds a `deleteSubmission()`
+   gateway that reverses the full rollup contribution atomically, as the
+   ONLY sanctioned delete path, so the counter reversal can't be bypassed
+   if such a UI is later added or a manager deletes out-of-band. Recompute
+   remains the real safety net.
+4. **`byContributor.type`** is added to the fixed `{aed,count,label}` shape
+   (self-describing; lets Step 6 reproduce its `{type}` output field
+   without re-deriving from the users list).
