@@ -740,7 +740,7 @@ checkboxes, Queue tab, Dashboard) re-verified with zero regressions —
 this session's only shared surface, `js/orgConfig.js`, is not imported
 by `js/queue.js` or `js/dashboard*.js` at all.
 
-## 15. Session C1 — Rollup Counters Core (Phase C, IN PROGRESS)
+## 15. Session C1 — Rollup Counters Core (Phase C — shipped)
 
 **Purpose:** the write-time rollup counters §7/§10 reserved for Phase C.
 `getDashboardData()`'s donut/KPI aggregations (today a live per-request
@@ -924,3 +924,43 @@ the one documented gap, and recompute is its correction mechanism.**
 4. **`byContributor.type`** is added to the fixed `{aed,count,label}` shape
    (self-describing; lets Step 6 reproduce its `{type}` output field
    without re-deriving from the users list).
+
+### 15.7 Regression (the triple-check — RAW == ROLLUP == RECOMPUTE)
+
+Verified live against a two-month fixture. **62 isolated unit assertions** on
+the pure engine (activate/reverse nets to zero, historical reject/resubmit
+counts, zero-AED prepaid, sourced attribution routing off the agent bucket,
+delete reversal, apply-layer summing + payload shape, diffRollups). Then a
+live fixture driven through the ACTUAL increment paths (createSubmissions /
+appendEvent / deleteSubmission) as manager:
+
+- **Month A (current, live increments):** six cases — one activation, one
+  reject→resubmit→activate, one activation-reversal, one manager delete, one
+  zero-AED prepaid line, one sourcedBy partner line. RAW (an independent
+  FINAL-STATE + event-scan tally) == ROLLUP (the live-incremented doc) ==
+  RECOMPUTE (the replay), **zero drift on every bucket** — totals, byFamily,
+  byCategory, byTeam, byContributor. The activation-reversal left its category
+  bucket at `{0,0}`; the deleted line was absent from all three; the sourced
+  line credited the partner, not the agent.
+- **Create-via-increment proven live:** the month's rollup doc was
+  `permission-denied`/absent immediately before the first case and existed
+  with correct values immediately after — backfill did NOT pre-create it, so
+  the set-with-merge CREATE passed the published `sameOrgWrite()` (orgId
+  stamped first in the payload).
+- **Month B (prior month, seeded raw):** two submissions with backdated
+  timestamps, rollup built by the **recompute tool's real write-backfill**
+  (dry-run drift report → Apply). The backfill's current-month drift isolated
+  EXACTLY the one pre-wiring baseline submission (`linesSubmitted 5→6`) and
+  nothing else — the live increments themselves had zero drift.
+- **Dashboard preset == custom** for the same dates, both months: the rendered
+  view (team/contributor names + AED + count) is byte-identical. The only
+  preset/custom divergence is the internal byContributor `key` (slug vs raw
+  partnerName, Flag 1) — not read by any renderer, so the view is unaffected.
+- **Cleanup to baseline:** all fixture data deleted; a final recompute
+  restored `rollups/{current}` to the baseline (`linesSubmitted:1`, the one
+  pre-existing submission) and the seeded prior-month doc was removed. B5
+  (Queue, sourcedBy capture) and C0 (families) re-smoked with zero
+  regressions; no console errors across the session.
+
+**Post-activation `mrc` edits remain the one untracked case** (§15.4) — the
+recompute tool is its correction path.

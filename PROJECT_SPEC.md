@@ -609,6 +609,34 @@ line activate while a sibling is still pending (the normal case, not an edge cas
   OR-clause exactly. Cost this session a real regression bug (team_lead/agent got
   `permission-denied` reading their own data) before being caught and fixed.
 
+### `rollups` (NEW, Session C1, ARCHITECTURE.md §15) — write-time counters
+```
+// One doc per LOCAL-time calendar month, id == 'YYYY-MM'. Field-orgId collection (orgId stamped
+// on every write) — sameOrg()/sameOrgWrite() as for submissions, NOT key-matched like orgs/.
+{
+  orgId, month,                                     // 'YYYY-MM' self-describing copy of the id
+  totals: { aedActivated, linesActivated,           // aed = mrc of CURRENTLY-activated lines
+            linesSubmitted, linesRejected,           // linesRejected/Resubmitted = historical event
+            linesResubmitted },                      //   counts (never decremented except by delete)
+  byFamily:      { [familyId]:   { aed, count } },   // activations only
+  byCategory:    { [categoryId]: { aed, count } },   // activations only
+  byTeam:        { [teamId|'none']: { aed, count } },
+  byContributor: { [key]: { aed, count, label, type } },  // key = agent uid, or slugged sourcedBy
+                                                    //   partnerName, or 'outsourced'; attribution
+                                                    //   identical to B5 dashboardData, key slugged
+                                                    //   for Firestore-map safety (label = raw name)
+  lastRecomputedAt, lastRecomputedBy                // set by the recompute tool only
+}
+```
+Written by write-time increments in the SAME batch/transaction as the mutation (create → `linesSubmitted`;
+activation ± → all dimensions; rejected/resubmit → historical totals; `deleteSubmission()` → full reversal),
+all delta-on-transition via `js/rollups.js`. Read by DOC ID only (`getDoc`) — the Manager's Cockpit presets
+(This/Last Month, This Quarter = 3 months summed) via `js/dashboardData.js`, and the manager-only recompute
+tool. Never list-queried → no composite index. Rebuildable from raw submissions by the recompute/backfill
+tool (`js/org.js` "🧮 Recompute Rollups") which replays each submission's `events[]` through the same
+transition logic and reports drift before overwriting. See Firestore Security Rules below and the Session C1
+phase entry.
+
 ---
 
 ## Pipeline Stages
@@ -770,7 +798,7 @@ acting manager's own `orgId` immediately, and every subsequent collection's `sam
 then compare a real orgId against still-unmigrated docs and fail closed, silently locking the
 migration out of everything after `users`.
 
-All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, eleven collections:
+All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, twelve collections:
 
 | Collection | Read | Write |
 |---|---|---|
@@ -784,6 +812,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 | `products` | Any auth | Manager only |
 | `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted, OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop, now built end-to-end as Fix & Resubmit — Phase D); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
 | `submissionDocs` (firestore-b64 driver, ARCHITECTURE.md §6) | Same four parties as `submissions` — manager; `agentId==self`; their TL (`teamId` match); backend department (fields denormalized onto every page doc for exactly this reason) | Create: the uploading agent (`agentId==self`), a manager, **or (Phase D) active backend department staff** attaching an additional document to someone else's bundle (the page's `agentId` stays the ORIGINAL submitting agent's, not the backend uploader's — `isActiveBackend()` is what actually authorizes that write, since `agentId==self` can't); **no update at all** — pages are immutable, replacing a doc means writing the NEXT version as a new create (Fix & Resubmit, Phase D); delete: manager-only (matches the retention sweep's own gate) |
+| `rollups` (Session C1, ARCHITECTURE.md §15) | Any auth, same org | Create + update: any auth, same org — write-time increments ride BOTH the agent's submission-create batch AND a backend user's activation transaction, so neither can be narrowed to one role (client-trust on counter values is the documented §15.5 tradeoff, correctable via the recompute tool); delete: manager-only. Field-orgId collection (`orgId` stamped first in every `applyRollupDeltas` payload, so the set-merge CREATE of a brand-new month passes `sameOrgWrite()`); never list-queried (single-doc `getDoc` by key) → no composite index |
 | `auditLog` | Manager only | Create: any auth, `sameOrgWrite()` (the gateway writes these on every mutation); update/delete: **never**, always `false` — append-only |
 
 **Key implementation notes:**
@@ -1364,6 +1393,64 @@ label resolves by id. B5 smoke (Submit-to-Backend's accTransfer/sourcedBy checkb
 Dashboard) re-verified with zero regressions. Full test-data cleanup to baseline verified via
 `getDoc` (leads/companies/users/products/submissions counts all unchanged, product category and
 org-config state restored).
+
+### Session C1 (shipped) — Rollup Counters Core (Phase C)
+Per `ARCHITECTURE.md` §15. The write-time rollup counters §7/§10 reserved for Phase C: a new
+`rollups/{YYYY-MM}` collection (one doc per LOCAL-time month) whose donut/KPI aggregations replace
+the Manager's Cockpit's live per-request scan of `submissions`. **Prime directive: a wrong counter
+is worse than a slow read** — every increment is paired with the mutation that justifies it in the
+SAME batch/transaction, delta-based on a state TRANSITION (never current state alone), and
+rebuildable from raw submissions by the recompute tool.
+
+**Engine (`js/rollups.js`, pure + unit-testable):** `monthKey` (local-time, to match
+`resolvePeriodRange`'s local month boundaries), `contributorOf`/`slug` (attribution IDENTICAL to
+B5's `dashboardData` — normal line credits the submitting agent, a `sourcedBy` line credits the
+partner, else "Outsourced Revenue" — but the key is SLUGGED because it's now a Firestore map key,
+raw name kept in `label`), a `familyOf` resolver, and one `transitionDeltas()` that both the live
+sites and `submissionContribution()`'s event-replay funnel through, so live and recompute cannot
+drift. `applyRollupDeltas()` writes via `set(ref, nested, {merge:true})` with `FieldValue.increment`
+(creation-safe; sums same-path deltas so N lines → one `increment(N)` and ONE write per doc).
+
+**Doc shape** — `totals{aedActivated,linesActivated,linesSubmitted,linesRejected,linesResubmitted}`,
+and `byFamily`/`byCategory`/`byTeam` `{[id]:{aed,count}}` + `byContributor{[key]:{aed,count,label,
+type}}`, all activation-based (aed = mrc of activated lines). The six increment sites (all in the
+mutation's own batch/txn, `js/submissions.js`): **create** → `linesSubmitted` (createdAt month);
+**into activated** (guard prev≠activated) → aed/count across all dimensions (activatedAt month);
+**out of activated** → symmetric decrements (original activatedAt month, via the sticky
+`activatedAt`); **into rejected** (guard prev≠rejected) → `linesRejected` (event month, historical);
+**resubmit** (prev==rejected) → `linesResubmitted`; **delete** (new manager-only `deleteSubmission()`
+gateway — no delete UI existed) → negates the full replayed contribution. Zero-AED prepaid lines
+flow through identically (count yes, aed 0).
+
+**Reconciliation tool (`js/org.js`, manager-only "🧮 Recompute Rollups"):** rebuilds a month (or
+all months = backfill) by replaying each submission's `events[]` through the same transition logic,
+REPORTS per-bucket drift (stored vs recomputed) before a full-overwrite Apply. Idempotent. The only
+untracked case — a post-activation `mrc` edit (both the activation and any reversal use current
+`mrc`) — is documented and corrected by this tool.
+
+**Dashboard swap (`js/dashboardData.js`):** the three preset periods read `totals`/`byTeam`/
+`byContributor` from `rollups/{YYYY-MM}` (This Quarter = up to 3 months summed); CUSTOM ranges keep
+the live path unchanged; `roleMetrics` (agent metrics keyed by agentId, and the backend time
+metrics) stay live this session. Call signature and output shape unchanged — `dashboardCharts.js`/
+`dashboardCards.js` untouched.
+
+**Rules (published, sentinel-verified):** new `match /rollups/{m}` — read + create + update = any
+authed same-org user (increments ride both the agent create batch and the backend activation txn;
+client-trust on counter values is the documented §15.5 tradeoff for the later security overhaul),
+delete = manager-only. Field-orgId collection → `sameOrg()`/`sameOrgWrite()` as for `submissions`;
+`applyRollupDeltas` stamps `orgId` first so the set-merge CREATE of a new month passes
+`sameOrgWrite()`. NEVER list-queried (single-doc `getDoc` by key) → no composite index;
+`sameOrg()`/`sameOrgWrite()` untouched → rules-probe protocol not triggered.
+
+**Regression (the triple-check):** 62 isolated unit assertions + a live two-month fixture through
+the real increment paths — one activation, one reject→resubmit→activate, one activation-reversal,
+one manager delete, one zero-AED prepaid, one sourcedBy partner line. RAW (independent final-state
+tally) == ROLLUP (live increments) == RECOMPUTE (replay), zero drift on every bucket; create-via-
+increment proven live (doc `permission-denied`/absent before, correct after, backfill did not
+pre-create it); the backfill drift isolated exactly the one pre-wiring baseline submission; dashboard
+preset view == custom view byte-for-byte (only the internal slugged contributor key differs, not
+read by any renderer). Full cleanup to baseline + a final recompute restored `rollups` to the
+baseline; B5/C0 re-smoked clean. See `ARCHITECTURE.md` §15.7.
 
 ---
 
