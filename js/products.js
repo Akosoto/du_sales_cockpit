@@ -764,9 +764,14 @@ async function runFamilyMigration(plan, onSaved){
 
 function showCategoryConfigModal(products, onSaved){
   function countFor(catId){ return products.filter(p=>p.category===catId); }
+  // Family delete-blocking: which categories reference this family — same
+  // "list the blockers, never a silent cascade" pattern countFor() uses for
+  // category delete against products.
+  function categoriesInFamily(famId){ return currentCategories().filter(c=>c.familyId===famId); }
 
   function render(){
     const categories = currentCategories();
+    const families = currentFamilies();
     const terms = {}; // term -> a stored label to use as the default/fallback
     products.forEach(p => (p.pricingOptions||[]).forEach(po => { if(terms[po.term]==null) terms[po.term] = po.label; }));
     const termLabels = currentTermLabels();
@@ -778,6 +783,27 @@ function showCategoryConfigModal(products, onSaved){
         <p>Some categories don't have a product family assigned yet (used by Phase C's reports). This seeds the default family list if needed and assigns each unmapped category — safe to re-run.</p>
         <button class="btn btn-primary btn-sm" id="btn-family-migration">🏷️ Migrate Categories to Families</button>
       </div>` : ''}
+      <p><strong>Product Families</strong> <span class="text-dim text-xs">(used by Phase C's reports — each category belongs to one)</span></p>
+      <div class="tbl-wrap"><table><tbody>
+        ${families.map(f=>{
+          const blockers = categoriesInFamily(f.id);
+          const n = blockers.length;
+          const blockText = n ? `${n} categor${n!==1?'ies':'y'}: ${esc(blockers.map(c=>c.label).join(', '))}` : '—';
+          return `<tr>
+            <td style="width:35%"><input type="text" class="cc-fam-label" data-id="${f.id}" value="${esc(f.label)}"></td>
+            <td class="td-dim text-xs">${blockText}</td>
+            <td style="text-align:right;white-space:nowrap">
+              <button class="btn btn-ghost btn-xs" data-fam-save="${f.id}">Save</button>
+              <button class="btn btn-danger btn-xs" data-fam-del="${f.id}" ${n?'disabled title="In use — cannot delete"':''}>Delete</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody></table></div>
+      <div class="row2 mt-8">
+        <input type="text" id="cc-new-fam-label" placeholder="New family label">
+        <button class="btn btn-ghost btn-sm" id="cc-add-fam">+ Add Family</button>
+      </div>
+      <div class="divider"></div>
       <p><strong>Categories</strong></p>
       <div class="tbl-wrap"><table><tbody>
         ${categories.map(c=>{
@@ -785,7 +811,10 @@ function showCategoryConfigModal(products, onSaved){
           const n = blockers.length;
           const blockText = n ? `${n} product${n!==1?'s':''}: ${esc(blockers.slice(0,3).map(p=>p.name).join(', '))}${n>3?` +${n-3} more`:''}` : '—';
           return `<tr>
-            <td style="width:35%"><input type="text" class="cc-cat-label" data-id="${c.id}" value="${esc(c.label)}"></td>
+            <td style="width:28%"><input type="text" class="cc-cat-label" data-id="${c.id}" value="${esc(c.label)}"></td>
+            <td style="width:20%"><select class="cc-cat-family" data-id="${c.id}">
+              ${families.map(f=>`<option value="${f.id}"${c.familyId===f.id?' selected':''}>${esc(f.label)}</option>`).join('')}
+            </select></td>
             <td class="td-dim text-xs">${blockText}</td>
             <td style="text-align:right;white-space:nowrap">
               <button class="btn btn-ghost btn-xs" data-cat-save="${c.id}">Save</button>
@@ -812,6 +841,53 @@ function showCategoryConfigModal(products, onSaved){
       </div>`, true);
 
     document.getElementById('btn-family-migration')?.addEventListener('click', () => showFamilyMigrationPreview(() => { onSaved(); render(); }));
+
+    document.querySelectorAll('[data-fam-save]').forEach(b=>b.addEventListener('click', async ()=>{
+      const id = b.dataset.famSave;
+      const label = (document.querySelector(`.cc-fam-label[data-id="${id}"]`).value||'').trim();
+      if(!label){ toast('Label cannot be empty.','err'); return; }
+      const updated = families.map(f=>f.id===id?{...f,label}:f);
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({families:updated}));
+      if(ok){ toast('Family renamed.'); onSaved(); }
+      render();
+    }));
+
+    document.querySelectorAll('[data-fam-del]:not([disabled])').forEach(b=>{
+      b.addEventListener('click', ()=>{
+        const id = b.dataset.famDel;
+        confirmModal(`Delete "${esc(families.find(f=>f.id===id)?.label||'')}"?`, 'This family is not referenced by any category and will be removed permanently.', async ()=>{
+          const updated = families.filter(f=>f.id!==id);
+          const ok = await withOrgConfigSave(()=>saveOrgConfig({families:updated}));
+          if(ok){ toast('Family deleted.'); onSaved(); }
+          render();
+        });
+      });
+    });
+
+    document.getElementById('cc-add-fam').onclick = async () => {
+      const label = v('cc-new-fam-label');
+      if(!label){ toast('Enter a label first.','err'); return; }
+      const id = label.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+      if(!id){ toast('Label must contain letters or numbers.','err'); return; }
+      if(families.some(f=>f.id===id)){ toast('A family with this id already exists — use a different label.','err'); return; }
+      const updated = [...families, {id, label:label.trim()}];
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({families:updated}));
+      if(ok){ toast('Family added.'); onSaved(); }
+      render();
+    };
+
+    // Family dropdown re-parents LIVE — saves immediately on change, unlike
+    // the label input's explicit Save button (free text shouldn't autosave
+    // on every keystroke; a <select> choice is already a complete, discrete
+    // action the moment it fires).
+    document.querySelectorAll('.cc-cat-family').forEach(sel=>sel.addEventListener('change', async function(){
+      const id = this.dataset.id;
+      const familyId = this.value;
+      const updated = categories.map(c=>c.id===id?{...c,familyId}:c);
+      const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
+      if(ok){ toast('Category moved to a new family.'); onSaved(); }
+      render();
+    }));
 
     document.querySelectorAll('[data-cat-save]').forEach(b=>b.addEventListener('click', async ()=>{
       const id = b.dataset.catSave;
@@ -841,7 +917,7 @@ function showCategoryConfigModal(products, onSaved){
       const id = label.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
       if(!id){ toast('Label must contain letters or numbers.','err'); return; }
       if(categories.some(c=>c.id===id)){ toast('A category with this id already exists — use a different label.','err'); return; }
-      const updated = [...categories, {id, label:label.trim()}];
+      const updated = [...categories, {id, label:label.trim(), familyId:'others'}];
       const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
       if(ok){ toast('Category added.'); onSaved(); }
       render();
