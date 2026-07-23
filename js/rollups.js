@@ -201,25 +201,55 @@ export function negate(deltas){
 // ── Apply layer (touches the SDK) ──────────────────────
 // Writes a delta list onto rollups/{month} docs via the caller's writer (a
 // writeBatch OR a runTransaction — both expose .set(ref,data,{merge:true})).
-// Groups by month, builds ONE nested-object payload per month, and stamps
-// orgId + month on every write (orgId is what the sameOrg() rule reads;
-// §15.5). Field transforms (increment) need no prior read, so this is safe to
-// add to a transaction after its reads.
+//
+// CRITICAL: increments for the SAME path within one call are SUMMED into a
+// single increment(sum), and only ONE .set() is emitted per month doc. Two
+// reasons: (a) Firestore forbids writing the same document twice in one
+// batch/transaction — a bundle of N created lines all bump
+// totals.linesSubmitted in the same month, and a delete-reversal can revisit
+// a path across an activate/reverse cycle; (b) a naive "last write wins" per
+// path would silently drop N-1 of those increments. Accumulation is into a
+// nested Map tree (not a joined-string key), so a path segment — even a legacy
+// name-string category with spaces/punctuation — needs no separator or
+// escaping. Sets (label/type) apply after increments, so a counter path never
+// mixes with a descriptor. orgId + month are stamped on every write (orgId is
+// what the sameOrg() rule reads; §15.5). Field transforms need no prior read,
+// so this is safe to add to a transaction after its reads.
 export function applyRollupDeltas(writer, deltas){
   if(!deltas || !deltas.length) return;
-  const byMonth = {};
-  for(const d of deltas){ (byMonth[d.month] || (byMonth[d.month]=[])).push(d); }
-  for(const month of Object.keys(byMonth)){
-    const payload = { orgId, month };
-    for(const d of byMonth[month]){
-      let node = payload;
+  const months = new Map();
+  for(const d of deltas){
+    let bucket = months.get(d.month);
+    if(!bucket){ bucket = { incTree: new Map(), sets: [] }; months.set(d.month, bucket); }
+    if('inc' in d){
+      let node = bucket.incTree;
       for(let i=0; i<d.path.length-1; i++){
-        const k = d.path[i];
-        if(typeof node[k] !== 'object' || node[k] === null) node[k] = {};
-        node = node[k];
+        let child = node.get(d.path[i]);
+        if(!(child instanceof Map)){ child = new Map(); node.set(d.path[i], child); }
+        node = child;
       }
       const leaf = d.path[d.path.length-1];
-      node[leaf] = ('inc' in d) ? increment(d.inc) : d.set;
+      node.set(leaf, (node.get(leaf)||0) + d.inc);
+    } else {
+      bucket.sets.push({ path: d.path, value: d.set });
+    }
+  }
+  for(const [month, bucket] of months){
+    const payload = { orgId, month };
+    (function walk(node, obj){
+      for(const [k,v] of node){
+        if(v instanceof Map){ if(typeof obj[k] !== 'object' || obj[k] === null) obj[k] = {}; walk(v, obj[k]); }
+        else obj[k] = increment(v);
+      }
+    })(bucket.incTree, payload);
+    for(const { path, value } of bucket.sets){
+      let obj = payload;
+      for(let i=0; i<path.length-1; i++){
+        const k = path[i];
+        if(typeof obj[k] !== 'object' || obj[k] === null) obj[k] = {};
+        obj = obj[k];
+      }
+      obj[path[path.length-1]] = value;
     }
     writer.set(doc(db,'rollups',month), payload, { merge:true });
   }
@@ -230,11 +260,39 @@ export function applyRollupDeltas(writer, deltas){
 // objects. The recompute tool (js/*, Step 4) reads these, diffs vs the stored
 // docs for a drift report, then overwrites with a full set() (no merge). Same
 // transition logic as live → recompute is the reconciliation ground truth.
-function blankMonth(){
+export function blankMonth(){
   return {
     totals: { aedActivated:0, linesActivated:0, linesSubmitted:0, linesRejected:0, linesResubmitted:0 },
     byFamily:{}, byCategory:{}, byTeam:{}, byContributor:{}
   };
+}
+
+// Per-bucket drift between a STORED rollup doc (or null/absent) and a freshly
+// recomputed one — the dry-run report the recompute tool shows BEFORE it
+// overwrites (§15.4). Compares only the counter leaves; ignores orgId/month/
+// audit fields and the byContributor label/type descriptors (not quantities).
+// Returns [{path, old, new}] for every leaf that differs, old missing → 0.
+const ROLLUP_TOTAL_KEYS = ['aedActivated','linesActivated','linesSubmitted','linesRejected','linesResubmitted'];
+const ROLLUP_DIM_KEYS = ['byFamily','byCategory','byTeam','byContributor'];
+export function diffRollups(oldObj, newObj){
+  const o = oldObj || {}, n = newObj || {};
+  const num = x => Number(x)||0;
+  const drifts = [];
+  for(const k of ROLLUP_TOTAL_KEYS){
+    const ov = num(o.totals && o.totals[k]), nv = num(n.totals && n.totals[k]);
+    if(ov !== nv) drifts.push({ path:`totals.${k}`, old:ov, new:nv });
+  }
+  for(const dim of ROLLUP_DIM_KEYS){
+    const keys = new Set([...Object.keys(o[dim]||{}), ...Object.keys(n[dim]||{})]);
+    for(const key of keys){
+      for(const metric of ['aed','count']){
+        const ov = num(o[dim] && o[dim][key] && o[dim][key][metric]);
+        const nv = num(n[dim] && n[dim][key] && n[dim][key][metric]);
+        if(ov !== nv) drifts.push({ path:`${dim}.${key}.${metric}`, old:ov, new:nv });
+      }
+    }
+  }
+  return drifts;
 }
 export function buildRollupsFromSubmissions(subs, familyOf){
   const months = {};

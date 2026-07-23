@@ -8,6 +8,7 @@ import { v, esc, now, fmtDate, disable, enable, toast, modal, closeModal, confir
 import { permissionChecklistHtml, wirePermissionSearch, getSelectedPermissions, hasPermission } from './permissions.js';
 import { fetchCompanies, backfillCompanies } from './companies.js';
 import { currentCategories, categoryLabel, findCategoryIdByLabel, loadOrgConfig, DEFAULT_CATEGORIES } from './orgConfig.js';
+import { buildRollupsFromSubmissions, diffRollups, blankMonth, currentFamilyResolver } from './rollups.js';
 import * as storage from './storage/index.js';
 import { orgId } from '../config.js';
 
@@ -111,6 +112,7 @@ export async function renderOrgTab(){
       <div><h2>Org & Teams</h2><p class="pg-hdr-sub">${teams.length} team${teams.length!==1?'s':''} · ${tls.length} team lead${tls.length!==1?'s':''} · ${ags.length} agent${ags.length!==1?'s':''}</p></div>
       <div class="pg-actions">
         <button class="btn btn-ghost btn-sm" id="btn-backup-export">⬇️ Backup / Export All Data</button>
+        <button class="btn btn-ghost btn-sm" id="btn-recompute-rollups">🧮 Recompute Rollups</button>
         <button class="btn btn-ghost btn-sm" id="btn-doc-retention-sweep">🗑️ Clean up old documents</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-team">+ New Team</button>
         <button class="btn btn-ghost btn-sm" id="btn-add-tl">+ New Team Lead</button>
@@ -306,6 +308,7 @@ export async function renderOrgTab(){
   ct.querySelector('#btn-category-migration')?.addEventListener('click', () => showCategoryMigrationPreview());
   ct.querySelector('#btn-backup-export')?.addEventListener('click', () => runBackupExport());
   ct.querySelector('#btn-doc-retention-sweep')?.addEventListener('click', () => runDocumentRetentionSweep());
+  ct.querySelector('#btn-recompute-rollups')?.addEventListener('click', () => showRecomputeRollupsModal());
   ct.querySelectorAll('[data-edit-company]').forEach(b => b.addEventListener('click', () => showEditCompanyModal(b.dataset.editCompany, companies, users)));
 
   ct.querySelectorAll('[data-edit-team]').forEach(b => b.addEventListener('click', () => showEditTeamModal(b.dataset.editTeam, teams, tls, ags)));
@@ -1124,6 +1127,101 @@ async function runDocumentRetentionSweep(){
   } finally {
     if(btn && !btn.textContent.includes('Cleaning')){ btn.disabled = false; btn.textContent = '🗑️ Clean up old documents'; }
   }
+}
+
+// ─── RECOMPUTE ROLLUPS (reconciliation tool, ARCHITECTURE.md §15.4) ───
+// The safety net for the write-time counters: rebuilds a month's (or every
+// month's) rollups/{YYYY-MM} doc from raw submissions by REPLAYING each
+// submission's events[] through the exact same transition logic the live
+// increment sites use (js/rollups.js buildRollupsFromSubmissions), so a
+// recompute is the ground truth the live counters must match. Always
+// dry-runs first — reports per-bucket drift (stored vs recomputed) and writes
+// nothing — before an explicit Apply overwrites the targeted month docs.
+// Backfill = leave the month blank (every month that has data). Idempotent by
+// construction (a full absolute overwrite, not an increment). Manager-only
+// (Org-tab reachability + the rollups delete/write rules).
+async function recomputeRollups(monthFilter, { write }){
+  // Existing B4 query path — every submission for this org (a deliberate admin
+  // full-scan, same category as backfillCompanies/the retention sweep).
+  const snap = await getDocs(query(collection(db,'submissions'), where('orgId','==',orgId)));
+  const subs = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+  const familyOf = currentFamilyResolver();
+  const computed = buildRollupsFromSubmissions(subs, familyOf); // { 'YYYY-MM': absoluteRollup }
+
+  // A specific month (even one that recomputes to EMPTY — so a now-emptied
+  // month can be zeroed) or, blank, every month that carries data.
+  const targetMonths = monthFilter ? [monthFilter] : Object.keys(computed).sort();
+
+  const report = [];
+  for(const m of targetMonths){
+    const newObj = computed[m] || blankMonth();
+    let existing = null;
+    try {
+      const s = await getDoc(doc(db,'rollups',m));
+      if(s.exists()) existing = s.data();
+    } catch(e){ /* rollups read rule ships Step 5 — treat a denial as absent, same as loadOrgConfig() */ }
+    report.push({ month:m, existed: !!existing, drift: diffRollups(existing, newObj), newObj });
+  }
+
+  if(write){
+    // Full overwrite (dbSet = set, not merge) → absolute truth replaces any
+    // drifted live-incremented values. skipAudit: a derived aggregate, not a
+    // user-authored record (the underlying mutations were already audited);
+    // orgId is still stamped by dbSet for the sameOrg() rule.
+    for(const r of report){
+      await dbSet('rollups', r.month, { ...r.newObj, lastRecomputedAt: now(), lastRecomputedBy: CP.name }, { skipAudit:true });
+    }
+  }
+  return { report, subCount: subs.length };
+}
+
+function renderRecomputeReport(report, subCount, wrote){
+  if(!report.length){
+    return `<p class="text-dim">Scanned ${subCount} submission${subCount!==1?'s':''}. No months with data — nothing to ${wrote?'write':'backfill'}.</p>`;
+  }
+  const rows = report.map(r => {
+    const head = `<div style="font-weight:700;margin-top:10px">${esc(r.month)} — ${r.existed?'existing doc':'NEW doc'}${r.drift.length?` · ${r.drift.length} bucket${r.drift.length!==1?'s':''} drift`:' · in sync'}</div>`;
+    if(!r.drift.length) return head;
+    const lines = r.drift.map(d => `<div style="font-family:monospace">${esc(d.path)}: <span style="color:var(--red)">${d.old}</span> → <span style="color:var(--green)">${d.new}</span></div>`).join('');
+    return head + lines;
+  }).join('');
+  return `<p class="text-dim mb-8">Scanned ${subCount} submission${subCount!==1?'s':''}. ${wrote?'✅ Overwrote':'Preview —'} ${report.length} month${report.length!==1?'s':''}:</p>${rows}`;
+}
+
+function showRecomputeRollupsModal(){
+  modal('Recompute Rollups', `
+    <p class="text-dim text-xs mb-8">Rebuilds the rollup counters from raw submissions (§15.4). Dry-run first — it reports per-bucket drift (stored vs recomputed) and writes nothing; then Apply overwrites the targeted month docs with the recomputed truth. Leave the month blank to backfill every month that has data.</p>
+    <div class="field"><label>Month (YYYY-MM) — blank = all months</label><input type="text" id="rr-month" placeholder="e.g. 2026-07"></div>
+    <div class="flex gap-8" style="margin:10px 0">
+      <button class="btn btn-primary btn-sm" id="rr-dry">🔍 Dry-run (preview drift)</button>
+      <button class="btn btn-ghost btn-sm" id="rr-apply" disabled>💾 Apply overwrite</button>
+    </div>
+    <div id="rr-report" class="text-xs" style="max-height:340px;overflow:auto"></div>
+  `, true);
+
+  async function run(write){
+    const monthInput = v('rr-month');
+    if(monthInput && !/^\d{4}-\d{2}$/.test(monthInput)){ toast('Month must be YYYY-MM (or blank for all).','err'); return; }
+    const monthFilter = monthInput || null;
+    const rep = document.getElementById('rr-report');
+    const dryBtn = document.getElementById('rr-dry'), applyBtn = document.getElementById('rr-apply');
+    dryBtn.disabled = true; applyBtn.disabled = true;
+    rep.innerHTML = '<div class="loading"><div class="spin"></div> Computing…</div>';
+    try {
+      const { report, subCount } = await recomputeRollups(monthFilter, { write });
+      rep.innerHTML = renderRecomputeReport(report, subCount, write);
+      if(write){ toast(`✅ Recomputed ${report.length} month${report.length!==1?'s':''}.`); applyBtn.disabled = true; }
+      else { applyBtn.disabled = report.length === 0; }
+    } catch(e){
+      const denied = e.code === 'permission-denied' || /insufficient permissions/i.test(e.message||'');
+      rep.innerHTML = `<p style="color:var(--red)">${denied ? "Can't write rollups yet — the rollups/ Firestore rules ship in Step 5 of this build. Dry-run still works." : 'Error: '+esc(e.message)}</p>`;
+    } finally {
+      dryBtn.disabled = false;
+    }
+  }
+
+  document.getElementById('rr-dry').onclick = () => run(false);
+  document.getElementById('rr-apply').onclick = () => run(true);
 }
 
 // ─── EDIT COMPANY ───
