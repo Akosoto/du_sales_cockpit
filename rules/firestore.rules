@@ -343,6 +343,33 @@ service cloud.firestore {
       allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
+    // ── ROLLUPS (Phase C, ARCHITECTURE.md §15) ──────
+    // Per-month rollup counter docs, id = 'YYYY-MM' (a FIELD-orgId collection
+    // like submissions — orgId is stamped on every write by
+    // js/rollups.js applyRollupDeltas() and the recompute tool's dbSet() — NOT
+    // a key-matched collection like orgs/, so sameOrg()/sameOrgWrite() apply
+    // exactly as they do for submissions).
+    //
+    // Write-time increments ride BOTH an agent's submission-create batch
+    // (SITE 1) AND a backend user's activation transaction (SITES 2-5), plus
+    // the manager-only recompute overwrite (SITE 6 delete rides deleteSubmission
+    // too). create/update therefore CANNOT be narrowed to a single role without
+    // breaking either the agent create path or the backend activation path — so
+    // any same-org authed user may create/update, and CLIENT-TRUST on the
+    // counter values is an explicitly documented tradeoff (§15.5) reserved for
+    // the later security overhaul (the recompute tool is the correction path if
+    // a client ever writes a bad value). Read: any same-org user
+    // (getDashboardData's preset reads + the recompute dry-run), all single-doc
+    // getDoc by key — the collection is NEVER list-queried, so no
+    // resource.data-provability concern and no composite index. Delete:
+    // manager-only, matching every other collection.
+    match /rollups/{m} {
+      allow read:   if isAuth() && sameOrg();
+      allow create: if isAuth() && sameOrgWrite();
+      allow update: if isAuth() && sameOrg();
+      allow delete: if isAuth() && role() == 'manager' && sameOrg();
+    }
+
     // ── AUDIT LOG (ARCHITECTURE.md §3) ──────────────
     // Append-only: js/db.js writes one doc per mutation, in the same batch
     // as the mutation itself. No update/delete ever — the log is only ever
