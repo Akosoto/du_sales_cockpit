@@ -6,6 +6,7 @@ import { renderPipelineTab } from './leads.js';
 import { renderScriptsSection } from './scripts.js';
 import { renderProductsSection } from './products.js';
 import { renderQueueTab } from './queue.js';
+import { renderReportsTab } from './reports.js';
 
 // isActiveBackend, client-side mirror of the rules helper of the same name —
 // department is independent of role (a backend coordinator might still be
@@ -19,7 +20,7 @@ function isBackendUser(){ return CP.department === 'backend' && CP.active !== fa
 function getTabs(){
   const r = CP.role;
   const queueTab = (r==='manager' || isBackendUser()) ? [['queue','📥 Queue']] : [];
-  if(r==='manager')   return [['org','🏢 Org & Teams'], ...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
+  if(r==='manager')   return [['org','🏢 Org & Teams'], ...queueTab, ['dashboard','📊 Dashboard'],['reports','📈 Reports'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
   if(r==='team_lead') return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
   return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 My Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
 }
@@ -38,6 +39,7 @@ export function switchTab(id){
   if(id==='org')           renderOrgTab();
   else if(id==='queue')    renderQueueTab();
   else if(id==='dashboard')renderDashboardTab();
+  else if(id==='reports')  renderReportsTab();
   else if(id==='pipeline') renderPipelineTab();
   else if(id==='scripts')  renderScriptsSection();
   else if(id==='products') renderProductsSection();

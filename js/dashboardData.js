@@ -176,9 +176,15 @@ export async function getDashboardData(period, { teams = [], users = [] } = {}){
   });
 
   // ── Sales agent role metrics: AED closed (activated) + lines submitted (created) ──
+  // activatedCount (Session C2, Report 1): additive field on an EXISTING
+  // per-submission loop below — Report 1's "activated lines per agent"
+  // column needs an agentId-keyed count that byContributor can't give
+  // correctly (attribution-based, §15.3) and roleMetrics didn't track before
+  // this. Purely additive — existing consumers (dashboardCards.js) read only
+  // aedClosed/linesSubmitted and ignore the new field.
   const agentMetrics = {};
-  function am(id,name){ return agentMetrics[id] || (agentMetrics[id] = { userId:id, name, aedClosed:0, linesSubmitted:0 }); }
-  activated.forEach(s => { if(userById[s.agentId]?.role==='agent') am(s.agentId, s.agentName).aedClosed += Number(s.mrc)||0; });
+  function am(id,name){ return agentMetrics[id] || (agentMetrics[id] = { userId:id, name, aedClosed:0, activatedCount:0, linesSubmitted:0 }); }
+  activated.forEach(s => { if(userById[s.agentId]?.role==='agent'){ const m = am(s.agentId, s.agentName); m.aedClosed += Number(s.mrc)||0; m.activatedCount++; } });
   created.forEach(s   => { if(userById[s.agentId]?.role==='agent') am(s.agentId, s.agentName).linesSubmitted++; });
 
   // ── Backend role metrics: queue wait (created->claimed), handling time
