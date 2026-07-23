@@ -2,10 +2,14 @@ import {
   db, CU, CP, MANDATORY_DOC_TYPES, ORG_DEFAULTS,
   doc, collection, runTransaction, getDoc, getDocs, query, where
 } from './state.js';
-import { newBatch, batchAdd, batchUpdate } from './db.js';
+import { newBatch, batchAdd, batchUpdate, batchDelete } from './db.js';
 import { now } from './helpers.js';
 import { orgId } from '../config.js';
 import * as storage from './storage/index.js';
+import {
+  createDeltas, transitionDeltas, submissionContribution, negate,
+  applyRollupDeltas, currentFamilyResolver
+} from './rollups.js';
 
 // Backend-attachable doc types (step 5b) — distinct from the
 // agent-required checklist (MANDATORY_DOC_TYPES + product-specific), these
@@ -210,7 +214,15 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
   }
 
   const bat = externalBat || newBatch();
+  // One timestamp for the whole bundle — siblings are created together. Also
+  // the rollup create-month source, kept IDENTICAL to the doc's stored
+  // createdAt (passed into batchAdd below, overriding db.js auditCreate()'s
+  // own now() — a sanctioned override per db.js's comment) and to the 'created'
+  // event ts, so the live SITE-1 increment and any later recompute bucket the
+  // line in the exact same month with zero midnight-boundary drift (§15.3).
+  const createdAt = now();
   const subIds = [];
+  const createRollupDeltas = [];
   items.forEach(it => {
     let assignedBackendAgent = null;
     if(autoMode){
@@ -236,13 +248,23 @@ export async function createSubmissions({ lead, company, items, requiredDocs, ac
       ...(accTransferPayload.flag ? { transferStatus: 'pending' } : {}),
       sourcedBy: sourcedByPayload,
       status: 'pendingVerification',
-      events: [{ type:'created', actorId:CU.uid, actorName:CP.name, ts:now(), payload:{} }],
+      createdAt,
+      events: [{ type:'created', actorId:CU.uid, actorName:CP.name, ts:createdAt, payload:{} }],
       verification: null,
       requiredDocs: requiredDocsPayload,
       assignedBackendAgent
     });
     subIds.push(subRef.id);
+    // SITE 1 (§15.3, rollups.js) — every created line is +1 linesSubmitted in
+    // its createdAt month. No inline increment logic here; the delta shape is
+    // owned by createDeltas().
+    createRollupDeltas.push(...createDeltas({ createdAt }));
   });
+  // One rollup write for the whole bundle (applyRollupDeltas sums the N
+  // same-month +1s into a single increment(N), one .set() on the month doc —
+  // Firestore forbids writing the same doc twice per batch), atomic with the
+  // submission creates in this same batch.
+  applyRollupDeltas(bat, createRollupDeltas);
 
   // Pipeline submission-status badge (step 0d) — denormalized onto the LEAD
   // so the pipeline list never needs a per-lead submissions query just to
@@ -321,6 +343,9 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
 
   const subRef = doc(db,'submissions',submissionId);
   let finalStatus;
+  // Resolved once, outside the transaction, so retries reuse the same mapping
+  // (OC doesn't change mid-call). Feeds the rollup delta below (§15.3).
+  const familyOf = currentFamilyResolver();
 
   // Sibling bundle enumeration — a plain query BEFORE the transaction, since
   // Firestore transactions can only re-read specific document refs
@@ -354,7 +379,14 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
     // happen before any transaction.set()/update() call below.
     const otherSiblingSnaps = await Promise.all(otherSiblingRefs.map(r => transaction.get(r)));
 
-    const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: now(), payload }];
+    // One timestamp for THIS event, shared by the appended events[] entry and
+    // the rollup delta below, so a later recompute (which buckets SITE-4/5
+    // historical counts by events[].ts) lands in the exact same month as the
+    // live increment — captured inside the callback so each retry gets its own
+    // consistent value.
+    const evTs = now();
+    const prevStatus = sub.status;
+    const events = [...(sub.events||[]), { type, actorId: CU.uid, actorName: CP.name, ts: evTs, payload }];
     const update = { events, lastEditedBy: CP.name, lastEditedAt: now(), ...extraFields };
 
     if(['docsVerified','verificationCall','verificationEmail'].includes(type)){
@@ -398,6 +430,17 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
       who: CU.uid, what: 'submissions', action: 'update', docRef: submissionId, ts: now(), orgId
     });
 
+    // SITES 2-5 (§15.3) — the rollup delta for THIS event, in the SAME
+    // transaction. transitionDeltas() owns every guard (into/out of activated,
+    // into rejected, resubmit-from-rejected) from the pre-transaction status;
+    // no inline increment logic here. subForDelta carries the activatedAt
+    // being written this txn (a fresh activation) so the activation bucket
+    // matches the stored top-level activatedAt a recompute would read. Empty
+    // for note/claim/reassign/transfer* events → applyRollupDeltas no-ops.
+    const subForDelta = { ...sub, activatedAt: update.activatedAt || sub.activatedAt };
+    const { deltas: rollupDeltas } = transitionDeltas(prevStatus, { type, ts: evTs }, subForDelta, familyOf);
+    applyRollupDeltas(transaction, rollupDeltas);
+
     finalStatus = update.status || sub.status;
 
     // Pipeline submission-status badge (step 0d) — recomputed across every
@@ -414,6 +457,43 @@ export async function appendEvent(submissionId, { type, payload = {}, extraField
   });
 
   return finalStatus;
+}
+
+// SITE 6 (§15.3) — manager submission-delete gateway. No submission-delete UI
+// exists in the app today (the submissions rule permits manager delete, but
+// nothing calls dbDelete('submissions')); this is the ONLY sanctioned delete
+// path, so a future delete UI — or a manager deleting a suspected-fake order
+// out-of-band via this function — can never bypass the counter reversal.
+// Reverses the submission's ENTIRE net rollup contribution (replay events[] →
+// negate) in the SAME batch as the doc delete, so afterwards the rollups equal
+// a fresh recompute over the surviving docs. Also recomputes the lead's
+// denormalized submissionSummary badge from the surviving siblings (the
+// deleted line may have been the bundle's only activated/rejected one).
+// Manager-only is enforced at the Firestore rule level, not here.
+export async function deleteSubmission(submissionId){
+  const snap = await getDoc(doc(db,'submissions',submissionId));
+  if(!snap.exists()) throw new Error('Submission not found.');
+  const sub = { id: submissionId, ...snap.data() };
+  const familyOf = currentFamilyResolver();
+
+  // Surviving siblings for the badge — same LIST-query-provable shape
+  // appendEvent uses (bundleId + agentId, both from the doc just read; every
+  // sibling shares the bundle's agentId). One lead == one bundle under the
+  // current Submit-to-Backend v1 constraint, so these are all the lead's
+  // remaining lines.
+  let remaining = [];
+  if(sub.leadId && sub.bundleId){
+    const sibSnap = await getDocs(query(collection(db,'submissions'),
+      where('bundleId','==',sub.bundleId), where('agentId','==',sub.agentId)));
+    remaining = sibSnap.docs.filter(d => d.id !== submissionId).map(d => ({ status: d.data().status }));
+  }
+
+  const bat = newBatch();
+  batchDelete(bat, 'submissions', submissionId);                          // + auditLog delete entry (db.js)
+  applyRollupDeltas(bat, negate(submissionContribution(sub, familyOf)));  // reverse every occupied bucket
+  if(sub.leadId) batchUpdate(bat, 'leads', sub.leadId, { submissionSummary: collapseSubmissionSummary(remaining) });
+  await bat.commit();
+  return { deleted: submissionId };
 }
 
 // Claim/reassignment (ARCHITECTURE.md §4, step 2) — both just an
