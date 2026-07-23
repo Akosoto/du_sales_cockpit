@@ -1,5 +1,5 @@
-import { db, CP, collection, getDocs } from './state.js';
-import { esc } from './helpers.js';
+import { db, CP, OC, collection, getDocs } from './state.js';
+import { esc, toast } from './helpers.js';
 import { getDashboardData } from './dashboardData.js';
 
 // ════════════════════════════════════════════════════
@@ -152,6 +152,91 @@ async function renderDailyTeamReport(body){
 }
 
 // ════════════════════════════════════════════════════
+// REPORT 2 — Daily Summary (ARCHITECTURE.md §16.2)
+// Today's numbers (its own today-custom getDashboardData call) + MTD vs org
+// target, reusing js/dashboard.js's target/run-rate resolution logic
+// VERBATIM (not re-derived): target = Σ active agents' monthlyTarget;
+// run-rate visibility = CP.runRateVisible ?? OC.runRateDefaultVisible
+// (per-user override always wins, §12) — the run-rate line renders ONLY
+// when that resolves visible, never forced on.
+// ════════════════════════════════════════════════════
+function buildSummaryText({ periodLabel, today, mtd, target, achieved, exceeded, remaining, showRunRate, daysLeft, runRate }){
+  const lines = [
+    `📊 Daily Summary — ${periodLabel}`,
+    `Today: ${today.submitted} submitted · ${today.count} activated (AED ${Number(today.aed).toLocaleString()})`,
+    `MTD: ${mtd.count} activated (AED ${Number(mtd.aed).toLocaleString()})` +
+      (target ? ` — Target AED ${Number(target).toLocaleString()} (AED ${Number(remaining).toLocaleString()} ${exceeded?'exceeded by':'remaining'})` : ' — no target set')
+  ];
+  if(target && showRunRate) lines.push(`Required daily run-rate: AED ${Number(Math.round(runRate)).toLocaleString()}/day (${daysLeft} day${daysLeft!==1?'s':''} left)`);
+  return lines.join('\n');
+}
+
+async function renderDailySummaryReport(body){
+  const { teams, users } = await fetchTeamsAndUsers();
+  const todayStr = todayDateStr();
+
+  const [todayData, mtdData] = await Promise.all([
+    getDashboardData({ preset:'custom', from: todayStr, to: todayStr }, { teams, users }),
+    getDashboardData('thisMonth', { teams, users })
+  ]);
+
+  const todaySubmitted = todayData.roleMetrics.agents.reduce((s,a)=>s+(a.linesSubmitted||0),0);
+  const today = { submitted: todaySubmitted, count: todayData.totals.activatedCount, aed: todayData.totals.activatedAed };
+  const mtd   = { count: mtdData.totals.activatedCount, aed: mtdData.totals.activatedAed };
+
+  // Target/run-rate — verbatim js/dashboard.js resolution (Session B4 Step 7).
+  const target = users.filter(u=>u.role==='agent').reduce((s,u)=>s+(Number(u.monthlyTarget)||0),0);
+  const achieved = mtd.aed;
+  const exceeded = achieved > target;
+  const remaining = Math.abs(target - achieved);
+  const showRunRate = CP.runRateVisible != null ? CP.runRateVisible : !!(OC?.runRateDefaultVisible);
+  const t = new Date();
+  const daysLeft = new Date(t.getFullYear(), t.getMonth()+1, 0).getDate() - t.getDate() + 1; // today inclusive
+  const runRate = daysLeft > 0 ? remaining / daysLeft : remaining;
+
+  const periodLabel = t.toLocaleDateString('en-AE', { weekday:'short', day:'2-digit', month:'short', year:'numeric' });
+  const summaryText = buildSummaryText({ periodLabel, today, mtd, target, achieved, exceeded, remaining, showRunRate, daysLeft, runRate });
+
+  const aed = n => `AED ${Number(n||0).toLocaleString()}`;
+
+  body.innerHTML = `
+    <div class="flex gap-8" style="justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <p class="text-dim text-xs">Last fetched: ${fmtTime(new Date())}</p>
+      <div class="flex gap-8">
+        <button class="btn btn-ghost btn-sm" id="rp2-copy">📋 Copy Summary</button>
+        <button class="btn btn-ghost btn-sm" id="rp2-refresh">🔄 Refresh</button>
+      </div>
+    </div>
+    <div class="section-card" style="margin-bottom:14px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:10px">📅 Today — ${esc(periodLabel)}</div>
+      <div class="kpi-grid">
+        <div class="kpi-card"><div class="kpi-val">${today.submitted}</div><div class="kpi-lbl">Lines Submitted</div></div>
+        <div class="kpi-card"><div class="kpi-val" style="color:var(--green)">${aed(today.aed)}</div><div class="kpi-lbl">Activated AED</div></div>
+        <div class="kpi-card"><div class="kpi-val">${today.count}</div><div class="kpi-lbl">Activated Lines</div></div>
+      </div>
+    </div>
+    <div class="section-card" style="margin-bottom:14px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:10px">📆 Month to Date</div>
+      <div class="kpi-grid">
+        <div class="kpi-card"><div class="kpi-val" style="color:var(--green)">${aed(mtd.aed)}</div><div class="kpi-lbl">Activated AED</div></div>
+        <div class="kpi-card"><div class="kpi-val">${mtd.count}</div><div class="kpi-lbl">Activated Lines</div></div>
+        ${target ? `
+        <div class="kpi-card"><div class="kpi-val">${aed(target)}</div><div class="kpi-lbl">Target</div></div>
+        <div class="kpi-card"><div class="kpi-val" style="color:${exceeded?'var(--green)':'var(--t1)'}">${aed(remaining)}</div><div class="kpi-lbl">${exceeded?'Exceeded By':'Remaining'}</div></div>
+        ${showRunRate ? `<div class="kpi-card"><div class="kpi-val" style="color:var(--amber)">${aed(Math.round(runRate))}</div><div class="kpi-lbl">Required Daily Run-Rate</div></div>` : ''}
+        ` : `<div class="kpi-card"><div class="kpi-val text-dim">—</div><div class="kpi-lbl">No target set</div></div>`}
+      </div>
+    </div>
+  `;
+
+  document.getElementById('rp2-refresh')?.addEventListener('click', () => renderDailySummaryReport(body));
+  document.getElementById('rp2-copy')?.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(summaryText); toast('Copied.'); }
+    catch(e){ toast('Could not copy — copy it manually.', 'err'); }
+  });
+}
+
+// ════════════════════════════════════════════════════
 // TAB SCAFFOLD
 // ════════════════════════════════════════════════════
 export async function renderReportsTab(){
@@ -181,7 +266,7 @@ export async function renderReportsTab(){
     body.innerHTML = '<div class="loading"><div class="spin"></div> Loading…</div>';
     try {
       if(active === 'daily-team')         await renderDailyTeamReport(body);
-      else if(active === 'daily-summary') body.innerHTML = placeholderHtml('Daily Summary');
+      else if(active === 'daily-summary') await renderDailySummaryReport(body);
       else if(active === 'tracker')       body.innerHTML = placeholderHtml('Master Tracker');
       else if(active === 'rejections')    body.innerHTML = placeholderHtml('Rejection Analytics');
     } catch(e){
