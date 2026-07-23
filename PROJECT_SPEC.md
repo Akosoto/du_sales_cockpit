@@ -1,14 +1,14 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Session B5 (Sourcing & Transfer Tracking) shipped** — corrects a
-B4 design mistake: donut/contributor attribution now reads a new `sourcedBy` field instead of
-`accTransfer` (which is an operational account-takeover marker, not a sourcing signal — crediting
-revenue to it was wrong by design), plus a new `transferStatus` tracker
-(`pending`/`completed`/`rejected`+reason) for `accTransfer`-flagged lines, structurally isolated
-from the submission's own document-review lifecycle. No rules or index changes needed. See the
-Session B5 history entry below and `ARCHITECTURE.md` §13. Session B4 (Manager's Cockpit — category
-identity refactor, Products config panel, the dashboard itself, a real users-collection
-privilege-escalation fix found during its rules review) shipped in the prior session, unchanged
-since except for the attribution repoint above — see `ARCHITECTURE.md` §12.
+**Last updated:** July 2026 | **Session C0 (Product Family Layer) shipped** — builds a product
+FAMILY layer (`orgs/{orgId}.families`, every category gets a permanent `familyId`) ahead of Phase
+C's rollup counters, so those counters are born keyed by family and never need re-bucketing.
+Manager UI extends the existing Categories & Contract Terms panel (families CRUD, a live-reparenting
+family dropdown per category). No rules, index, or query changes. See the Session C0 history entry
+below and `ARCHITECTURE.md` §14. Session B5 (Sourcing & Transfer Tracking — corrected B4's donut
+attribution to read a new `sourcedBy` field instead of the misused `accTransfer`, added
+`transferStatus` outcome tracking) and Session B4 (Manager's Cockpit — category identity refactor,
+Products config panel, the dashboard itself, a real users-collection privilege-escalation fix)
+shipped in prior sessions, unchanged since — see `ARCHITECTURE.md` §§12-13.
 **`ARCHITECTURE.md` is the authoritative spec for all future work** — this file stays as
 historical/reference documentation for what's already shipped.
 
@@ -148,7 +148,12 @@ js/products.js        — Products tab, seed catalog, discounts, waivers, Catego
                         delete-if-unreferenced, contract-term label rename). Categories now resolved
                         via js/orgConfig.js (currentCategories/categoryLabel), not a local constant —
                         the old PRODUCT_CATEGORIES export was removed in Session B4's category
-                        identity refactor.
+                        identity refactor. Session C0 added: Product Families CRUD (same modal,
+                        rename/add/delete-if-unreferenced-by-a-category) + a per-category family
+                        <select> that re-parents live on change; the one-time family migration
+                        (computeFamilyMigrationPlan/showFamilyMigrationPreview/runFamilyMigration —
+                        seeds orgs/{orgId}.families + stamps familyId on every category, dry-run
+                        preview, idempotent).
 js/main.js            — getTabs/renderNav/switchTab — the only place that imports every
                         render*Tab function and routes between them. Queue tab is gated to
                         manager or isBackendUser() (department:'backend' && active!==false,
@@ -325,9 +330,20 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
 // a redundant `orgId` field on every write as a side effect of the shared
 // write path; the doc ID is what the Firestore rule actually keys off.
 {
-  categories: [ { id, label } ],   // permanent IDs, editable label — see js/orgConfig.js. Seeded
-                                    // with DEFAULT_CATEGORIES (starter/essential/ultimate/mobile)
-                                    // by the one-time category migration (js/org.js).
+  categories: [ { id, label, familyId } ],   // permanent IDs, editable label — see js/orgConfig.js.
+                                    // Seeded with DEFAULT_CATEGORIES (starter/essential/ultimate/
+                                    // mobile) by the one-time category migration (js/org.js).
+                                    // familyId (NEW, Session C0) — every category belongs to
+                                    // exactly one family, stamped by the one-time family migration
+                                    // (js/products.js runFamilyMigration) per DEFAULT_FAMILY_MAPPING,
+                                    // editable via the category row's family <select> (Products
+                                    // config panel) which re-parents live on change.
+  families: [ { id, label } ],     // NEW (Session C0) — a coarser grouping ABOVE categories, for
+                                    // Phase C's rollup counters (keyed by family, not category).
+                                    // Same permanent-id/editable-label pattern as categories. Seeded
+                                    // with DEFAULT_FAMILIES: fixed->"Fixed", sim->"SIM Cards",
+                                    // others->"Others". Delete blocked while any category
+                                    // references the id (js/products.js showCategoryConfigModal).
   contractTermLabels: { [term]: label },  // OPTIONAL override on top of each product's own
                                     // pricingOption.label — absent/partial is fine, never migrated.
   runRateDefaultVisible: true | false     // org-wide default for the Manager's Cockpit's run-rate
@@ -338,6 +354,8 @@ below to avoid drift; assume `orgId: string` is present on every document in eve
 Read: any same-org authenticated user (every role's `loadOrgConfig()` runs at login). Write:
 manager unrestricted; team_lead narrowed to `runRateDefaultVisible` only. See Firestore Security
 Rules below for the exact rule (key-matched, not `sameOrg()`-gated like every other collection).
+**No rule change was needed for `families`/`familyId` (Session C0)** — both ride the SAME
+manager-unrestricted write path `categories`/`contractTermLabels` already used.
 
 **Seed data (19 products, auto-seeded by manager on first Products tab open):**
 
@@ -1313,6 +1331,39 @@ discovered during cleanup verification (a real lead's `submissionSummary` badge 
 with zero backing submissions) and deliberately left untouched, since B5 never wrote to that lead
 and reverting data this session didn't touch, based on an uncertain history, was judged riskier
 than leaving a stale badge — flagged for Ashok to investigate separately.
+
+### Session C0 (shipped) — Product Family Layer
+Per `ARCHITECTURE.md` §14. Builds the family layer BEFORE Phase C's rollup counters exist, so
+those counters are born keyed by their final `familyId` and never need a re-bucketing migration
+later. No rules, index, or query changes — everything rides paths B4 already made
+manager-unrestricted.
+
+**Schema + migration:** `orgs/{orgId}` gained `families: [{id,label}]` (seeded `fixed`->"Fixed",
+`sim`->"SIM Cards", `others`->"Others") and every category gained a `familyId`
+(`starter`/`essential`/`ultimate`->`fixed`, `mobile`->`sim`, default mapping in
+`js/orgConfig.js DEFAULT_FAMILY_MAPPING`). Unlike B4's category migration (many product/user
+documents), this is a single-document migration (`js/products.js`) — both parts (seed families,
+stamp familyId) independently idempotent, dry-run preview before writing. Verified live: dry-run
+matched the expected mapping exactly, post-write `getDoc` confirmed correct data with unrelated
+org-config fields untouched, re-run correctly detected as already-migrated.
+
+**Manager UI:** extends the existing Categories & Contract Terms modal with a "Product Families"
+section (same CRUD pattern as categories — rename, add, delete-blocked-while-referenced with
+blockers listed) and a per-category family `<select>` that re-parents LIVE on change (no separate
+Save click, unlike the free-text label input). New categories default to `familyId:'others'`
+rather than landing unmapped. Verified live: full family add/rename/delete round-trip, and moving
+a category between families and back, both confirmed via `getDoc` not just optimistic UI state.
+Also verified (no code change needed): the existing Edit Product modal's category `<select>`
+already persists a category move correctly — closes out "move products between categories."
+
+**Scope discipline:** grepped for hardcoded family name-strings and for
+familyId/familyLabel/currentFamilies/findFamilyIdByLabel usage outside
+`js/orgConfig.js`/`js/products.js` — zero hits on both, confirming this session touched no
+dashboard or other file (families surface in Phase C's reports, not this session's UI) and every
+label resolves by id. B5 smoke (Submit-to-Backend's accTransfer/sourcedBy checkboxes, Queue tab,
+Dashboard) re-verified with zero regressions. Full test-data cleanup to baseline verified via
+`getDoc` (leads/companies/users/products/submissions counts all unchanged, product category and
+org-config state restored).
 
 ---
 

@@ -662,7 +662,7 @@ manager (`transferRejected` with a reason, badge visible in the Queue
 list and action panel, submission `status` and Quick Actions
 confirmed completely unaffected — the lifecycle guarantee holds).
 
-## 14. Session C0 — Product Family Layer (STUB — finalized in Step 4)
+## 14. Session C0 — Product Family Layer (shipped)
 
 **Purpose:** Phase C's rollup counters (§10) will be keyed by product
 FAMILY, not category — a coarser grouping for reporting (e.g. every
@@ -676,15 +676,66 @@ gets a permanent `familyId`, resolved to a label at render time, never
 stored as a name string anywhere.
 
 **Seeded families:** `fixed` → "Fixed", `sim` → "SIM Cards", `others`
-→ "Others".
+→ "Others" (`orgs/{orgId}.families: [{id,label}]`, `js/orgConfig.js
+DEFAULT_FAMILIES`).
 
 **Default category→family mapping (existing four categories):**
 `starter`, `essential`, `ultimate` → `fixed`; `mobile` → `sim`. No
 existing category defaults to `others` — that bucket exists for
 future categories a manager creates without picking a family, or an
-explicit reassignment.
+explicit reassignment (`js/orgConfig.js DEFAULT_FAMILY_MAPPING`).
 
-No rules or index changes are expected — the `orgs` update path is
+**Migration (`js/products.js`):** unlike B4's category migration
+(many product/user documents), this touches ONE document
+(`orgs/{orgId}`) — seeds `families` if missing, stamps `familyId` on
+any category that doesn't have one yet. Both parts independently
+idempotent. Dry-run preview shows the exact mapping before writing,
+triggered by a banner in the existing Categories & Contract Terms
+modal that disappears once nothing is left to migrate. Verified live:
+dry-run matched the mapping above exactly; post-write `getDoc`
+confirmed the correct `families` array and every category's
+`familyId`, with unrelated org-config fields (`runRateDefaultVisible`,
+`orgId`) untouched by the merge-then-set write; re-checking afterward
+correctly reports already-migrated and the banner disappears.
+
+**Manager UI (extends the Categories & Contract Terms modal):** a
+"Product Families" section — mirrors the existing category CRUD
+exactly (rename via label + Save, add via a new-label input,
+id-slugified from the label). Delete is blocked while any category
+still references the family id, with the blocking category names
+listed — same "list the blockers, never a silent cascade" pattern
+category delete already uses against products. Each category row
+gained a family `<select>` that re-parents LIVE (saves on `change`,
+no separate Save click needed — a dropdown choice is already a
+discrete, complete action, unlike the label input's free text which
+must not autosave per keystroke). New categories default to
+`familyId:'others'` rather than landing unmapped. Verified live: full
+add/rename/delete round-trip on a throwaway family, and moving a
+category between families and back, both confirmed via `getDoc` (not
+just optimistic UI state) — the blocking-reference list and the
+delete-button's enabled/disabled state both updated correctly and
+instantly in both directions.
+
+**Product category move:** the existing Edit Product modal's category
+`<select>` (built in B4, unchanged) already persists a category
+change — verified live rather than assumed, moving a real product
+between categories and back with a `getDoc` check after each
+direction. No code change was needed here; this closes out the "move
+products between categories" part of the manager requirement.
+
+**Scope discipline:** grepped the whole codebase for hardcoded family
+name-strings ("Fixed"/"SIM Cards"/"Others") outside `DEFAULT_FAMILIES`
+itself, and for any `familyId`/`familyLabel`/`currentFamilies`/
+`findFamilyIdByLabel` reference outside `js/orgConfig.js`/
+`js/products.js` — zero hits on both, confirming labels resolve by id
+everywhere and this session touched no dashboard or other file, per
+the fixed decision that families surface in Phase C's reports, not
+this session's UI.
+
+No rules or index changes were needed — the `orgs` update path was
 already manager-unrestricted for the sections this session touches,
-and `products.category` is already manager-editable. No new queries
-are expected either.
+and `products.category` was already manager-editable. No new queries
+were added. B5 smoke (Submit-to-Backend's `accTransfer`/`sourcedBy`
+checkboxes, Queue tab, Dashboard) re-verified with zero regressions —
+this session's only shared surface, `js/orgConfig.js`, is not imported
+by `js/queue.js` or `js/dashboard*.js` at all.
