@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rollups Delta-Engine Assertion Suite</title>
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#eee;padding:24px;max-width:900px;margin:0 auto}
+  h2{color:#a78bfa}
+  button{padding:8px 16px;margin:4px 4px 4px 0;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer}
+  button:disabled{opacity:.4;cursor:default}
+  .ok{color:#4ade80}
+  .err{color:#f87171}
+  .dim{color:#888}
+  .summary{font-size:1.1rem;font-weight:700;margin:12px 0}
+  pre{background:#1a1a1a;padding:14px;border-radius:6px;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+</style>
+</head>
+<body>
+<!--
+  Rollup delta-engine assertion suite — Session C2 Step 2, debt clearance.
+
+  Origin: Session C1 (Opus, ARCHITECTURE.md §15) verified js/rollups.js with
+  62 isolated unit assertions run as a throwaway Node scratch script (stdout
+  only, never committed) — a real gap, since the pure engine backing a
+  prime-directive-critical counter system had no assertion suite living in
+  the repo. This page closes that gap: it imports the REAL js/rollups.js
+  directly (no stubbed copy, no re-implementation of its logic here), so
+  these tests can never silently drift from the actual module. Runnable in
+  any browser with zero setup (no login, no Firestore read/write — every
+  function under test is pure).
+
+  Re-run this page after ANY change to js/rollups.js before trusting the
+  live rollup counters again.
+-->
+<h2>Rollup Delta-Engine Assertion Suite</h2>
+<p class="dim">Standalone page — imports <code>../js/rollups.js</code> directly and exercises its pure functions with no Firestore reads/writes. Auto-runs on load; re-run anytime with the button below.</p>
+<!-- js/rollups.js → js/orgConfig.js → js/db.js → js/helpers.js, and helpers.js
+     wires #m-close/#modal click handlers at MODULE TOP LEVEL (an index.html
+     DOM assumption, not a Firestore one) — these inert, hidden stand-ins let
+     that import chain succeed unmodified so this page can import the REAL
+     js/rollups.js rather than a stub or a re-implementation. -->
+<div id="modal" style="display:none"></div>
+<button id="m-close" style="display:none"></button>
+<button id="run">Run Tests</button>
+<div id="summary" class="summary"></div>
+<pre id="out"></pre>
+
+<script type="module">
+import * as R from '../js/rollups.js';
+
+const out = document.getElementById('out');
+const summaryEl = document.getElementById('summary');
+let pass = 0, fail = 0;
+const failures = [];
+
+function eq(actual, expected, msg){
+  const a = JSON.stringify(actual), e = JSON.stringify(expected);
+  if(a === e){ pass++; }
+  else { fail++; failures.push(`FAIL: ${msg}\n  expected ${e}\n  got      ${a}`); }
+}
+function ok(cond, msg){
+  if(cond){ pass++; } else { fail++; failures.push(`FAIL: ${msg}`); }
+}
+
+function run(){
+  pass = 0; fail = 0; failures.length = 0;
+
+  const famOf = R.familyResolverFrom([{id:'starter',familyId:'fixed'},{id:'mobile',familyId:'sim'}]);
+
+  // ── monthKey ──
+  eq(R.monthKey('2026-07-15T12:00:00.000Z'), '2026-07', 'monthKey Jul');
+  eq(R.monthKey('2026-02-10T00:00:00.000Z'), '2026-02', 'monthKey Feb');
+  ok((()=>{ try{ R.monthKey('nonsense'); return false; }catch(e){ return true; } })(), 'monthKey throws on bad iso');
+
+  // ── slug ──
+  eq(R.slug('Acme Corp.'), 'acme-corp', 'slug punctuation');
+  eq(R.slug('A/B*C'), 'a-b-c', 'slug field-path chars');
+  eq(R.slug('   '), 'outsourced', 'slug empty → outsourced');
+
+  // ── contributorOf ──
+  eq(R.contributorOf({agentId:'u1',agentName:'Ann'}), {key:'u1',label:'Ann',type:'agent'}, 'contrib normal');
+  eq(R.contributorOf({sourcedBy:{flag:true,partnerName:'Beta LLC'}}), {key:'beta-llc',label:'Beta LLC',type:'partner'}, 'contrib sourced+name');
+  eq(R.contributorOf({sourcedBy:{flag:true,partnerName:''}}), {key:'outsourced',label:'Outsourced Revenue',type:'partner'}, 'contrib sourced no name');
+  eq(R.contributorOf({}), {key:'unknown',label:'Unknown',type:'agent'}, 'contrib missing agent');
+
+  // ── createDeltas ──
+  eq(R.createDeltas({createdAt:'2026-07-15T12:00:00Z'}),
+     [{month:'2026-07',path:['totals','linesSubmitted'],inc:1}], 'createDeltas');
+
+  // ── activationDeltas add / reverse ──
+  const actSub = {mrc:100,category:'starter',teamId:'t1',agentId:'u1',agentName:'Ann',activatedAt:'2026-07-15T12:00:00Z'};
+  const addD = R.activationDeltas(actSub, +1, famOf);
+  eq(addD.length, 12, 'activation add = 10 inc + 2 set');
+  eq(addD.find(d=>JSON.stringify(d.path)===JSON.stringify(['byFamily','fixed','aed'])).inc, 100, 'fixed.aed +100');
+  eq(addD.find(d=>JSON.stringify(d.path)===JSON.stringify(['byContributor','u1','label'])).set, 'Ann', 'contrib label set');
+  const revD = R.activationDeltas(actSub, -1, famOf);
+  eq(revD.length, 10, 'activation reverse = 10 inc, no sets');
+  ok(revD.every(d=>'inc' in d), 'reverse has no set deltas');
+  eq(revD.find(d=>JSON.stringify(d.path)===JSON.stringify(['totals','aedActivated'])).inc, -100, 'reverse aed -100');
+
+  // ── transitionDeltas guards ──
+  // created → pendingVerification, emits createDeltas
+  {
+    const { deltas, nextStatus } = R.transitionDeltas(null, {type:'created', ts:'2026-07-01T00:00:00Z'}, {createdAt:'2026-07-01T00:00:00Z'}, famOf);
+    eq(nextStatus, 'pendingVerification', 'transition created → nextStatus');
+    eq(deltas, R.createDeltas({createdAt:'2026-07-01T00:00:00Z'}), 'transition created → deltas match createDeltas');
+  }
+  // activated guarded: prevStatus already activated → no-op
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('activated', {type:'activated', ts:'x'}, actSub, famOf);
+    eq(deltas, [], 'transition activated-from-activated → no deltas (guard)');
+    eq(nextStatus, 'activated', 'transition activated-from-activated → stays activated');
+  }
+  // activated from pendingVerification → full add
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('pendingVerification', {type:'activated', ts:'x'}, actSub, famOf);
+    eq(deltas, R.activationDeltas(actSub, +1, famOf), 'transition activated-from-pending → matches activationDeltas(+1)');
+    eq(nextStatus, 'activated', 'transition activated → nextStatus activated');
+  }
+  // rejected from activated → reverses + linesRejected
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('activated', {type:'rejected', ts:'2026-08-01T00:00:00Z'}, actSub, famOf);
+    const expectRev = R.activationDeltas(actSub, -1, famOf);
+    eq(deltas.slice(0, expectRev.length), expectRev, 'transition rejected-from-activated → reversal first');
+    ok(deltas.some(d=>d.path.join('.')==='totals.linesRejected' && d.inc===1 && d.month==='2026-08'), 'transition rejected-from-activated → +1 linesRejected in event month');
+    eq(nextStatus, 'rejected', 'transition rejected → nextStatus rejected');
+  }
+  // rejected from pendingVerification (never activated) → just linesRejected, no reversal
+  {
+    const { deltas } = R.transitionDeltas('pendingVerification', {type:'rejected', ts:'2026-08-01T00:00:00Z'}, actSub, famOf);
+    eq(deltas, [{month:'2026-08',path:['totals','linesRejected'],inc:1}], 'transition rejected-from-pending → only linesRejected, no reversal');
+  }
+  // rejected guarded: prevStatus already rejected → no duplicate linesRejected
+  {
+    const { deltas } = R.transitionDeltas('rejected', {type:'rejected', ts:'2026-08-01T00:00:00Z'}, actSub, famOf);
+    eq(deltas, [], 'transition rejected-from-rejected → no deltas (guard, no double-count)');
+  }
+  // resubmit from rejected → linesResubmitted
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('rejected', {type:'resubmit', ts:'2026-08-05T00:00:00Z'}, actSub, famOf);
+    eq(deltas, [{month:'2026-08',path:['totals','linesResubmitted'],inc:1}], 'transition resubmit-from-rejected → linesResubmitted');
+    eq(nextStatus, 'pendingVerification', 'transition resubmit → nextStatus pendingVerification');
+  }
+  // resubmit from activated (unusual but symmetric) → reverses, no linesResubmitted
+  {
+    const { deltas } = R.transitionDeltas('activated', {type:'resubmit', ts:'2026-08-05T00:00:00Z'}, actSub, famOf);
+    eq(deltas, R.activationDeltas(actSub, -1, famOf), 'transition resubmit-from-activated → pure reversal, no linesResubmitted');
+  }
+  // submittedToDu from activated → reverses (correction back past submit)
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('activated', {type:'submittedToDu', ts:'x'}, actSub, famOf);
+    eq(deltas, R.activationDeltas(actSub, -1, famOf), 'transition submittedToDu-from-activated → reversal');
+    eq(nextStatus, 'submittedToDu', 'transition submittedToDu → nextStatus');
+  }
+  // neutral event: submittedToDu status bumps to inProgress, no deltas
+  {
+    const { deltas, nextStatus } = R.transitionDeltas('submittedToDu', {type:'note', ts:'x'}, actSub, famOf);
+    eq(deltas, [], 'transition note (neutral) → no deltas');
+    eq(nextStatus, 'inProgress', 'transition note from submittedToDu → bumps to inProgress');
+  }
+  // transferCompleted/transferRejected never bump status even from submittedToDu
+  {
+    const { nextStatus: n1 } = R.transitionDeltas('submittedToDu', {type:'transferCompleted', ts:'x'}, actSub, famOf);
+    eq(n1, 'submittedToDu', 'transferCompleted does not bump submittedToDu → inProgress');
+    const { nextStatus: n2 } = R.transitionDeltas('submittedToDu', {type:'transferRejected', ts:'x'}, actSub, famOf);
+    eq(n2, 'submittedToDu', 'transferRejected does not bump submittedToDu → inProgress');
+  }
+
+  // ── negate ──
+  eq(R.negate([{month:'2026-07',path:['a'],inc:5},{month:'2026-07',path:['b'],set:'x'}]),
+     [{month:'2026-07',path:['a'],inc:-5}], 'negate flips inc, drops set');
+
+  // ── submissionContribution: full lifecycle replays ──
+  const lc = {
+    createdAt:'2026-07-10T12:00:00Z', mrc:100, category:'starter', teamId:'t1', agentId:'u1', agentName:'Ann',
+    activatedAt:'2026-07-15T12:00:00Z',
+    events:[
+      {type:'created',       ts:'2026-07-10T12:00:00Z'},
+      {type:'submittedToDu', ts:'2026-07-12T12:00:00Z'},
+      {type:'activated',     ts:'2026-07-15T12:00:00Z'},
+      {type:'rejected',      ts:'2026-08-05T12:00:00Z', payload:{reason:'x'}}
+    ]
+  };
+  const lcR = R.buildRollupsFromSubmissions([lc], famOf);
+  eq(lcR['2026-07'].totals.linesSubmitted, 1, 'lifecycle Jul linesSubmitted');
+  eq(lcR['2026-07'].totals.aedActivated, 0, 'lifecycle Jul aed nets to 0 (activate+reverse, sticky month)');
+  eq(lcR['2026-07'].totals.linesActivated, 0, 'lifecycle Jul linesActivated nets to 0');
+  eq(lcR['2026-07'].byFamily.fixed.aed, 0, 'lifecycle Jul fixed.aed nets to 0');
+  eq(lcR['2026-07'].byFamily.fixed.count, 0, 'lifecycle Jul fixed.count nets to 0');
+  eq(lcR['2026-08'].totals.linesRejected, 1, 'lifecycle Aug linesRejected historical (different month than activation)');
+
+  const clean = { createdAt:'2026-07-10T12:00:00Z', mrc:250, category:'mobile', teamId:'t2', agentId:'u2', agentName:'Bob',
+    activatedAt:'2026-07-20T12:00:00Z',
+    events:[{type:'created',ts:'2026-07-10T12:00:00Z'},{type:'activated',ts:'2026-07-20T12:00:00Z'}] };
+  const cR = R.buildRollupsFromSubmissions([clean], famOf)['2026-07'];
+  eq(cR.totals.aedActivated, 250, 'clean aed 250');
+  eq(cR.byFamily.sim, {aed:250,count:1}, 'clean sim family');
+  eq(cR.byContributor.u2, {aed:250,count:1,label:'Bob',type:'agent'}, 'clean contributor u2');
+
+  const zero = { createdAt:'2026-07-10T12:00:00Z', mrc:0, category:'mobile', teamId:'t2', agentId:'u2', agentName:'Bob',
+    activatedAt:'2026-07-20T12:00:00Z',
+    events:[{type:'created',ts:'2026-07-10T12:00:00Z'},{type:'activated',ts:'2026-07-20T12:00:00Z'}] };
+  const zR = R.buildRollupsFromSubmissions([zero], famOf)['2026-07'];
+  eq(zR.byFamily.sim, {aed:0,count:1}, 'zero-AED prepaid: counts, aed 0');
+
+  const srcSub = { createdAt:'2026-07-10T12:00:00Z', mrc:500, category:'starter', teamId:'t1', agentId:'u1', agentName:'Ann',
+    sourcedBy:{flag:true,partnerName:'Beta LLC'}, activatedAt:'2026-07-20T12:00:00Z',
+    events:[{type:'created',ts:'2026-07-10T12:00:00Z'},{type:'activated',ts:'2026-07-20T12:00:00Z'}] };
+  const sR = R.buildRollupsFromSubmissions([srcSub], famOf)['2026-07'];
+  eq(sR.byContributor['beta-llc'], {aed:500,count:1,label:'Beta LLC',type:'partner'}, 'sourced → partner bucket');
+  ok(!('u1' in sR.byContributor), 'sourced line NOT credited to agent in byContributor');
+
+  const rs = { createdAt:'2026-07-01T12:00:00Z', mrc:100, category:'starter', teamId:'t1', agentId:'u1', agentName:'Ann',
+    activatedAt:'2026-07-25T12:00:00Z',
+    events:[
+      {type:'created',  ts:'2026-07-01T12:00:00Z'},
+      {type:'rejected', ts:'2026-07-05T12:00:00Z', payload:{reason:'x'}},
+      {type:'resubmit', ts:'2026-07-10T12:00:00Z'},
+      {type:'activated',ts:'2026-07-25T12:00:00Z'}
+    ] };
+  const rsR = R.buildRollupsFromSubmissions([rs], famOf)['2026-07'];
+  eq(rsR.totals.linesRejected, 1, 'resubmit lc linesRejected 1 (historical)');
+  eq(rsR.totals.linesResubmitted, 1, 'resubmit lc linesResubmitted 1');
+  eq(rsR.totals.aedActivated, 100, 'resubmit lc finally activated aed 100');
+
+  // proceededWithoutVerification is skipped, never treated as a transition
+  const pwv = { createdAt:'2026-07-01T12:00:00Z', mrc:100, category:'starter', teamId:'t1', agentId:'u1', agentName:'Ann',
+    events:[
+      {type:'created', ts:'2026-07-01T12:00:00Z'},
+      {type:'submittedToDu', ts:'2026-07-02T12:00:00Z'},
+      {type:'proceededWithoutVerification', ts:'2026-07-02T12:00:00Z'},
+      {type:'note', ts:'2026-07-03T12:00:00Z'}
+    ] };
+  const pwvContrib = R.submissionContribution(pwv, famOf);
+  eq(pwvContrib, R.createDeltas({createdAt:'2026-07-01T12:00:00Z'}), 'proceededWithoutVerification produces no delta of its own (skipped in replay)');
+
+  // ── delete reversal nets a clean activation to zero ──
+  const delDeltas = R.negate(R.submissionContribution(clean, famOf));
+  ok(delDeltas.every(d=>'inc' in d), 'negate(contribution) drops all set deltas');
+  const combined = R.buildRollupsFromSubmissions([clean], famOf);
+  for(const d of delDeltas){
+    const acc = combined[d.month];
+    let node=acc; for(let i=0;i<d.path.length-1;i++){ node[d.path[i]] = node[d.path[i]]||{}; node=node[d.path[i]]; }
+    node[d.path[d.path.length-1]] += d.inc;
+  }
+  eq(combined['2026-07'].totals.aedActivated, 0, 'delete reversal → aed 0');
+  eq(combined['2026-07'].totals.linesSubmitted, 0, 'delete reversal → linesSubmitted 0');
+  eq(combined['2026-07'].byFamily.sim.aed, 0, 'delete reversal → sim.aed 0');
+
+  // ── applyRollupDeltas: payload shape + summing (Firestore forbids writing a doc twice per batch) ──
+  const calls=[];
+  const fakeWriter = { set:(ref,data,opts)=>calls.push({ref,data,opts}) };
+  R.applyRollupDeltas(fakeWriter, [
+    {month:'2026-07',path:['totals','aedActivated'],inc:100},
+    {month:'2026-07',path:['byContributor','u1','label'],set:'Ann'},
+    {month:'2026-08',path:['totals','linesRejected'],inc:1}
+  ]);
+  eq(calls.length, 2, 'applyRollupDeltas writes one doc per month');
+  const jul = calls.find(c=>c.data.month==='2026-07');
+  eq(jul.opts, {merge:true}, 'applyRollupDeltas uses merge:true (creation-safe)');
+  ok(jul.data.orgId !== undefined, 'applyRollupDeltas stamps orgId');
+  ok(jul.data.totals.aedActivated && typeof jul.data.totals.aedActivated === 'object', 'applyRollupDeltas emits an increment() sentinel, not a raw number');
+  eq(jul.data.byContributor.u1.label, 'Ann', 'applyRollupDeltas: label set literally (not wrapped in increment)');
+
+  const calls2=[];
+  const w2={ set:(ref,data,opts)=>calls2.push({ref,data,opts}) };
+  R.applyRollupDeltas(w2, [
+    {month:'2026-07',path:['totals','linesSubmitted'],inc:1},
+    {month:'2026-07',path:['totals','linesSubmitted'],inc:1},
+    {month:'2026-07',path:['totals','linesSubmitted'],inc:1}
+  ]);
+  eq(calls2.length, 1, 'applyRollupDeltas summing: one write per doc, not one per delta');
+
+  const calls3=[];
+  const w3={ set:(ref,data,opts)=>calls3.push({ref,data,opts}) };
+  const both=[...R.activationDeltas(actSub,+1,famOf), ...R.activationDeltas(actSub,-1,famOf)];
+  R.applyRollupDeltas(w3, both);
+  eq(calls3.length, 1, 'applyRollupDeltas net activate+reverse in one call → one write');
+  ok(calls3[0].data.byContributor.u1.label === 'Ann', 'applyRollupDeltas: label still stamped even when net inc is 0 (from the +1 side)');
+
+  // ── diffRollups ──
+  eq(R.diffRollups(null, R.blankMonth()), [], 'diffRollups: blank vs null = no drift');
+  const dOld = { totals:{aedActivated:100,linesActivated:1,linesSubmitted:2,linesRejected:0,linesResubmitted:0}, byFamily:{fixed:{aed:100,count:1}}, byCategory:{}, byTeam:{}, byContributor:{} };
+  const dNew = { totals:{aedActivated:150,linesActivated:1,linesSubmitted:2,linesRejected:0,linesResubmitted:0}, byFamily:{fixed:{aed:150,count:1}}, byCategory:{}, byTeam:{}, byContributor:{} };
+  const drift = R.diffRollups(dOld, dNew);
+  eq(drift.length, 2, 'diffRollups: 2 leaves drift');
+  ok(drift.some(x=>x.path==='totals.aedActivated'&&x.old===100&&x.new===150), 'diffRollups totals.aedActivated 100→150');
+  eq(R.diffRollups(dNew, dNew), [], 'diffRollups: identical = no drift');
+  const dr2 = R.diffRollups(null, R.buildRollupsFromSubmissions([clean], famOf)['2026-07']);
+  ok(dr2.some(x=>x.path==='totals.aedActivated'&&x.old===0&&x.new===250), 'diffRollups vs absent: aed 0→250');
+  ok(!dr2.some(x=>x.path.endsWith('.label')||x.path.endsWith('.type')), 'diffRollups ignores label/type descriptors');
+
+  // ── render ──
+  summaryEl.innerHTML = fail
+    ? `<span class="err">${pass} passed, ${fail} FAILED</span>`
+    : `<span class="ok">${pass} passed, 0 failed</span>`;
+  out.textContent = failures.length ? failures.join('\n\n') : 'All assertions passed.';
+}
+
+document.getElementById('run').addEventListener('click', run);
+run();
+</script>
+</body>
+</html>
