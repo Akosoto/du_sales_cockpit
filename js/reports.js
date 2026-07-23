@@ -1,6 +1,11 @@
-import { db, CP, OC, collection, getDocs } from './state.js';
+import {
+  db, CP, OC, collection, getDocs, query, where, orderBy, limit, startAfter
+} from './state.js';
 import { esc, toast } from './helpers.js';
-import { getDashboardData } from './dashboardData.js';
+import { getDashboardData, resolvePeriodRange } from './dashboardData.js';
+import { SUBMISSION_STATUS_LABELS, TRANSFER_STATUS_LABELS } from './submissions.js';
+import { currentCategories, categoryLabel, currentFamilies, familyLabel } from './orgConfig.js';
+import { currentFamilyResolver } from './rollups.js';
 
 // ════════════════════════════════════════════════════
 // REPORTS TAB (Session C2, ARCHITECTURE.md §16) — manager-only. Every
@@ -236,6 +241,212 @@ async function renderDailySummaryReport(body){
   });
 }
 
+// ── Shared CSV export (client-side Blob — mirrors js/org.js's
+// runBackupExport download pattern) ──
+function csvEscape(v){
+  const s = v==null ? '' : String(v);
+  return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+}
+function toCsv(rows, columns){
+  const header = columns.map(c=>csvEscape(c.label)).join(',');
+  const body = rows.map(r => columns.map(c=>csvEscape(c.get(r))).join(',')).join('\n');
+  return header + '\n' + body;
+}
+function downloadCsv(filename, csvText){
+  const blob = new Blob([csvText], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+function eventValue(sub, type){
+  return [...(sub.events||[])].reverse().find(e=>e.type===type)?.payload?.value;
+}
+
+// ════════════════════════════════════════════════════
+// REPORT 3 — Master Tracker (ARCHITECTURE.md §16.3)
+// Server query: createdAt range (≤92 days, resolvePeriodRange's custom
+// validation reused) + orderBy('createdAt','desc') + limit(200) + startAfter
+// cursor ("Load more") — the exact cursor-pagination shape js/leads.js's
+// Pipeline tab already established, single field, auto-indexed. EVERY other
+// filter (status, team, agent, family, transferStatus) is client-side over
+// the accumulating loaded set, deliberately, so no filter combination can
+// ever require a new composite index this session. Sortable columns =
+// client-side re-sort of the loaded set. CSV exports all currently-filtered
+// rows (not just the visible page).
+//
+// Provability (new query — createdAt range + orderBy + limit + startAfter):
+// same field/shape as dashboardData.js's own `created` query (already
+// proven live, single-field range, auto-indexed); pagination clauses don't
+// change what the read rule evaluates (rules reference resource.data
+// fields, never query shape) — the manager clause's request-time-only
+// role() escape (§12's empirical provability record) is satisfied
+// identically regardless of page size or cursor position.
+// ════════════════════════════════════════════════════
+const TRACKER_PAGE_SIZE = 200;
+const TRACKER_COLUMNS = [
+  { key:'createdAt',  label:'Created',      get: s => s.createdAt||'', sort: s => s.createdAt||'' },
+  { key:'bundleId',   label:'Bundle',        get: s => s.bundleId||'' },
+  { key:'agentName',  label:'Agent',         get: s => s.agentName||'', sort: s => s.agentName||'' },
+  { key:'team',       label:'Team',          get: (s,ctx) => ctx.teamName(s.teamId) },
+  { key:'productName',label:'Product',       get: s => s.productName||'' },
+  { key:'category',   label:'Category',      get: s => categoryLabel(s.category) },
+  { key:'family',     label:'Family',        get: (s,ctx) => familyLabel(ctx.familyOf(s.category)) },
+  { key:'qty',        label:'Qty',           get: s => s.qty ?? '' },
+  { key:'mrc',        label:'MRC (AED)',     get: s => s.mrc ?? '', sort: s => Number(s.mrc)||0 },
+  { key:'typeOfRequest', label:'Type of Request', get: s => s.typeOfRequest||'' },
+  { key:'contractTerm', label:'Contract Term', get: s => s.contractTerm ? `${s.contractTerm}mo` : '' },
+  { key:'status',     label:'Status',        get: s => SUBMISSION_STATUS_LABELS[s.status]||s.status||'', sort: s => s.status||'' },
+  { key:'transferStatus', label:'Transfer',  get: s => s.transferStatus ? (TRANSFER_STATUS_LABELS[s.transferStatus]||s.transferStatus) : '—' },
+  { key:'activityNo', label:'Activity No.',  get: s => eventValue(s,'activityNo') ?? '' },
+  { key:'workOrderNo',label:'Work Order No.', get: s => eventValue(s,'workOrderNo') ?? '' },
+  { key:'activatedAt',label:'Activated',     get: s => s.activatedAt||'' },
+  { key:'rejectedAt', label:'Rejected',      get: s => s.rejectedAt||'' }
+];
+
+function trackerDefaultRange(){
+  const to = todayDateStr();
+  const d = new Date(); d.setDate(d.getDate()-29);
+  const from = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return { from, to };
+}
+
+async function fetchTrackerPage(fromIso, toIso, cursorSnap){
+  const clauses = [
+    where('createdAt','>=',fromIso), where('createdAt','<=',toIso),
+    orderBy('createdAt','desc')
+  ];
+  if(cursorSnap) clauses.push(startAfter(cursorSnap));
+  clauses.push(limit(TRACKER_PAGE_SIZE));
+  const snap = await getDocs(query(collection(db,'submissions'), ...clauses));
+  return {
+    docs: snap.docs.map(d=>({id:d.id,...d.data()})),
+    lastSnap: snap.docs.length ? snap.docs[snap.docs.length-1] : null,
+    pageCount: snap.docs.length
+  };
+}
+
+async function renderMasterTrackerReport(body){
+  const { teams, users } = await fetchTeamsAndUsers();
+  const teamById = Object.fromEntries(teams.map(t=>[t.id,t]));
+  const agentUsers = users.filter(u=>u.role==='agent');
+  const familyOf = currentFamilyResolver();
+  const ctx = { teamName: id => teamById[id]?.name || (id ? id : 'Unassigned'), familyOf };
+
+  let range = trackerDefaultRange();
+  let rows = [];        // accumulated raw docs across all loaded pages
+  let cursorSnap = null;
+  let exhausted = false;
+  let f = { status:'', teamId:'', agentId:'', familyId:'', transferStatus:'' };
+  let sortKey = 'createdAt', sortDir = 'desc';
+
+  function filteredSorted(){
+    let out = rows.filter(s =>
+      (!f.status || s.status===f.status) &&
+      (!f.teamId || s.teamId===f.teamId) &&
+      (!f.agentId || s.agentId===f.agentId) &&
+      (!f.familyId || familyOf(s.category)===f.familyId) &&
+      (!f.transferStatus || (f.transferStatus==='none' ? !s.transferStatus : s.transferStatus===f.transferStatus))
+    );
+    const col = TRACKER_COLUMNS.find(c=>c.key===sortKey);
+    const keyFn = col?.sort || col?.get;
+    out.sort((a,b) => {
+      const av = keyFn(a,ctx), bv = keyFn(b,ctx);
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sortDir==='asc' ? cmp : -cmp;
+    });
+    return out;
+  }
+
+  async function loadFirstPage(){
+    range = { from: document.getElementById('rt-from')?.value || range.from, to: document.getElementById('rt-to')?.value || range.to };
+    let validated;
+    try { validated = resolvePeriodRange({ preset:'custom', from: range.from, to: range.to }); }
+    catch(e){ toast(e.message, 'err'); return; }
+    rows = []; cursorSnap = null; exhausted = false;
+    const page = await fetchTrackerPage(validated.from, validated.to, null);
+    rows = page.docs;
+    cursorSnap = page.lastSnap;
+    exhausted = page.pageCount < TRACKER_PAGE_SIZE;
+    render();
+  }
+
+  async function loadMore(){
+    if(exhausted || !cursorSnap) return;
+    const validated = resolvePeriodRange({ preset:'custom', from: range.from, to: range.to });
+    const page = await fetchTrackerPage(validated.from, validated.to, cursorSnap);
+    rows = rows.concat(page.docs);
+    cursorSnap = page.lastSnap;
+    exhausted = page.pageCount < TRACKER_PAGE_SIZE;
+    render();
+  }
+
+  function render(){
+    const view = filteredSorted();
+    const sortArrow = key => key!==sortKey ? '' : (sortDir==='asc' ? ' ▲' : ' ▼');
+    const statusOpts = ['pendingVerification','submittedToDu','inProgress','activated','rejected']
+      .map(s=>`<option value="${s}" ${f.status===s?'selected':''}>${esc(SUBMISSION_STATUS_LABELS[s]||s)}</option>`).join('');
+    const teamOpts = teams.map(t=>`<option value="${t.id}" ${f.teamId===t.id?'selected':''}>${esc(t.name)}</option>`).join('');
+    const agentOpts = agentUsers.map(u=>`<option value="${u.id}" ${f.agentId===u.id?'selected':''}>${esc(u.name)}</option>`).join('');
+    const familyOpts = currentFamilies().map(fam=>`<option value="${fam.id}" ${f.familyId===fam.id?'selected':''}>${esc(fam.label)}</option>`).join('');
+
+    body.innerHTML = `
+      <div class="flex gap-8" style="justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <p class="text-dim text-xs">Loaded ${rows.length} row${rows.length!==1?'s':''} (${view.length} match current filters) — last fetched: ${fmtTime(new Date())}</p>
+        <button class="btn btn-ghost btn-sm" id="rt-csv">⬇️ Export CSV</button>
+      </div>
+      <div class="row2" style="max-width:420px;margin-bottom:10px">
+        <div class="field"><label>From</label><input type="date" id="rt-from" value="${esc(range.from)}"></div>
+        <div class="field"><label>To <span class="text-dim">(max 92 days)</span></label><input type="date" id="rt-to" value="${esc(range.to)}"></div>
+      </div>
+      <button class="btn btn-ghost btn-sm mb-12" id="rt-apply">Apply Range</button>
+      <div class="filters" style="margin-bottom:12px;flex-wrap:wrap;gap:8px">
+        <select id="rt-f-status"><option value="">All Statuses</option>${statusOpts}</select>
+        <select id="rt-f-team"><option value="">All Teams</option>${teamOpts}</select>
+        <select id="rt-f-agent"><option value="">All Agents</option>${agentOpts}</select>
+        <select id="rt-f-family"><option value="">All Families</option>${familyOpts}</select>
+        <select id="rt-f-transfer">
+          <option value="">All (Transfer)</option>
+          <option value="pending" ${f.transferStatus==='pending'?'selected':''}>${esc(TRANSFER_STATUS_LABELS.pending)}</option>
+          <option value="completed" ${f.transferStatus==='completed'?'selected':''}>${esc(TRANSFER_STATUS_LABELS.completed)}</option>
+          <option value="rejected" ${f.transferStatus==='rejected'?'selected':''}>${esc(TRANSFER_STATUS_LABELS.rejected)}</option>
+          <option value="none" ${f.transferStatus==='none'?'selected':''}>Not a Transfer</option>
+        </select>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr>${TRACKER_COLUMNS.map(c=>`<th data-sort="${c.key}" style="cursor:pointer;white-space:nowrap">${esc(c.label)}${sortArrow(c.key)}</th>`).join('')}</tr></thead>
+          <tbody>${view.length ? view.map(s=>`<tr>${TRACKER_COLUMNS.map(c=>`<td>${esc(c.get(s,ctx))}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${TRACKER_COLUMNS.length}" class="text-dim">No submissions match this range/filter.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px">
+        <button class="btn btn-ghost btn-sm" id="rt-more" ${exhausted?'disabled':''}>${exhausted ? 'No more rows in range' : 'Load more'}</button>
+      </div>
+    `;
+
+    document.getElementById('rt-apply').addEventListener('click', loadFirstPage);
+    document.getElementById('rt-more').addEventListener('click', loadMore);
+    document.getElementById('rt-csv').addEventListener('click', () => {
+      const csv = toCsv(filteredSorted(), TRACKER_COLUMNS.map(c=>({ label:c.label, get: s=>c.get(s,ctx) })));
+      downloadCsv(`master-tracker-${range.from}_to_${range.to}.csv`, csv);
+    });
+    document.getElementById('rt-f-status').addEventListener('change', e => { f.status = e.target.value; render(); });
+    document.getElementById('rt-f-team').addEventListener('change', e => { f.teamId = e.target.value; render(); });
+    document.getElementById('rt-f-agent').addEventListener('change', e => { f.agentId = e.target.value; render(); });
+    document.getElementById('rt-f-family').addEventListener('change', e => { f.familyId = e.target.value; render(); });
+    document.getElementById('rt-f-transfer').addEventListener('change', e => { f.transferStatus = e.target.value; render(); });
+    body.querySelectorAll('[data-sort]').forEach(th => th.addEventListener('click', () => {
+      const key = th.dataset.sort;
+      if(sortKey===key) sortDir = sortDir==='asc' ? 'desc' : 'asc';
+      else { sortKey = key; sortDir = 'asc'; }
+      render();
+    }));
+  }
+
+  await loadFirstPage();
+}
+
 // ════════════════════════════════════════════════════
 // TAB SCAFFOLD
 // ════════════════════════════════════════════════════
@@ -267,7 +478,7 @@ export async function renderReportsTab(){
     try {
       if(active === 'daily-team')         await renderDailyTeamReport(body);
       else if(active === 'daily-summary') await renderDailySummaryReport(body);
-      else if(active === 'tracker')       body.innerHTML = placeholderHtml('Master Tracker');
+      else if(active === 'tracker')       await renderMasterTrackerReport(body);
       else if(active === 'rejections')    body.innerHTML = placeholderHtml('Rejection Analytics');
     } catch(e){
       body.innerHTML = `<p class="err">Error: ${esc(e.message)}</p>`;
