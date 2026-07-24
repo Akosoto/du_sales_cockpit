@@ -370,6 +370,58 @@ service cloud.firestore {
       allow delete: if isAuth() && role() == 'manager' && sameOrg();
     }
 
+    // ── SOF TEMPLATES (Session S1, ARCHITECTURE.md §17) ──
+    // Blank Service Order Forms managers upload for every role to download
+    // (latest version only) — RAW original file bytes, base64-chunked, one
+    // parent doc per uploaded VERSION + a `chunks` subcollection holding the
+    // actual base64 data. Field-orgId collection (orgId stamped on every
+    // write, like submissions/rollups), NOT key-matched like orgs/.
+    //
+    // Read: manager -> any; every other role -> ONLY the CURRENT LATEST
+    // version (resource.data.isLatest == true). This is the mirror-image of
+    // the LIST-query provability pattern already established elsewhere in
+    // this file (a non-manager role's query must match its own OR-clause's
+    // resource.data condition exactly to be provable) — here the condition
+    // isn't a role-scoping field like teamId/agentId, it's the SAME
+    // isLatest field js/sofTemplates.js's fetchLatestForms() already
+    // filters on (where('isLatest','==',true)), so that query is provable
+    // for every role without any composite index.
+    //
+    // Write: manager only, full stop — no agent/team_lead/backend create,
+    // update, or delete path exists for this collection at all (unlike
+    // submissions' agent-self-resubmit exception, there is no analogous
+    // non-manager mutation here).
+    match /sofTemplates/{id} {
+      allow read: if isAuth() && sameOrg() && (
+        role() == 'manager' || resource.data.isLatest == true
+      );
+      allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
+      allow update: if isAuth() && role() == 'manager' && sameOrg();
+      allow delete: if isAuth() && role() == 'manager' && sameOrg();
+
+      // ── CHUNKS — the LOAD-BEARING gate, not the parent's ──
+      // A chunk get() is a DIRECT read by known id (js/sofTemplates.js
+      // downloadSofTemplate: chunk-0..chunk-(chunkCount-1)), never a list
+      // query — it does NOT re-read or re-check the parent doc as part of
+      // being evaluated. isLatest is therefore DENORMALIZED onto every
+      // chunk (stamped at upload time and flipped false in the SAME batch
+      // that supersedes a version) specifically so this rule has its own
+      // resource.data to gate on. If this isLatest condition were ever
+      // missing here, any authenticated non-manager user who obtained (by
+      // any means) a superseded version's parent id could still
+      // reassemble its full byte content chunk-by-chunk — even though
+      // that version never appears in any listing they can run — since
+      // the PARENT rule above is never consulted during a chunk read.
+      match /chunks/{n} {
+        allow read: if isAuth() && sameOrg() && (
+          role() == 'manager' || resource.data.isLatest == true
+        );
+        allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
+        allow update: if isAuth() && role() == 'manager' && sameOrg();
+        allow delete: if isAuth() && role() == 'manager' && sameOrg();
+      }
+    }
+
     // ── AUDIT LOG (ARCHITECTURE.md §3) ──────────────
     // Append-only: js/db.js writes one doc per mutation, in the same batch
     // as the mutation itself. No update/delete ever — the log is only ever

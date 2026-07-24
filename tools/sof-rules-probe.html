@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SOF Templates Rules Adversarial Probe</title>
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#eee;padding:24px;max-width:800px;margin:0 auto}
+  h2{color:#f87171}
+  input{padding:8px;margin:4px 4px 4px 0;background:#1e1e1e;color:#eee;border:1px solid #444;border-radius:4px}
+  button{padding:8px 16px;margin:4px 4px 4px 0;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer}
+  button:disabled{opacity:.4;cursor:default}
+  .ok{color:#4ade80}
+  .err{color:#f87171}
+  .dim{color:#888}
+  label{display:block;margin-top:10px;font-size:12px;color:#aaa}
+  pre{background:#1a1a1a;padding:14px;border-radius:6px;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+</style>
+</head>
+<body>
+<!--
+  SOF Templates rules adversarial probe — Session S1 Step 5.
+
+  Origin: ARCHITECTURE.md §17.4 flags the CHUNK-level isLatest gate as the
+  load-bearing piece of this feature's rules, not the parent's — a chunk
+  get() (js/sofTemplates.js downloadSofTemplate) never re-reads its parent
+  doc as part of being evaluated, so if that gate were ever missing or
+  wrong, any authenticated non-manager user who obtained a SUPERSEDED
+  version's parent id could still reassemble its full byte content
+  chunk-by-chunk, even though that version never appears in any listing
+  they can run. This is exactly the class of bug adversarial testing
+  exists to catch before it's relied on in production, not after.
+
+  Independent of index.html/js/state.js (own Firebase app instance, own
+  login form) — same precedent as tools/rules-probe.html, to rule out any
+  app-state/harness artifact skewing the result.
+
+  HOW TO RUN:
+  1. Sign in as MANAGER. Note a form's parent doc id from the app (or
+     upload a throwaway test form, then upload a SECOND version of the
+     SAME name so the first becomes superseded — its id is what test (3)/
+     (4) below should target). Paste that superseded version's PARENT ID
+     into the field below (chunk index 0 is fine — every version has at
+     least one chunk).
+  2. Run all four tests as manager — expect ALL FOUR to succeed (manager
+     reads anything).
+  3. Sign out, sign in as a NON-MANAGER control account (team_lead or
+     agent) with the SAME parent id still in the field.
+  4. Run all four tests again — expect:
+       (1) bare collection list          -> DENIED
+       (2) isLatest-filtered list        -> OK (returns only latest versions)
+       (3) get() on the SUPERSEDED parent -> DENIED
+       (4) get() on the SUPERSEDED chunk  -> DENIED  <- the critical one
+  5. Record the actual result matrix in this file's own comment block
+     (below this note) before considering Step 5 verified, mirroring
+     tools/rules-probe.html's own "RESULT MATRIX" convention.
+
+  RESULT MATRIX (2026-07-24, run live via javascript_exec against the
+  authenticated app sessions rather than typed into this page's own form —
+  same live project/rules, equivalent evidence):
+
+    Fixture: "s1-fix test form" — v1 (1.2MB, 3 chunks), v2 (1.2MB, 3
+    chunks, id JPcPwbKhp9fDJvo9iKxD), v3 (900KB, 2 chunks, id
+    lepmG1s5hfihmb6GjeOG, isLatest:true).
+
+    Manager account (Sales Manager):
+      Upload v1, v2, v3                                    -> all OK
+      History modal (all 3 versions)                       -> OK
+      Delete blocked on v3 (current latest), both via
+        the UI's disabled button AND a direct call to
+        deleteSofVersion(v3)                                -> correctly BLOCKED,
+                                                                 clear error message
+      Delete v1 (superseded)                                -> OK; parent + all 3
+                                                                 chunks confirmed gone
+      Download v3 (latest) and v1 (superseded, via
+        history) — byte-perfect reassembly vs. the
+        original upload content, both cases               -> OK, byte-identical
+
+    Team_lead account (Marwan, non-manager control):
+      (1) bare collection('sofTemplates')                  -> DENIED (permission-denied)
+      (2) where('isLatest','==',true)                       -> OK, returned exactly
+                                                                 v3 (the one latest doc)
+      (3) get() on superseded v2 PARENT (known id)          -> DENIED
+      (4) get() on superseded v2 CHUNK-0 (known id)         -> DENIED  <- the critical
+                                                                 case: confirmed a
+                                                                 non-manager cannot
+                                                                 reassemble a
+                                                                 superseded version's
+                                                                 bytes even with a
+                                                                 known parent id
+      (5) get() on LATEST v3 parent (known id)              -> OK, isLatest:true
+      (6) get() on LATEST v3 chunk-0 (known id)             -> OK, full chunk data
+                                                                 returned
+      Forms tab UI: showed ONLY v3, no upload/history
+        buttons in the DOM at all; download of v3
+        byte-identical to the original upload            -> OK
+
+  Conclusion: the chunk-level isLatest gate works exactly as designed —
+  the load-bearing property (a non-manager cannot reassemble a superseded
+  version's bytes by known id, even though the parent-level list query
+  never surfaces it) is CONFIRMED, not just reasoned. Test fixture cleaned
+  up afterward (all versions deleted, collection restored to empty).
+
+  RE-RUN OBLIGATION: re-run this probe after any future change to this
+  collection's rules, or to sameOrg()/sameOrgWrite() themselves (this
+  session's rules reuse those helpers unmodified, so per ARCHITECTURE.md
+  §12's own re-run obligation, this session did NOT need to re-run
+  tools/rules-probe.html — only this dedicated probe, which is new).
+-->
+<h2>SOF Templates Rules Adversarial Probe</h2>
+<p class="dim">Standalone page, independent of index.html/js/state.js — signs in and queries directly against the SAME Firebase project this app uses. See the file header comment for how to run this and what each result should be. Re-run after any change to this collection's rules.</p>
+
+<div id="login">
+  <input type="email" id="email" placeholder="email" size="30"><br>
+  <input type="password" id="pw" placeholder="password" size="30"><br>
+  <button id="signin">Sign In</button>
+</div>
+<div id="status" class="dim">Not signed in.</div>
+<button id="signout" style="display:none">Sign Out</button>
+
+<label for="parentId">Parent doc id to target for tests (3)/(4) — use a SUPERSEDED version's id for the critical check:</label>
+<input type="text" id="parentId" size="30" placeholder="e.g. aBc123XyZ">
+<label for="chunkIdx">Chunk index (0 is fine for any version):</label>
+<input type="text" id="chunkIdx" size="6" value="0">
+<br>
+<button id="run" style="display:none">Run Tests</button>
+
+<pre id="out"></pre>
+
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+  import { getFirestore, doc, getDoc, collection, query, where, getDocs } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+  import { firebaseConfig, orgId } from '../config.js';
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  const out      = document.getElementById('out');
+  const statusEl = document.getElementById('status');
+  const runBtn   = document.getElementById('run');
+  const signoutBtn = document.getElementById('signout');
+
+  document.getElementById('signin').onclick = async () => {
+    const email = document.getElementById('email').value.trim();
+    const pw    = document.getElementById('pw').value;
+    statusEl.textContent = 'Signing in…';
+    try { await signInWithEmailAndPassword(auth, email, pw); }
+    catch(e){ statusEl.textContent = 'Sign-in failed: ' + e.message; }
+  };
+  signoutBtn.onclick = () => signOut(auth);
+
+  onAuthStateChanged(auth, user => {
+    if(user){
+      statusEl.innerHTML = `Signed in as <b>${user.email}</b> (uid <span class="dim">${user.uid}</span>)`;
+      runBtn.style.display = 'inline-block';
+      signoutBtn.style.display = 'inline-block';
+    } else {
+      statusEl.textContent = 'Not signed in.';
+      runBtn.style.display = 'none';
+      signoutBtn.style.display = 'none';
+      out.textContent = '';
+    }
+  });
+
+  function log(line, cls){
+    const div = document.createElement('div');
+    if(cls) div.className = cls;
+    div.textContent = line;
+    out.appendChild(div);
+  }
+
+  async function test(label, fn){
+    try {
+      const result = await fn();
+      log(`OK   ${label} — ${result}`, 'ok');
+    } catch(e) {
+      log(`FAIL ${label} — code: ${e.code || '(none)'} — ${e.message}`, 'err');
+    }
+  }
+
+  runBtn.onclick = async () => {
+    out.textContent = '';
+    const parentId = document.getElementById('parentId').value.trim();
+    const chunkIdx  = document.getElementById('chunkIdx').value.trim() || '0';
+    log(`project: ${firebaseConfig.projectId}   orgId constant: ${orgId}`, 'dim');
+    log(`targeting parent id: ${parentId || '(none entered)'}   chunk-${chunkIdx}\n`, 'dim');
+
+    await test("(1) bare collection('sofTemplates')", async () => {
+      const s = await getDocs(collection(db,'sofTemplates'));
+      return `${s.size} docs`;
+    });
+
+    await test("(2) where('isLatest','==',true)", async () => {
+      const s = await getDocs(query(collection(db,'sofTemplates'), where('isLatest','==',true)));
+      return `${s.size} docs (should be one per form name)`;
+    });
+
+    if(!parentId){
+      log('(3)/(4) skipped — no parent id entered.', 'dim');
+      return;
+    }
+
+    await test(`(3) get() on parent sofTemplates/${parentId}`, async () => {
+      const snap = await getDoc(doc(db,'sofTemplates',parentId));
+      if(!snap.exists()) return 'doc does not exist (check the id)';
+      const d = snap.data();
+      return `isLatest=${d.isLatest}  name=${d.name}  version=${d.version}`;
+    });
+
+    await test(`(4) get() on chunk sofTemplates/${parentId}/chunks/chunk-${chunkIdx}  <-- THE CRITICAL CASE`, async () => {
+      const snap = await getDoc(doc(db,'sofTemplates',parentId,'chunks',`chunk-${chunkIdx}`));
+      if(!snap.exists()) return 'doc does not exist (check the id/index)';
+      const d = snap.data();
+      return `isLatest=${d.isLatest}  data length=${(d.data||'').length} chars`;
+    });
+  };
+</script>
+</body>
+</html>
