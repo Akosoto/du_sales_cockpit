@@ -1237,3 +1237,180 @@ numbers, not a report against itself.
   buckets, every one matching the fixture's known contribution — leaving
   `{linesSubmitted:1, everything else 0}`, the true pre-session baseline.
   Reports tab re-rendered clean against the restored baseline.
+
+## 17. Session S1 — SOF Template Library (IN PROGRESS)
+
+**Purpose:** managers upload blank Service Order Forms (fillable PDF or
+Excel the CUSTOMER must be able to type into — fidelity is the point, not
+a nice-to-have); every role sees and downloads only the LATEST version of
+each named form; managers additionally see full version history and can
+delete a superseded version. Deliberately a NEW, self-contained mechanism
+— not an extension of the existing `js/storage/firestore-b64.js` driver
+(§6/PROJECT_SPEC's Document Storage section), which exists specifically
+to CONVERT submission evidence (canvas-recompressed images, pdf.js-
+rendered PDF pages → JPEGs) for the free tier. That conversion would
+destroy a fillable form's actual field structure — the opposite of this
+feature's purpose — so SOF templates store RAW ORIGINAL FILE BYTES,
+never re-rendered or re-encoded beyond the base64 chunking Firestore
+itself requires.
+
+### 17.1 Storage — raw bytes, base64-chunked, ≤700KB/chunk (encoded)
+
+5MB file cap; PDF and Excel (`.xlsx`/`.xls`) only — validated on BOTH MIME
+type and file extension (a renamed `.exe` with a spoofed MIME is still
+rejected by extension; a correctly-typed file with a mismatched extension
+is still rejected by MIME) — clear, specific error message for oversize
+or wrong-type, never a generic upload failure.
+
+**Chunk sizing is ENCODED bytes, not raw** — matching
+`js/storage/firestore-b64.js`'s own established precedent (`HARD_CEILING_
+CHARS = 900*1024`, checked against the base64 STRING length, "what
+actually gets stored," not the pre-encoding byte size, since base64
+inflates size ~33%). "≤700KB/chunk" here means each chunk doc's stored
+`data` field (the base64 string) is capped at 700×1024 characters — the
+raw byte-slice fed into each chunk before encoding is therefore
+~525KB (700KB × 3/4), producing a ~700KB encoded string with ~324KB of
+headroom under Firestore's ~1MiB per-document ceiling (MORE headroom than
+firestore-b64's own 900KB/~124KB margin — appropriate here since a SOF
+chunk must reassemble byte-PERFECTLY, unlike a compressed JPEG page that
+can simply be re-captured at a lower quality if oversize). A 5MB file
+needs at most `Math.ceil(5*1024*1024 / (700*1024*3/4)) ≈ 10` chunks.
+
+### 17.2 Schema
+
+```
+sofTemplates/{id}              // one doc per uploaded VERSION, not per form name
+{
+  name,                        // form's display name, free text — the identity a
+                               //   manager types at upload time; an EXISTING name
+                               //   (case-insensitive match against other docs'
+                               //   name) creates the next version of that form,
+                               //   a NEW name creates a brand-new form
+  fileName,                    // original filename, kept verbatim for download
+  fileType,                    // 'pdf' | 'xlsx' | 'xls' — validated at upload
+  version,                     // int, PER-NAME sequence (1, 2, 3, … for this name)
+  isLatest,                    // true on exactly one version per name at a time
+  sizeBytes,                   // original file size (pre-encoding), for display
+  chunkCount,                  // N — chunks are fetched by direct index 0..N-1,
+                               //   never a list query (17.3)
+  uploadedBy, uploadedAt,      // audit
+  orgId                        // field-orgId collection, sameOrg()/sameOrgWrite()
+                               //   pattern (like submissions/rollups), NOT the
+                               //   key-matched pattern orgs/ uses
+}
+sofTemplates/{id}/chunks/{n}   // subcollection, n = 0..chunkCount-1
+{
+  data,                        // base64 string, ≤700KB encoded (17.1)
+  orgId,                       // denormalized — chunk reads are DIRECT gets by
+                               //   parent id + index, never through the parent's
+                               //   own read rule, so this collection needs its
+                               //   OWN orgId-bearing read gate
+  isLatest                     // DENORMALIZED from the parent — see 17.3/17.4;
+                               //   this is the field the CHUNK read rule actually
+                               //   gates on, since a chunk get() never reads its
+                               //   parent as part of evaluating its own rule
+}
+```
+
+**Upload = one atomic batch**, never partially applied: write the new
+version's parent doc + all its chunk docs, AND — if a prior version of
+this name exists — flip `isLatest:false` on that prior version's parent
+doc AND every one of its chunk docs, all in the SAME `writeBatch`. A 5MB
+file's worst case is ~10 new chunks + 1 new parent + (up to) ~10 old
+chunks + 1 old parent ≈ 22 writes — far under Firestore's 500-op batch
+cap, so no chunking-the-batch-itself concern the way `documents.js`'s
+bulk sweeps need.
+
+### 17.3 Reads — direct gets only, one list-query shape
+
+**Chunk fetch is a direct `getDoc` by index** — `chunk-0`, `chunk-1`, …
+up to the parent's own `chunkCount` — NEVER a list query against the
+`chunks` subcollection. This is the same "eliminate the provability
+surface entirely" discipline `submissionDocs`' viewer already uses (one
+`get()` per page, never a list query) — a direct get on a KNOWN id is
+always provable per-document by the read rule, with no LIST-query
+all-possible-matches concern at all.
+
+**The only list query in this whole feature:** the "latest forms"
+listing every non-manager role's Forms tab needs —
+`where('isLatest','==',true)` against `sofTemplates`. This is provable
+for EVERY role, not just manager, because the query's own filter is
+IDENTICAL to the non-manager branch of the read rule's condition
+(`resource.data.isLatest == true`) — Firestore can prove every possible
+matched document satisfies the rule precisely because the query already
+excludes everything the rule would reject. This is the mirror-image of
+the established "query shape must match the rule's resource.data
+condition for a non-manager-escape role" pattern (submissions' `teamId`/
+`agentId` filters, §5's LIST-query gotcha) — here it's not a role-scoping
+field but the SAME `isLatest` field the rule itself checks.
+
+**Manager's version-history listing** may run WITHOUT the `isLatest`
+filter (every version of a name, or the whole collection) — provable via
+the same request-time-only `role()=='manager'` escape already
+empirically confirmed for submissions/rollups (§12). Provability comment
+required on every query per this session's own instruction — written at
+each call site, not just here.
+
+### 17.4 Rules (Step 5 — PAUSE POINT)
+
+Expected shape (refined during Step 5, not relitigated here): `sofTemplates`
+and its `chunks` subcollection are FIELD-orgId collections (orgId stamped
+on every write, `sameOrg()`/`sameOrgWrite()` — the submissions/rollups
+pattern, not the key-matched `orgs/` pattern, since there are many docs
+per org here, not one). Parent AND chunk read: manager → any (`sameOrg()`
+only); every other role → same-org AND `resource.data.isLatest == true`.
+Create/update/delete: manager only, both parent and chunk.
+
+**The chunk-level gate is the load-bearing piece, not the parent's** — a
+non-manager role never lists `sofTemplates` bare (17.3), so the parent
+rule's `isLatest` condition mostly just gates the one list query itself;
+but chunk reassembly is a SEPARATE per-chunk `get()` that does NOT
+re-check the parent, so if the CHUNK rule's own `isLatest` gate were ever
+missing or wrong, any authenticated non-manager user who obtained (or
+guessed) a superseded version's parent id could still reassemble its
+full byte content chunk-by-chunk, even though that version never appears
+in any listing they can run. This is exactly the class of bug
+`tools/rules-probe.html`-style adversarial testing exists to catch before
+publish, not after — planned for Step 5: extend or re-run the probe
+against this new rule shape (a resource.data-dependent non-manager
+condition ORed with a request-time-only manager escape — "similarly
+shaped" to `sameOrg()`/`sameOrgWrite()` per §12's own re-run obligation,
+even though this session doesn't modify those helpers themselves) BEFORE
+declaring the rules safe to keep, as manager AND as a non-privileged
+control account, specifically targeting: (a) a non-manager `get()` on a
+superseded version's chunk by known id — must be denied; (b) the same
+`get()` as manager — must succeed; (c) the `isLatest`-filtered list query
+as a non-manager role — must succeed and return only latest versions;
+(d) a bare/unfiltered list as a non-manager role — must be denied.
+
+### 17.5 UI — "📄 Forms" tab, all roles
+
+New tab, visible to every role (unlike Reports/Org/Queue, which are role-
+gated) — added to every branch of `js/main.js getTabs()`. Agent/TL/backend
+view: latest version per form name (from the `isLatest`-filtered list),
+name + file type + size + a Download button (reassembles chunks → `Blob`
+→ saves under the ORIGINAL `fileName`, byte-identical to what was
+uploaded — no filename mangling, no extension guessing). Manager
+additionally gets: an upload control (pick file, type/confirm a form
+name — matching an EXISTING name creates that name's next version,
+anything else creates a new form), full version history per form (all
+versions, newest first, each with its own Download), and version delete
+— manager-only, and explicitly BLOCKED with a clear message when the
+target is the CURRENT latest version ("this is the latest version —
+upload a replacement instead of deleting it"), so a form name can never
+be left with zero versions or a silently-missing latest.
+
+### 17.6 Flagged design decisions (reconciled, not silent)
+
+1. This is a deliberately SEPARATE module/collection from
+   `js/storage/firestore-b64.js`/`submissionDocs` — no shared code, no
+   shared schema — because that pipeline's entire purpose (client-side
+   recompression to JPEG) is incompatible with "the customer must be able
+   to type into this form."
+2. Chunk size is interpreted as ENCODED (base64) bytes, matching
+   `firestore-b64.js`'s own established convention, not literally "700KB
+   of the original file" — see 17.1.
+3. Rules-probe re-run (or an equivalent adversarial extension) is planned
+   for Step 5 specifically because of the chunk-level gate's high stakes
+   (§17.4) — this is this session's OWN standing-protocol trigger, not a
+   re-run of a PRIOR session's finding.
