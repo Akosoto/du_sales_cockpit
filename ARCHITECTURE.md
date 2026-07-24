@@ -1256,25 +1256,37 @@ itself requires.
 
 ### 17.1 Storage — raw bytes, base64-chunked, ≤700KB/chunk (encoded)
 
-5MB file cap; PDF and Excel (`.xlsx`/`.xls`) only — validated on BOTH MIME
-type and file extension (a renamed `.exe` with a spoofed MIME is still
-rejected by extension; a correctly-typed file with a mismatched extension
-is still rejected by MIME) — clear, specific error message for oversize
-or wrong-type, never a generic upload failure.
+**5MB cap is enforced on the RAW file size, pre-encode** (`file.size`,
+before any base64 conversion) — the number a manager actually understands
+("this file is 5MB"), not an encoded-size figure. PDF and Excel
+(`.xlsx`/`.xls`) only — validated on BOTH MIME type and file extension (a
+renamed `.exe` with a spoofed MIME is still rejected by extension; a
+correctly-typed file with a mismatched extension is still rejected by
+MIME) — clear, specific error message for oversize or wrong-type, never a
+generic upload failure.
 
-**Chunk sizing is ENCODED bytes, not raw** — matching
-`js/storage/firestore-b64.js`'s own established precedent (`HARD_CEILING_
-CHARS = 900*1024`, checked against the base64 STRING length, "what
-actually gets stored," not the pre-encoding byte size, since base64
-inflates size ~33%). "≤700KB/chunk" here means each chunk doc's stored
-`data` field (the base64 string) is capped at 700×1024 characters — the
-raw byte-slice fed into each chunk before encoding is therefore
-~525KB (700KB × 3/4), producing a ~700KB encoded string with ~324KB of
-headroom under Firestore's ~1MiB per-document ceiling (MORE headroom than
-firestore-b64's own 900KB/~124KB margin — appropriate here since a SOF
-chunk must reassemble byte-PERFECTLY, unlike a compressed JPEG page that
-can simply be re-captured at a lower quality if oversize). A 5MB file
-needs at most `Math.ceil(5*1024*1024 / (700*1024*3/4)) ≈ 10` chunks.
+**Chunk sizing is arithmetic done ENTIRELY on the ENCODED (base64) string
+length, independent of any other driver in this codebase.** The real
+constraint is Firestore's ~1MiB (1,048,576 byte) hard per-document limit
+— base64 inflates the raw byte count by ~4/3 (~33%), and a per-doc write
+also carries field-name/metadata overhead (`orgId`, `isLatest`, the doc
+path itself) on top of the `data` string. "700KB raw, then encode" would
+produce a ~933KB encoded string — leaving under 100KB of margin for that
+metadata, and pushing over Firestore's cap on exactly the large files the
+5MB allowance exists to support is the one failure mode this design
+cannot tolerate (a write that fails must never be discovered only on a
+manager's largest file). Instead: each chunk's raw byte-slice is sized so
+its ENCODED form lands at ≤700KB (700×1024 = 716,800 characters) —
+`rawChunkBytes = Math.floor(700*1024*3/4)` ≈ 524,288 bytes (512KB) per
+slice, producing a ~700KB encoded string with ~324KB of headroom under
+the 1MiB ceiling for metadata + safety margin. A 5MB file needs at most
+`Math.ceil(5*1024*1024 / 524288) = 10` chunks. This sizing is justified
+purely by Firestore's own per-document limit and this feature's own
+byte-perfect-reassembly requirement — not by analogy to
+`js/storage/firestore-b64.js`'s unrelated 900KB convention (that driver
+chunks ALREADY-recompressed JPEG image pages, a fundamentally different
+and much smaller payload with a different failure mode — a too-large page
+there just gets rejected/re-captured, never silently corrupted).
 
 ### 17.2 Schema
 
@@ -1407,9 +1419,12 @@ be left with zero versions or a silently-missing latest.
    shared schema — because that pipeline's entire purpose (client-side
    recompression to JPEG) is incompatible with "the customer must be able
    to type into this form."
-2. Chunk size is interpreted as ENCODED (base64) bytes, matching
-   `firestore-b64.js`'s own established convention, not literally "700KB
-   of the original file" — see 17.1.
+2. Chunk size is arithmetic on ENCODED (base64) bytes, not the original
+   file's raw bytes — justified independently by Firestore's 1MiB/doc
+   cap and this feature's byte-perfect-reassembly requirement, NOT by
+   analogy to `firestore-b64.js`'s unrelated 900KB convention (a
+   different job — already-recompressed image pages, not raw originals)
+   — see 17.1.
 3. Rules-probe re-run (or an equivalent adversarial extension) is planned
    for Step 5 specifically because of the chunk-level gate's high stakes
    (§17.4) — this is this session's OWN standing-protocol trigger, not a
