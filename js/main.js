@@ -7,6 +7,7 @@ import { renderScriptsSection } from './scripts.js';
 import { renderProductsSection } from './products.js';
 import { renderQueueTab } from './queue.js';
 import { renderReportsTab } from './reports.js';
+import { renderFormsTab } from './forms.js';
 
 // isActiveBackend, client-side mirror of the rules helper of the same name —
 // department is independent of role (a backend coordinator might still be
@@ -20,9 +21,9 @@ function isBackendUser(){ return CP.department === 'backend' && CP.active !== fa
 function getTabs(){
   const r = CP.role;
   const queueTab = (r==='manager' || isBackendUser()) ? [['queue','📥 Queue']] : [];
-  if(r==='manager')   return [['org','🏢 Org & Teams'], ...queueTab, ['dashboard','📊 Dashboard'],['reports','📈 Reports'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
-  if(r==='team_lead') return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
-  return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 My Pipeline'],['scripts','📞 Scripts'],['products','📦 Products']];
+  if(r==='manager')   return [['org','🏢 Org & Teams'], ...queueTab, ['dashboard','📊 Dashboard'],['reports','📈 Reports'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products'],['forms','📄 Forms']];
+  if(r==='team_lead') return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 Pipeline'],['scripts','📞 Scripts'],['products','📦 Products'],['forms','📄 Forms']];
+  return [...queueTab, ['dashboard','📊 Dashboard'],['pipeline','📋 My Pipeline'],['scripts','📞 Scripts'],['products','📦 Products'],['forms','📄 Forms']];
 }
 
 export function renderNav(){
@@ -43,4 +44,5 @@ export function switchTab(id){
   else if(id==='pipeline') renderPipelineTab();
   else if(id==='scripts')  renderScriptsSection();
   else if(id==='products') renderProductsSection();
+  else if(id==='forms')    renderFormsTab();
 }
