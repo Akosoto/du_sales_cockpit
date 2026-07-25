@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<!--
+  tools/seed-synthetic.html — SYNTHETIC HISTORY GENERATOR (test fixture only)
+
+  WHY THIS EXISTS
+  Session C3 builds a forecasting ladder (run-rate -> Holt's linear -> Holt-
+  Winters). Each rung needs a different amount of history to be exercised at
+  all, and the live database holds ~2 months. This page fabricates 24 months
+  of submissions so every rung can be tested, and purges them again.
+
+  WHAT IT PROVES AND DOES NOT PROVE
+  It proves the forecasting CODE runs, aggregates correctly, and degrades at
+  the right thresholds. It does NOT prove any forecast is accurate for this
+  business: the seasonal shape below was chosen by hand, so any model will
+  "discover" exactly what was planted. Do not treat a good fit here as
+  evidence the feature works on real data.
+
+  SAFETY
+  - Every generated doc carries isSynthetic:true. Purge deletes on that flag.
+  - Submissions are written DIRECTLY (not through the app's mutation path), so
+    no rollup increments fire during seeding. Run "Recompute Rollups" in the
+    app after seeding AND after purging.
+  - Synthetic submissions reference EXISTING real leads/companies rather than
+    fabricating them, so the company list and lead pipeline stay clean.
+  - Deterministic: the same seed produces the same dataset every run.
+
+  ============================ VERIFIED AGAINST SCHEMA =======================
+  FIELD_MAP was checked against js/submissions.js (createSubmissions,
+  appendEvent) and js/rollups.js (activationDeltas, transitionDeltas,
+  contributorOf) before this file was committed — see FIELD_MAP's own
+  comment block for the corrections that review found (categoryId->category,
+  familyId removed, events[].ts not .at, timestamps as ISO strings not Date
+  objects, agentName added). If js/submissions.js or js/rollups.js change
+  their field names later, re-check FIELD_MAP against the new source before
+  running again — a wrong name here still produces data that silently
+  aggregates to zero (or, for a timestamp-shape regression, makes synthetic
+  docs invisible to date-range queries without any error at all).
+  ===========================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Synthetic history generator — du Sales Cockpit</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:24px; background:#12151c; color:#dfe4ee;
+         font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  h1 { font-size:17px; margin:0 0 4px; letter-spacing:.02em; }
+  .sub { color:#8a93a6; margin:0 0 20px; }
+  fieldset { border:1px solid #283040; border-radius:6px; padding:14px 16px;
+             margin:0 0 16px; max-width:900px; }
+  legend { color:#9fb0ff; padding:0 6px; font-size:12px; text-transform:uppercase;
+           letter-spacing:.08em; }
+  label { display:inline-block; min-width:230px; color:#a8b1c4; }
+  input { background:#1b2130; color:#dfe4ee; border:1px solid #2f3849;
+          border-radius:4px; padding:5px 7px; width:110px; font:inherit; }
+  button { font:inherit; padding:8px 16px; border-radius:5px; cursor:pointer;
+           border:1px solid #3a4459; background:#212a3a;
+           color:#dfe4ee; margin-right:8px; }
+  button.primary { background:#2b4ea8; border-color:#3a63c9; }
+  button.danger  { background:#5c2230; border-color:#7d2f41; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #log { background:#0d1017; border:1px solid #232b3a; border-radius:6px;
+         padding:12px 14px; max-width:900px; white-space:pre-wrap;
+         max-height:460px; overflow:auto; }
+  .ok { color:#6ee7a8; } .warn { color:#f2c14e; } .err { color:#ff8a8a; }
+  .dim { color:#7c869b; }
+  table { border-collapse:collapse; margin:8px 0; }
+  td,th { padding:2px 12px 2px 0; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+</style>
+</head>
+<body>
+<h1>Synthetic history generator</h1>
+<p class="sub">Fabricates 24 months of submissions so the forecasting ladder can be
+tested. Test fixture only — see the file header before trusting anything it produces.</p>
+
+<fieldset>
+  <legend>Shape of the fabricated business</legend>
+  <div><label>Months of history</label><input id="months" value="24"></div>
+  <div><label>Lines/month now</label><input id="volNow" value="40"></div>
+  <div><label>Lines/month at start</label><input id="volStart" value="16"></div>
+  <div><label>Rejection rate</label><input id="rejRate" value="0.62"></div>
+  <div><label>Recovery rate (of rejected)</label><input id="recRate" value="0.75"></div>
+  <div><label>Random seed</label><input id="seed" value="1974"></div>
+</fieldset>
+
+<fieldset>
+  <legend>Actions</legend>
+  <button id="btnPreview" class="primary">Preview monthly totals</button>
+  <button id="btnSeed">Write synthetic data</button>
+  <button id="btnPurge" class="danger">Purge synthetic data</button>
+  <p class="dim" style="margin:10px 0 0">Preview writes nothing. After seeding or
+  purging, run <strong>Recompute Rollups</strong> in the app — this page bypasses
+  the mutation path on purpose, so counters are stale until you do.</p>
+</fieldset>
+
+<div id="log">Sign-in state unknown. Click Preview to begin.</div>
+
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getAuth, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+import { getFirestore, collection, getDocs, query, where, doc, getDoc, writeBatch, limit }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+import { firebaseConfig } from '../config.js';   // config.js lives at repo root, not js/ — CORRECTED
+
+/* ── FIELD MAP — VERIFIED against js/submissions.js (createSubmissions,
+   appendEvent) and js/rollups.js (activationDeltas, transitionDeltas,
+   contributorOf) before commit. Corrections made from the original draft:
+
+   1. categoryId -> category. Real submissions store this under the field
+      name `category` (js/submissions.js: `category: it.category`), and
+      js/rollups.js's activationDeltas() reads `sub.category` directly for
+      BOTH the byCategory dimension and familyOf(sub.category) (the byFamily
+      dimension). Writing `categoryId` would have zeroed out both.
+   2. familyId REMOVED from the write payload. js/rollups.js never reads a
+      `familyId` field from a submission — family is ALWAYS derived from
+      `category` via the org's live category config (familyResolverFrom /
+      currentFamilyResolver, called by both js/rollups.js and appendEvent).
+      A `familyId` field on the doc would simply be inert. The intended
+      family mix (MIX below) is instead achieved by picking a PRODUCT whose
+      `category` maps to the target family via orgs/{orgId}.categories[]
+      (see loadContext()'s productsByFamily grouping, used in makeLine())
+      — products do NOT carry their own familyId field (confirmed against
+      js/products.js: product docs have `category` only; familyId lives on
+      the ORG-CONFIG's categories[] array, keyed by category id).
+   3. agentName added. contributorOf() (js/rollups.js) falls back to
+      'Unknown' for any line missing it — numbers stay correct without it,
+      but every contributor label would render wrong.
+   4. events[].ts, not .at (js/submissions.js stamps `ts` on every event;
+      js/rollups.js's transitionDeltas()/submissionContribution() read
+      `event.ts` directly and monthKey() THROWS on an invalid timestamp —
+      this would have crashed Recompute Rollups over the synthetic data,
+      not just zeroed it). Extra per-event data (e.g. a rejection reason)
+      is wrapped in `payload: {...}`, matching the real shape exactly —
+      js/submissions.js never spreads extra fields directly onto an event.
+
+   If a name here is wrong, seeded data aggregates to zero (or, for #4,
+   the recompute tool throws) — the failure is quiet for most of these, so
+   this map is checked against the source on every change, not assumed.   */
+const FIELD_MAP = {
+  agentId:        'agentId',        // credited seller (roleMetrics/contributorOf keys on this)
+  agentName:      'agentName',      // contributorOf() display fallback ('Unknown' if absent)
+  teamId:         'teamId',         // byTeam rollup dimension
+  category:       'category',       // byCategory dimension AND drives familyOf(sub.category) for
+                                     //   byFamily — NOT categoryId, and there is no separate
+                                     //   familyId field on real submissions (see note above)
+  productId:      'productId',
+  mrc:            'mrc',            // AED value of the line
+  qty:            'qty',
+  status:         'status',
+  createdAt:      'createdAt',
+  claimedAt:      'claimedAt',
+  submittedToDuAt:'submittedToDuAt',
+  activatedAt:    'activatedAt',
+  rejectedAt:     'rejectedAt',
+  events:         'events',         // [{type, actorId, actorName, ts, payload}] — ts not at,
+                                     //   extras wrapped in payload, matching js/submissions.js exactly
+  bundleId:       'bundleId',
+  leadId:         'leadId',
+  companyId:      'companyId',
+  sourcedBy:      'sourcedBy',
+  accTransfer:    'accTransfer',
+  transferStatus: 'transferStatus',
+  orgId:          'orgId'
+};
+
+/* ── SEASONAL SHAPE (hand-chosen; this is the pattern models will "find") ──
+   UAE B2B telecom rhythm: new budgets in Jan, Ramadan/Eid slowdown in spring,
+   summer exodus, strong Sep-Nov recovery, mixed December.
+   DELIBERATE SIMPLIFICATION: Ramadan moves ~11 days earlier each year, so a
+   fixed month multiplier is wrong in reality. It's used here because
+   Holt-Winters assumes fixed monthly seasonality — meaning this fixture is
+   KINDER to the model than real data will be. Expect live accuracy to be
+   worse, and say so in the UI.                                              */
+const SEASON = [1.10,1.05,0.85,0.80,1.00,0.90,0.65,0.60,1.15,1.20,1.15,0.95];
+
+/* Family mix by LINE COUNT. Fixed is a minority of lines but most of the
+   value — that asymmetry is the point, it's what makes per-family forecasts
+   behave differently from each other. */
+const MIX = [
+  { family:'fixed',  share:0.35, minMrc:800, maxMrc:5000,  whaleChance:0.06, whaleMax:25000 },
+  { family:'sim',    share:0.55, minMrc:300, maxMrc:1500,  prepaidChance:0.08 },
+  { family:'others', share:0.10, minMrc:100, maxMrc:800 }
+];
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+const logEl = document.getElementById('log');
+let me = null, ctx = null;
+
+const log  = (msg, cls='') => { logEl.innerHTML += `\n<span class="${cls}">${msg}</span>`;
+                                logEl.scrollTop = logEl.scrollHeight; };
+const clear = () => logEl.innerHTML = '';
+const num = id => parseFloat(document.getElementById(id).value);
+
+/* Deterministic RNG (mulberry32) — same seed, same dataset, every run. */
+function rng(seed){ return function(){ seed|=0; seed=seed+0x6D2B79F5|0;
+  let t=Math.imul(seed^seed>>>15,1|seed); t=t+Math.imul(t^t>>>7,61|t)^t;
+  return ((t^t>>>14)>>>0)/4294967296; }; }
+const pick = (r,arr) => arr[Math.floor(r()*arr.length)];
+const between = (r,a,b) => a + r()*(b-a);
+
+onAuthStateChanged(auth, u => {
+  me = u;
+  clear();
+  log(u ? `Signed in as ${u.email}` : 'Not signed in — open the app, sign in as manager, then reload this page.',
+      u ? 'ok' : 'warn');
+});
+
+/* Loads the real org context: agents, teams, categories, and a pool of real
+   leads to attach synthetic submissions to. */
+async function loadContext(){
+  if (ctx) return ctx;
+  const users = (await getDocs(collection(db,'users'))).docs.map(d=>({id:d.id,...d.data()}));
+  const sellers = users.filter(u => (u.role==='agent'||u.role==='team_lead') && u.active!==false);
+  if (!sellers.length) throw new Error('No active agents or team leads found.');
+
+  const products = (await getDocs(collection(db,'products'))).docs.map(d=>({id:d.id,...d.data()}));
+  const leads = (await getDocs(query(collection(db,'leads'), limit(300)))).docs
+                  .map(d=>({id:d.id, companyId:d.data().companyId}));
+  if (!leads.length) throw new Error('No leads found to attach submissions to.');
+
+  const orgId = users.find(u=>u.id===me.uid)?.orgId;
+  if (!orgId) throw new Error('Signed-in user has no orgId.');
+
+  /* Product docs do NOT carry their own familyId (verified against
+     js/products.js — they only carry `category`). Family lives on
+     orgs/{orgId}.categories[] as {id, label, familyId}, keyed by category
+     id (same shape js/rollups.js's familyResolverFrom consumes). Products
+     are grouped by resolved family HERE, once, rather than re-filtering
+     per line. Any category with no familyId set falls back to 'others',
+     matching js/orgConfig.js DEFAULT_FAMILY_MAPPING's own fallback. */
+  const orgSnap = await getDoc(doc(db,'orgs',orgId));
+  const categories = orgSnap.exists() ? (orgSnap.data().categories||[]) : [];
+  const familyByCategory = {};
+  categories.forEach(cat => { if (cat && cat.id) familyByCategory[cat.id] = cat.familyId || 'others'; });
+
+  const productsByFamily = {};
+  products.forEach(p => {
+    const fam = familyByCategory[p.category] || 'others';
+    (productsByFamily[fam] ||= []).push(p);
+  });
+  MIX.forEach(band => {
+    if (!productsByFamily[band.family]?.length) {
+      log(`Warning: no product found for family "${band.family}" (checked ${products.length} products against ${categories.length} org categories) — lines targeting this family will fall back to a random product, breaking the intended family mix.`, 'warn');
+    }
+  });
+
+  /* Skill weighting: real teams are not uniform. Some sellers close more than
+     others, consistently — without this, per-agent forecasts look
+     unrealistically identical and the "per-agent is statistically weak"
+     warning never gets exercised. */
+  const r = rng(num('seed'));
+  sellers.forEach(s => s._weight = between(r, 0.5, 1.8));
+
+  ctx = { sellers, products, productsByFamily, leads, orgId };
+  log(`Context: ${sellers.length} sellers, ${products.length} products, ${leads.length} leads, `+
+      `${categories.length} categories, org ${orgId}`, 'dim');
+  return ctx;
+}
+
+/* Builds the full dataset in memory. Pure — writes nothing. */
+async function build(){
+  const c = await loadContext();
+  const months = num('months'), volNow = num('volNow'), volStart = num('volStart');
+  const rejRate = num('rejRate'), recRate = num('recRate');
+  const r = rng(num('seed'));
+  const now = new Date();
+  const rows = [], perMonth = [];
+
+  for (let back = months - 1; back >= 0; back--) {
+    const anchor = new Date(now.getFullYear(), now.getMonth() - back, 1);
+    const m = anchor.getMonth();
+    const progress = (months - 1 - back) / Math.max(1, months - 1);
+    const trend = volStart + (volNow - volStart) * progress;
+    const noise = between(r, 0.88, 1.12);          // month-to-month randomness
+    const count = Math.max(1, Math.round(trend * SEASON[m] * noise));
+
+    let activated = 0, aed = 0;
+    for (let i = 0; i < count; i++) {
+      const row = makeLine(r, c, anchor, rejRate, recRate);
+      rows.push(row);
+      if (row.status === 'activated') { activated++; aed += row.mrc; }
+    }
+    perMonth.push({
+      label: `${anchor.getFullYear()}-${String(m+1).padStart(2,'0')}`,
+      lines: count, activated, aed: Math.round(aed)
+    });
+  }
+  return { rows, perMonth };
+}
+
+/* One submission line, with a plausible event timeline. */
+function makeLine(r, c, anchor, rejRate, recRate){
+  const seller = weightedSeller(r, c.sellers);
+  const band   = weightedFamily(r);
+  // Product docs carry `category`, not their own familyId (js/products.js) —
+  // pick from the pre-grouped productsByFamily map (built in loadContext()
+  // from orgs/{orgId}.categories[].familyId), falling back to any product
+  // only if the org genuinely has none in this family (already warned about
+  // in loadContext()).
+  const familyProducts = c.productsByFamily[band.family];
+  const product = (familyProducts && familyProducts.length) ? pick(r, familyProducts) : pick(r, c.products);
+  const lead   = pick(r, c.leads);
+
+  // Deal value: log-normal-ish, with occasional whales in fixed.
+  let mrc = Math.round(between(r, band.minMrc, band.maxMrc) * between(r, 0.75, 1.35));
+  if (band.whaleChance && r() < band.whaleChance) mrc = Math.round(between(r, band.maxMrc, band.whaleMax));
+  if (band.prepaidChance && r() < band.prepaidChance) mrc = 0;   // prepaid: counted, zero value
+
+  // Timeline: created -> claimed -> submitted to du -> outcome.
+  const created   = new Date(anchor.getFullYear(), anchor.getMonth(), 1 + Math.floor(r()*27),
+                             9 + Math.floor(r()*8), Math.floor(r()*60));
+  const claimed   = addDays(created, between(r, 0.1, 3));
+  const submitted = addDays(claimed,  between(r, 0.5, 5));
+
+  // Event shape matches js/submissions.js EXACTLY: {type, actorId, actorName,
+  // ts, payload} — ts (not at), extras wrapped in payload (not spread bare).
+  // js/rollups.js reads event.ts directly and monthKey() throws on an
+  // invalid timestamp, so this is not cosmetic. 'activated' is left without
+  // an actor (no synthetic "backend staffer" concept is modeled here, and
+  // rollups.js never reads event.actorId/actorName anyway) — matches the
+  // real schema's SHAPE, just with an absent actor, not a wrong one.
+  //
+  // Every timestamp is converted to an ISO STRING (iso()) at this boundary,
+  // never left as a native JS Date. js/helpers.js's now() — the ONLY way any
+  // real submission ever gets a timestamp — returns `.toISOString()`, a
+  // plain string; every real document's createdAt/claimedAt/…/events[].ts is
+  // a string. Firestore auto-converts a raw JS Date argument into a native
+  // Timestamp on write, a DIFFERENT stored type from every real doc's string
+  // fields. That mismatch is silent until a range query runs: Firestore's
+  // where('field','>=', isoString) bounds only match STRING-typed field
+  // values — a Timestamp-typed field is excluded from that comparison
+  // entirely, so synthetic docs would be invisible to every date-range query
+  // in the app (js/dashboardData.js's presets/custom ranges, Reports) even
+  // though they'd still appear in a bare unfiltered scan.
+  const events = [{ type:'created', actorId: seller.id, actorName: seller.name||'Unknown', ts: iso(created), payload:{} }];
+  let status = 'activated', activatedAt = null, rejectedAt = null;
+
+  const wasRejected = r() < rejRate;
+  let duStart = submitted;
+  if (wasRejected) {
+    rejectedAt = addDays(submitted, between(r, 2, 12));
+    events.push({ type:'rejected', actorId: null, actorName: null, ts: iso(rejectedAt), payload: { reason: pick(r, REJECT_REASONS) } });
+    if (r() < recRate) {
+      const resubmit = addDays(rejectedAt, between(r, 0.5, 6));
+      events.push({ type:'resubmit', actorId: seller.id, actorName: seller.name||'Unknown', ts: iso(resubmit), payload:{} });
+      duStart = resubmit;
+    } else {
+      status = 'rejected';                  // never recovered
+    }
+  }
+  if (status === 'activated') {
+    activatedAt = addDays(duStart, between(r, 3, 21));
+    events.push({ type:'activated', actorId: null, actorName: null, ts: iso(activatedAt), payload:{} });
+  }
+
+  const sourced  = r() < 0.12;
+  const transfer = r() < 0.15;
+
+  return {
+    agentId: seller.id, agentName: seller.name||'Unknown', teamId: seller.teamId || null,
+    category: product?.category || null, productId: product?.id || null,
+    mrc, qty: 1, status,
+    createdAt: iso(created), claimedAt: iso(claimed), submittedToDuAt: iso(submitted),
+    activatedAt: iso(activatedAt), rejectedAt: iso(rejectedAt), events,
+    leadId: lead.id, companyId: lead.companyId || null,
+    sourcedBy: sourced ? { flag:true, partnerName: pick(r, PARTNERS) } : { flag:false, partnerName:'' },
+    accTransfer: transfer ? { flag:true, fromPartner: pick(r, PARTNERS) } : { flag:false, fromPartner:'' },
+    transferStatus: transfer ? pick(r, ['pending','completed','completed','rejected']) : null,
+    orgId: c.orgId
+  };
+}
+
+const REJECT_REASONS = ['Trade licence expired','Signature mismatch','Emirates ID unclear',
+  'Wrong plan code','Missing stamp','Account transfer refused','Duplicate request'];
+const PARTNERS = ['Gulf Link Telecom','Nexa Business Services','Al Rams Trading','Orbit Connect'];
+
+function weightedSeller(r, sellers){
+  const total = sellers.reduce((s,x)=>s+x._weight,0);
+  let t = r()*total;
+  for (const s of sellers) { t -= s._weight; if (t<=0) return s; }
+  return sellers[0];
+}
+function weightedFamily(r){
+  let t = r();
+  for (const b of MIX) { t -= b.share; if (t<=0) return b; }
+  return MIX[0];
+}
+const addDays = (d,n) => new Date(d.getTime() + n*86400000);
+// Every stored timestamp must be a plain ISO string, matching js/helpers.js's
+// now() — never a native JS Date (see the long comment in makeLine()). null
+// passes through unchanged (activatedAt/rejectedAt are legitimately null on
+// a line that hasn't reached that state).
+const iso = d => d == null ? null : d.toISOString();
+
+/* ── Actions ─────────────────────────────────────────────────────────────── */
+
+document.getElementById('btnPreview').onclick = async () => {
+  clear();
+  try {
+    log('Building preview — nothing is written.', 'dim');
+    const { rows, perMonth } = await build();
+    let html = '\n<table><tr><th>Month</th><th>Lines</th><th>Activated</th><th>AED</th></tr>';
+    perMonth.forEach(m => html += `<tr><td>${m.label}</td><td>${m.lines}</td><td>${m.activated}</td><td>${m.aed.toLocaleString()}</td></tr>`);
+    log(html + '</table>');
+    const totalAed = perMonth.reduce((s,m)=>s+m.aed,0);
+    log(`${rows.length} lines across ${perMonth.length} months · ${totalAed.toLocaleString()} AED activated total`, 'ok');
+    log('Check the seasonal shape looks like your real year before writing.', 'warn');
+  } catch (e) { log('Preview failed: ' + e.message, 'err'); }
+};
+
+document.getElementById('btnSeed').onclick = async () => {
+  if (!me) return log('Sign in first.', 'err');
+  if (!confirm('Write synthetic submissions to the live database?')) return;
+  clear();
+  try {
+    const { rows } = await build();
+    log(`Writing ${rows.length} synthetic submissions…`, 'dim');
+    let written = 0;
+    for (let i = 0; i < rows.length; i += 400) {         // 500-write batch cap
+      const batch = writeBatch(db);
+      rows.slice(i, i+400).forEach(row => {
+        const ref = doc(collection(db,'submissions'));
+        batch.set(ref, { ...row, bundleId: ref.id, isSynthetic: true });
+      });
+      await batch.commit();
+      written += Math.min(400, rows.length - i);
+      log(`  ${written}/${rows.length}`, 'dim');
+    }
+    log(`Done. ${written} synthetic submissions written.`, 'ok');
+    log('Now run "Recompute Rollups" (blank = all months) in the app.', 'warn');
+  } catch (e) { log('Seeding failed: ' + e.message, 'err'); }
+};
+
+document.getElementById('btnPurge').onclick = async () => {
+  if (!me) return log('Sign in first.', 'err');
+  if (!confirm('Delete every submission flagged isSynthetic?')) return;
+  clear();
+  try {
+    /* LIST query on submissions filtered by isSynthetic. Provable via the
+       manager clause in the submissions read rule (request-time role() check,
+       independent of resource.data) — same shape the queue and reports use.
+       Must be run as MANAGER: delete is manager-only. */
+    const snap = await getDocs(query(collection(db,'submissions'), where('isSynthetic','==',true)));
+    if (snap.empty) return log('Nothing to purge — no synthetic submissions found.', 'ok');
+    log(`Deleting ${snap.size} synthetic submissions…`, 'dim');
+    const docs = snap.docs;
+    for (let i = 0; i < docs.length; i += 400) {
+      const batch = writeBatch(db);
+      docs.slice(i, i+400).forEach(d => batch.delete(d.ref));
+      await batch.commit();
+      log(`  ${Math.min(i+400, docs.length)}/${docs.length}`, 'dim');
+    }
+    log('Purge complete.', 'ok');
+    log('Run "Recompute Rollups" again to restore counters to real data only.', 'warn');
+  } catch (e) { log('Purge failed: ' + e.message, 'err'); }
+};
+</script>
+</body>
+</html>
