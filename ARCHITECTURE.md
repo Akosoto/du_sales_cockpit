@@ -1238,7 +1238,7 @@ numbers, not a report against itself.
   `{linesSubmitted:1, everything else 0}`, the true pre-session baseline.
   Reports tab re-rendered clean against the restored baseline.
 
-## 17. Session S1 — SOF Template Library (IN PROGRESS)
+## 17. Session S1 — SOF Template Library (shipped)
 
 **Purpose:** managers upload blank Service Order Forms (fillable PDF or
 Excel the CUSTOMER must be able to type into — fidelity is the point, not
@@ -1363,9 +1363,10 @@ empirically confirmed for submissions/rollups (§12). Provability comment
 required on every query per this session's own instruction — written at
 each call site, not just here.
 
-### 17.4 Rules (Step 5 — PAUSE POINT)
+### 17.4 Rules (Step 5 — published, verified live)
 
-Expected shape (refined during Step 5, not relitigated here): `sofTemplates`
+As shipped (matched the "expected shape" below exactly, no refinement
+needed): `sofTemplates`
 and its `chunks` subcollection are FIELD-orgId collections (orgId stamped
 on every write, `sameOrg()`/`sameOrgWrite()` — the submissions/rollups
 pattern, not the key-matched `orgs/` pattern, since there are many docs
@@ -1394,6 +1395,10 @@ superseded version's chunk by known id — must be denied; (b) the same
 `get()` as manager — must succeed; (c) the `isLatest`-filtered list query
 as a non-manager role — must succeed and return only latest versions;
 (d) a bare/unfiltered list as a non-manager role — must be denied.
+
+**All four confirmed live** (`tools/sof-rules-probe.html`, Step 5) and
+**re-confirmed against a fresh fixture during Step 6's regression** — see
+§17.7.
 
 ### 17.5 UI — "📄 Forms" tab, all roles
 
@@ -1429,3 +1434,66 @@ be left with zero versions or a silently-missing latest.
    for Step 5 specifically because of the chunk-level gate's high stakes
    (§17.4) — this is this session's OWN standing-protocol trigger, not a
    re-run of a PRIOR session's finding.
+
+### 17.7 Regression (Step 6 — the byte-identity gate is pass/fail)
+
+**Byte-identity, both file types, genuinely valid content (not just bytes
+with the right extension):**
+- A hand-constructed fillable PDF — parsed and confirmed by `pdfjs-dist`
+  (the SAME pinned version `js/documents.js` already uses) BEFORE upload:
+  1 page, one real AcroForm text field (`CustomerName`) with its value
+  correctly readable via `pdf.js`'s `getFieldObjects()`. Uploaded (799
+  bytes), downloaded, SHA-256 of both sides compared:
+  `1ba82989791ab5607dfe3d4a3628f87ec10a0f5593c7bc35c82804e8121d209b` ==
+  `1ba82989791ab5607dfe3d4a3628f87ec10a0f5593c7bc35c82804e8121d209b`.
+  **Match.**
+- A real XLSX built and validated with SheetJS (`xlsx` from CDN) — written,
+  then independently re-read back through the SAME library to confirm it
+  parses as a genuine workbook before ever touching this feature. Uploaded
+  (16,149 bytes), downloaded, SHA-256 compared:
+  `a984d3207446c556ba966fab344770d767a16e3fbe79eeb5a62199064acb4e88` ==
+  `a984d3207446c556ba966fab344770d767a16e3fbe79eeb5a62199064acb4e88`.
+  **Match.**
+
+**Versioning + the chunk gate, re-confirmed against a fresh fixture:**
+uploaded v2 of the fillable form (distinct field value, so v1's specific
+bytes stay independently checkable) — manager's list correctly showed
+both versions (v1 superseded, v2 latest); manager downloaded v1
+byte-perfect (SHA-256 match against the original, independent of the v3
+fixture already used in Step 5). Switched to team_lead: Forms tab showed
+ONLY v2 (and the Excel's only version), no upload/history controls in the
+DOM; `isLatest`-filtered list returned exactly those 2 docs; direct
+`get()` on v1's PARENT and on v1's CHUNK-0 by known id both correctly
+**DENIED**; the SAME chunk-0 on v2 (still latest) correctly readable —
+the critical property from Step 5 holds after a full upload/version/
+delete cycle, not just at initial publish.
+
+**Reject cases:** a 6MB file and a `.docx` were both rejected with clear,
+specific error messages — at the raw `validateSofFile()` level AND
+through the actual upload modal UI (toast shows the same message,
+no Firestore doc created for the rejected attempt, confirmed via a
+direct query).
+
+**Delete guards, re-confirmed:** `deleteSofVersion()` on the current
+latest correctly threw before touching Firestore at all
+("upload a replacement instead of deleting it"); deleting a superseded
+version correctly removed the parent AND every one of its chunks
+(confirmed via the codebase's established get-on-nonexistent-doc pattern
+— a `getDoc()` on the deleted docs came back `permission-denied` rather
+than a clean `exists()===false`, exactly as documented elsewhere in this
+file for this rule shape).
+
+**Cross-cutting smoke, both roles, zero console errors the entire
+session:** Dashboard, Pipeline, Reports (manager), Queue (manager) all
+rendered cleanly. (A team_lead's forced `switchTab('queue')` correctly
+surfaced a clean "Missing or insufficient permissions" error — expected,
+since Queue is gated to manager/backend department in `js/main.js`
+`getTabs()` and this session changed nothing about that; the nav itself
+never offers a team_lead this tab in normal use.)
+
+**Cleanup:** every test template (the Step 5 fixture AND the Step 6
+fixture, across two separate cleanup passes as each stage's testing
+concluded) deleted via direct parent+chunk removal; `sofTemplates`
+verified back to **0 documents** after each pass, and the Forms tab
+re-rendered the clean "No forms uploaded yet." empty state for both
+roles.

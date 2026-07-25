@@ -151,6 +151,27 @@ js/reports.js         — (Session C2) manager-only Reports tab: Live Daily Team
                         filters, CSV export), Rejection Analytics (rollup-sourced monthly trend +
                         a live rejectedAt-range scan: top reasons, by team/agent/family, recovery
                         rate, avg resubmit count, CSV export). No schema/rules/index changes.
+js/sofTemplates.js    — (Session S1) SOF Template Library core: RAW original file bytes,
+                        base64-chunked (arithmetic on the ENCODED string, ≤700KB/chunk — Firestore's
+                        1MiB/doc cap plus metadata headroom, justified on its own terms, NOT an echo
+                        of firestore-b64.js's unrelated 900KB convention). validateSofFile (5MB raw
+                        cap, extension+MIME both directions, rejects empty), uploadSofTemplate (one
+                        atomic batch: new version's parent+chunks, plus flipping isLatest:false on
+                        the prior latest parent+chunks if one exists — via db.js's EXISTING
+                        batchAdd/batchSet/batchUpdate, reusing Firestore's native slash-path support
+                        for the chunks subcollection, no gateway changes), downloadSofTemplate
+                        (direct chunk gets by index, never a list query, byte-identical
+                        reassembly), deleteSofVersion (manager-only, blocked outright on the current
+                        latest). fetchLatestForms (isLatest-filtered, all roles) and
+                        fetchAllTemplatesForManager (bare, manager-only) are the only two list
+                        queries this feature ever runs.
+js/forms.js            — (Session S1) "📄 Forms" tab, ALL roles (unlike Reports/Org/Queue). Every
+                        role: latest-version-per-form list + Download. Manager additionally: one
+                        query per tab load supplies BOTH the latest view AND every form's version
+                        history from the same in-memory dataset (upload modal with name-collision
+                        detection reusing that list, no extra query; per-form version history
+                        modal; delete blocked on the current latest, both via a disabled button and
+                        deleteSofVersion's own guard).
 js/dashboardCharts.js — renderDonutCard: dependency-free hand-rolled SVG donut (stroke-dasharray
                         arcs), AED/count mode, empty state
 js/dashboardCards.js  — renderRoleMetricsSection: sales-agent + backend role-metrics cards, KAM/
@@ -657,6 +678,53 @@ tool (`js/org.js` "🧮 Recompute Rollups") which replays each submission's `eve
 transition logic and reports drift before overwriting. See Firestore Security Rules below and the Session C1
 phase entry.
 
+### `sofTemplates` (NEW, Session S1, ARCHITECTURE.md §17) — SOF Template Library
+```
+sofTemplates/{id}              // one PARENT doc per uploaded VERSION, not per form name
+{
+  name,                        // form's display name, free text — case-insensitively matched
+                                //   (js/sofTemplates.js normSofName) to find the current latest
+                                //   version to supersede; a NEW name creates a brand-new form
+  fileName,                    // original filename, kept verbatim for download
+  fileType,                    // 'pdf' | 'xlsx' | 'xls'
+  version,                     // int, PER-NAME sequence (1, 2, 3, …)
+  isLatest,                    // true on exactly one version per name at a time
+  sizeBytes,                   // original RAW file size (pre-encode)
+  chunkCount,                  // N — chunks fetched by direct index 0..N-1, NEVER a list query
+  orgId,                       // field-orgId collection (sameOrg()/sameOrgWrite(), like submissions/
+                                //   rollups) — NOT key-matched like orgs/
+  createdBy, createdAt, lastEditedBy, lastEditedAt   // db.js gateway's standard audit fields
+}
+sofTemplates/{id}/chunks/{n}   // subcollection, n = 0..chunkCount-1, doc id literally "chunk-{n}"
+{
+  data,                        // base64 string, ≤700KB — the arithmetic is done ENTIRELY on this
+                                //   ENCODED length, not the original file's raw bytes (Firestore's
+                                //   ~1MiB/doc cap plus per-doc metadata headroom is the actual
+                                //   constraint — deliberately NOT an echo of firestore-b64.js's
+                                //   unrelated 900KB convention, a different job: already-
+                                //   recompressed image pages, not raw originals)
+  orgId,                       // denormalized — a chunk get() never re-reads its parent
+  isLatest                     // DENORMALIZED from the parent, flipped in the SAME batch that
+                                //   supersedes a version — THE load-bearing rules gate (below);
+                                //   without this, a non-manager who obtained a superseded
+                                //   version's parent id could still reassemble its bytes
+                                //   chunk-by-chunk even though it never appears in any listing
+}
+```
+RAW original file bytes only — deliberately NOT `js/storage/firestore-b64.js`'s pipeline (that
+driver client-side recompresses to JPEG image pages, which would destroy a fillable form's actual
+field structure, the opposite of this feature's purpose). 5MB cap on the raw file, pre-encode;
+PDF and Excel (`.xlsx`/`.xls`) only, validated on both extension and MIME. Upload is one atomic
+`writeBatch` (new version's parent+chunks, plus flipping the prior latest's `isLatest` on both its
+parent and every one of its chunks, if one exists) — never partially applied.
+
+Reads: `fetchLatestForms()` — `where('isLatest','==',true)`, the one list query every non-manager
+role's Forms tab needs, provable because the filter matches the read rule's own non-manager
+condition exactly. `fetchAllTemplatesForManager()` — bare/unfiltered, manager-only, provable via the
+manager clause's request-time-only `role()` escape; supplies BOTH the latest-per-form view and every
+form's version history from one query. Chunk reassembly is always a direct `get()` by known index,
+never a list query. See Firestore Security Rules below and the Session S1 phase entry.
+
 ---
 
 ## Pipeline Stages
@@ -818,7 +886,7 @@ acting manager's own `orgId` immediately, and every subsequent collection's `sam
 then compare a real orgId against still-unmigrated docs and fail closed, silently locking the
 migration out of everything after `users`.
 
-All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, twelve collections:
+All rules changes have been treated with extra care after one earlier bug (a fragile secondary `tlId` lookup was replaced with a direct `teamId` comparison). Current state, thirteen collections:
 
 | Collection | Read | Write |
 |---|---|---|
@@ -833,6 +901,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 | `submissions` (v2 schema) | Manager; the submitting agent (`agentId`); their TL (`teamId` match); anyone in the backend department | Create: must set `agentId` to self; update: manager or backend-department unrestricted, OR the submitting agent ONLY when `status=='rejected'` moving to `'pendingVerification'` (the resubmit correction-loop, now built end-to-end as Fix & Resubmit — Phase D); **delete: manager-only, no exception even for the creator** (accountability — order records stay in the system for review, e.g. a suspected-fake document upload, rather than being quietly removable) |
 | `submissionDocs` (firestore-b64 driver, ARCHITECTURE.md §6) | Same four parties as `submissions` — manager; `agentId==self`; their TL (`teamId` match); backend department (fields denormalized onto every page doc for exactly this reason) | Create: the uploading agent (`agentId==self`), a manager, **or (Phase D) active backend department staff** attaching an additional document to someone else's bundle (the page's `agentId` stays the ORIGINAL submitting agent's, not the backend uploader's — `isActiveBackend()` is what actually authorizes that write, since `agentId==self` can't); **no update at all** — pages are immutable, replacing a doc means writing the NEXT version as a new create (Fix & Resubmit, Phase D); delete: manager-only (matches the retention sweep's own gate) |
 | `rollups` (Session C1, ARCHITECTURE.md §15) | Any auth, same org | Create + update: any auth, same org — write-time increments ride BOTH the agent's submission-create batch AND a backend user's activation transaction, so neither can be narrowed to one role (client-trust on counter values is the documented §15.5 tradeoff, correctable via the recompute tool); delete: manager-only. Field-orgId collection (`orgId` stamped first in every `applyRollupDeltas` payload, so the set-merge CREATE of a brand-new month passes `sameOrgWrite()`); never list-queried (single-doc `getDoc` by key) → no composite index |
+| `sofTemplates` + its `chunks` subcollection (Session S1, ARCHITECTURE.md §17) | Manager: any. Every other role: ONLY where `resource.data.isLatest == true` — gated independently on BOTH the parent AND each chunk, since a chunk `get()` never re-reads or re-checks its parent | Create/update/delete: manager only, full stop — no non-manager mutation path exists at all. Field-orgId collection (`sameOrg()`/`sameOrgWrite()`, like submissions/rollups). The chunk-level `isLatest` gate is the load-bearing piece (adversarially verified live, `tools/sof-rules-probe.html`: a non-manager `get()` on a superseded version's chunk by known id is denied, even though it never appears in any listing they can run) |
 | `auditLog` | Manager only | Create: any auth, `sameOrgWrite()` (the gateway writes these on every mutation); update/delete: **never**, always `false` — append-only |
 
 **Key implementation notes:**
@@ -1542,6 +1611,58 @@ net — the resulting drift report reversed exactly the fixture's footprint, res
 Pricing, Dashboard, Recompute Rollups); non-manager tab visibility confirmed by code inspection
 (`getTabs()`'s manager-only branch, matching the Org tab's own gating). Zero console errors across
 the session. See `ARCHITECTURE.md` §16.7.
+
+### Session S1 (shipped) — SOF Template Library
+Per `ARCHITECTURE.md` §17. Managers upload blank Service Order Forms (fillable PDF/Excel the
+CUSTOMER must be able to type into — fidelity is the point); every role sees and downloads only the
+LATEST version of each named form; managers additionally get full version history and can delete a
+superseded version. New `js/sofTemplates.js` (core storage engine) + `js/forms.js` (the "📄 Forms"
+tab, all roles) — see the File Structure section above for both. Deliberately a separate mechanism
+from `js/storage/firestore-b64.js`/`submissionDocs`: that pipeline client-side recompresses to JPEG
+image pages, which would destroy a fillable form's actual field structure.
+
+**Storage:** raw original file bytes, base64-chunked at ≤700KB per chunk — the arithmetic is done
+entirely on the ENCODED string length (not the original file's raw bytes), justified purely by
+Firestore's ~1MiB/doc cap plus per-chunk metadata headroom, deliberately NOT by analogy to
+`firestore-b64.js`'s unrelated 900KB convention (a different job — already-recompressed image
+pages, not raw originals). 5MB cap on the raw file size; PDF and Excel (`.xlsx`/`.xls`) only,
+validated on both extension and MIME, with a specific error for each rejection case. Upload is one
+atomic `writeBatch` via `db.js`'s existing gateway (`batchAdd`/`batchSet`/`batchUpdate` — no gateway
+changes needed, since Firestore's `doc()`/`collection()` accept a slash-joined subcollection path
+string identically to explicit multi-segment arguments, verified live): the new version's parent +
+all its chunks, plus flipping `isLatest:false` on the prior latest version's parent AND every one of
+its chunks if one exists, never partially applied.
+
+**Reads:** chunk fetch is always a direct `get()` by index (`chunk-0..chunk-(N-1)`), never a list
+query. The only two list queries the whole feature ever runs: `fetchLatestForms()`
+(`where('isLatest','==',true)`, all roles — provable because the filter matches the read rule's own
+non-manager condition exactly) and `fetchAllTemplatesForManager()` (bare/unfiltered, manager-only —
+one query supplies both the latest-per-form view and every form's version history from the same
+in-memory dataset).
+
+**Rules (published, adversarially verified live, not just reasoned about):** manager → unrestricted
+read/write; every other role → read-only, gated independently on isLatest on BOTH the parent and
+each chunk (the chunk gate is the load-bearing piece, since a chunk `get()` never re-checks its
+parent). New `tools/sof-rules-probe.html`, mirroring `tools/rules-probe.html`'s standalone-page
+pattern, purpose-built for this collection's critical property. Run live against a real 3-version
+fixture: manager could read/write everything; a team_lead control account was correctly denied a
+bare list, correctly allowed the `isLatest`-filtered list (returning only the true latest), and —
+the critical case — correctly DENIED a direct `get()` on a superseded version's chunk by known
+parent id, while the SAME chunk on the current latest was correctly readable.
+
+**Regression (Step 6, the byte-identity gate):** a hand-constructed fillable PDF (validated by
+`pdfjs-dist` — the same pinned version this app already uses — confirming a real AcroForm field
+before upload) and a real XLSX (validated by SheetJS, round-tripped through its own parser before
+upload) were each uploaded and downloaded; SHA-256 of the original and the downloaded bytes matched
+EXACTLY for both. Versioning and the chunk-gate denial were re-confirmed against a fresh v1/v2
+fixture post-Step-5 (not just relied on from the earlier run). Reject cases (6MB file, `.docx`) both
+failed cleanly with specific errors, at the raw validator AND through the real upload UI, with no
+Firestore doc created for either rejected attempt. Delete guards re-confirmed: blocked outright on
+the current latest (both the UI's disabled button and a direct call to the underlying function),
+succeeded on a superseded version (parent + all chunks confirmed gone). Dashboard/Pipeline/Reports/
+Queue all smoke-tested clean for both roles, zero console errors across the whole session. All test
+fixtures (Step 5's and Step 6's, in two separate passes) fully cleaned up — `sofTemplates` verified
+back to 0 documents each time. See `ARCHITECTURE.md` §17.7.
 
 ---
 
