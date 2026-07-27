@@ -1163,6 +1163,28 @@ async function recomputeRollups(monthFilter, { write }){
     report.push({ month:m, existed: !!existing, drift: diffRollups(existing, newObj), newObj });
   }
 
+  // Session P0 (ARCHITECTURE.md §18). rollups create/update is open to any
+  // same-org authed user — the §15.5 client-trust tradeoff, which exists
+  // because increments have to ride BOTH an agent's create batch and a
+  // backend user's activation transaction, and there is no server to move
+  // them to. That tradeoff was always documented as "correctable via the
+  // recompute tool," but correction alone is not a mitigation: it silently
+  // erases the evidence. A tampered counter was overwritten and left no
+  // trace that it had ever been wrong.
+  //
+  // Drift is therefore recorded before it is corrected. Deliberately logged
+  // on DETECTION, not on write — a manager who dry-runs, sees drift and
+  // walks away leaves the same trail as one who applies, and an attacker
+  // cannot suppress the record by hoping nobody clicks Apply. Repeated
+  // dry-runs producing repeated entries is the correct behaviour for an
+  // append-only log, not a duplicate-suppression problem.
+  //
+  // Non-zero drift is NOT proof of tampering — §15.4's documented gap
+  // (post-activation mrc edits) and any out-of-band delete both produce it
+  // honestly. The entry is worded as an observation, and it is the pattern
+  // over time, not any single entry, that is the signal.
+  await logRollupDrift(report, write);
+
   if(write){
     // Full overwrite (dbSet = set, not merge) → absolute truth replaces any
     // drifted live-incremented values. skipAudit: a derived aggregate, not a
@@ -1173,6 +1195,49 @@ async function recomputeRollups(monthFilter, { write }){
     }
   }
   return { report, subCount: subs.length };
+}
+
+// One auditLog entry per RUN that found drift, not one per month — a backfill
+// across many months stays a single record, and the per-month breakdown rides
+// along inside it. Bounded so a pathological run can't approach Firestore's
+// 1MiB document limit.
+const DRIFT_DETAIL_CAP = 50;
+async function logRollupDrift(report, wrote){
+  const drifted = report.filter(r => r.drift.length);
+  if(!drifted.length) return;
+
+  const details = [];
+  for(const r of drifted){
+    for(const d of r.drift){
+      if(details.length >= DRIFT_DETAIL_CAP) break;
+      details.push({ month: r.month, path: d.path, stored: d.old, recomputed: d.new });
+    }
+  }
+  const totalBuckets = drifted.reduce((n, r) => n + r.drift.length, 0);
+
+  try {
+    await dbAdd('auditLog', {
+      who: CU.uid,
+      whoName: CP.name,
+      what: 'rollupDrift',
+      action: 'rollupDrift',
+      // false = drift was observed in a dry-run and left in place; true = the
+      // same run went on to overwrite it.
+      corrected: !!wrote,
+      months: drifted.map(r => ({ month: r.month, buckets: r.drift.length })),
+      bucketCount: totalBuckets,
+      details,
+      detailsTruncated: totalBuckets > DRIFT_DETAIL_CAP,
+      description: `Rollup drift: ${totalBuckets} bucket${totalBuckets!==1?'s':''} across ${drifted.length} month${drifted.length!==1?'s':''} (${drifted.map(r=>r.month).join(', ')}) — ${wrote ? 'overwritten by recompute' : 'observed in dry-run, not corrected'}`,
+      ts: now()
+    }, { skipAudit: true });   // this IS the audit record; don't log the log
+  } catch(e){
+    // The drift report itself must still reach the manager even if the audit
+    // write fails (a rules change, a quota ceiling). Surfaced, never swallowed
+    // silently — a missing trail is itself worth seeing.
+    console.error('Rollup drift audit entry could not be written:', e);
+    toast('Drift detected, but the audit entry could not be written. Check the console.', 'err');
+  }
 }
 
 function renderRecomputeReport(report, subCount, wrote){
