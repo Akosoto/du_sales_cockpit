@@ -284,7 +284,7 @@ export async function renderOrgTab(){
           <tbody>
             ${unassigned.map(u=>`<tr>
               <td>${esc(u.name)}</td>
-              <td><span class="role-pill ${u.role}" style="font-size:10px">${u.role==='team_lead'?'Team Lead':'Agent'}</span></td>
+              <td><span class="role-pill ${esc(u.role)}" style="font-size:10px">${u.role==='team_lead'?'Team Lead':'Agent'}</span></td>
               <td class="td-dim">${esc(u.email)}</td>
               <td class="flex gap-8">
                 <button class="btn btn-ghost btn-xs" data-edit-user="${u.id}">Edit</button>
@@ -622,7 +622,7 @@ function showEditUserModal(userId, users, teams){
       </select>
     </div>
     ${isAg ? `
-    <div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="eu-target" value="${u.monthlyTarget||0}"></div>
+    <div class="field"><label>Monthly Revenue Target (AED)</label><input type="number" id="eu-target" value="${esc(u.monthlyTarget||0)}"></div>
     <div class="field" id="eu-tl-wrap" ${!u.teamId?'style="display:none"':''}>
       <label>Team Lead <span class="text-dim">(optional)</span></label>
       <select id="eu-tl">
@@ -653,7 +653,7 @@ function showEditUserModal(userId, users, teams){
     </div>
     <div class="field" id="eu-override-field" style="${u.targetSource!=='override'?'display:none':''}">
       <label>Override Amount (AED)</label>
-      <input type="number" id="eu-override-val" value="${u.targetSource==='override'?(u.monthlyTarget||0):freshAuto}" placeholder="e.g. 150000">
+      <input type="number" id="eu-override-val" value="${esc(u.targetSource==='override'?(u.monthlyTarget||0):freshAuto)}" placeholder="e.g. 150000">
     </div>` : ''}
     ${permissionChecklistHtml('eu-perm', u.permissions||[])}
     <p class="text-dim text-xs" style="margin-bottom:14px">Granted here apply to this member only, in addition to anything granted to their whole team.</p>
@@ -662,7 +662,7 @@ function showEditUserModal(userId, users, teams){
       <button class="btn btn-primary" id="eu-save">Save Changes</button>
       <button class="btn btn-ghost btn-sm" id="eu-reset">Send Password Reset Email</button>
     </div>
-    <p class="text-dim text-xs mt-8">Last edited by ${u.lastEditedBy||'—'} · ${u.lastEditedAt ? fmtDate(u.lastEditedAt) : '—'}</p>`);
+    <p class="text-dim text-xs mt-8">Last edited by ${esc(u.lastEditedBy||'—')} · ${u.lastEditedAt ? fmtDate(u.lastEditedAt) : '—'}</p>`);
 
   wirePermissionSearch('eu-perm');
 
@@ -1182,7 +1182,12 @@ function renderRecomputeReport(report, subCount, wrote){
   const rows = report.map(r => {
     const head = `<div style="font-weight:700;margin-top:10px">${esc(r.month)} — ${r.existed?'existing doc':'NEW doc'}${r.drift.length?` · ${r.drift.length} bucket${r.drift.length!==1?'s':''} drift`:' · in sync'}</div>`;
     if(!r.drift.length) return head;
-    const lines = r.drift.map(d => `<div style="font-family:monospace">${esc(d.path)}: <span style="color:var(--red)">${d.old}</span> → <span style="color:var(--green)">${d.new}</span></div>`).join('');
+    // d.old comes from the LIVE rollup doc, and rollups create/update is open
+    // to any same-org authed user (the documented §15.5 client-trust
+    // tradeoff) — so a tampered counter's value reaches the manager's drift
+    // report as raw HTML if it isn't escaped here. d.new is recomputed
+    // locally, but is escaped alongside it for symmetry.
+    const lines = r.drift.map(d => `<div style="font-family:monospace">${esc(d.path)}: <span style="color:var(--red)">${esc(d.old)}</span> → <span style="color:var(--green)">${esc(d.new)}</span></div>`).join('');
     return head + lines;
   }).join('');
   return `<p class="text-dim mb-8">Scanned ${subCount} submission${subCount!==1?'s':''}. ${wrote?'✅ Overwrote':'Preview —'} ${report.length} month${report.length!==1?'s':''}:</p>${rows}`;
@@ -1293,10 +1298,10 @@ function showEditCompanyModal(companyId, companies, users){
     <div class="divider"></div>
     <p class="text-dim text-xs mb-8">DOCUMENT EXPIRIES</p>
     <div class="row2">
-      <div class="field"><label>Trade License</label><input type="date" id="ec-exp-tl" value="${exp.tradeLicense||''}"></div>
-      <div class="field"><label>Establishment Card</label><input type="date" id="ec-exp-ec" value="${exp.establishmentCard||''}"></div>
+      <div class="field"><label>Trade License</label><input type="date" id="ec-exp-tl" value="${esc(exp.tradeLicense||'')}"></div>
+      <div class="field"><label>Establishment Card</label><input type="date" id="ec-exp-ec" value="${esc(exp.establishmentCard||'')}"></div>
     </div>
-    <div class="field"><label>Emirates ID</label><input type="date" id="ec-exp-eid" value="${exp.eid||''}"></div>
+    <div class="field"><label>Emirates ID</label><input type="date" id="ec-exp-eid" value="${esc(exp.eid||'')}"></div>
 
     <div class="divider"></div>
     <p class="text-dim text-xs mb-8">ACCOUNT OWNER (KAM)</p>
@@ -1310,7 +1315,7 @@ function showEditCompanyModal(companyId, companies, users){
     <div class="divider"></div>
     <p class="text-dim text-xs mb-8">BILLING</p>
     <div class="row2">
-      <div class="field"><label>Last Confirmed Paid Month</label><input type="month" id="ec-bill-month" value="${billing.lastConfirmedPaidMonth||''}"></div>
+      <div class="field"><label>Last Confirmed Paid Month</label><input type="month" id="ec-bill-month" value="${esc(billing.lastConfirmedPaidMonth||'')}"></div>
       <div class="field"><label>Status</label>
         <select id="ec-bill-status">
           <option value="ok" ${!billing.status||billing.status==='ok'?'selected':''}>OK</option>

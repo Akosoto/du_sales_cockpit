@@ -116,8 +116,30 @@ export async function get(ref){
   }
   if(!snap || !snap.exists()) return null;
   const d = snap.data();
-  return { mime: d.mime, dataURL: `data:${d.mime};base64,${d.b64}` };
+  return { mime: safeMime(d.mime), dataURL: `data:${safeMime(d.mime)};base64,${d.b64}` };
 }
+
+// Session P0 (ARCHITECTURE.md §18). `mime` is a STORED field, and
+// submissionDocs create is open to the uploading agent — so the value here
+// is attacker-controlled for anyone who writes a page document through the
+// API instead of through the app. It used to be interpolated straight into
+// `data:${d.mime};base64,…`, and that dataURL straight into
+// `<img src="${…}">` at four render sites (js/leads.js's timeline viewer and
+// js/queue.js's action panel — i.e. onto the screens of the backend reviewer,
+// the TL and the manager). A mime of `x" onerror="…` closed the src attribute
+// and injected an event handler, with no `<` anywhere for esc() to catch even
+// after esc() was taught to escape quotes.
+//
+// Those render sites now escape the dataURL too, but the real fix is here:
+// the capture pipeline (js/documents.js) recompresses EVERYTHING to JPEG —
+// images via canvas.toBlob('image/jpeg', …), PDF pages via pdf.js render →
+// canvas → the same JPEG path — so `image/jpeg` is the only value this
+// driver can legitimately ever have written. Anything else is either
+// pre-existing data from an older pipeline or forged, and in both cases
+// rendering it as JPEG is correct: the browser sniffs the actual bytes for
+// an <img> regardless of what the data URL claims.
+const ALLOWED_MIMES = ['image/jpeg','image/png','image/webp'];
+function safeMime(m){ return ALLOWED_MIMES.includes(m) ? m : 'image/jpeg'; }
 
 // Deletes every stored page (every docType, every pageIndex) for a bundle —
 // used when a single Submit-to-Backend attempt fails partway (cleanup after

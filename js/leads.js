@@ -326,7 +326,14 @@ export async function renderPipelineTab(){
     if(!summary || summary === 'none'){
       return l.stage === 'Closed' ? `<span class="subb subb-none">Not submitted</span>` : '';
     }
-    return `<span class="subb subb-${summary}">${SUBMISSION_BADGE_LABELS[summary]||summary}</span>`;
+    // submissionSummary is a STORED lead field, and the leads rules let the
+    // owning agent write it (it is in none of their blocked-field lists) as
+    // well as backend staff via the hasOnly(['submissionSummary']) exception.
+    // Both the class name and the label fall back to the raw stored value
+    // when it isn't one of the four known keys, so both are escaped — an
+    // agent could otherwise stage markup on their own lead and have it
+    // render on their TL's and the manager's Pipeline.
+    return `<span class="subb subb-${esc(summary)}">${esc(SUBMISSION_BADGE_LABELS[summary]||summary)}</span>`;
   }
 
   function renderList(){
@@ -348,7 +355,7 @@ export async function renderPipelineTab(){
           ${canBulk?(bulkEligible(l)?`<td><input type="checkbox" class="lead-chk" data-chk="${l.id}"${selected.has(l.id)?' checked':''}></td>`:'<td></td>'):''}
           <td class="td-company">${esc(l.company||'—')}${l.assignedTo===CU.uid?'<span style="font-size:10px;font-weight:700;background:rgba(16,185,129,.2);color:#34d399;padding:2px 8px;border-radius:10px;margin-left:6px;vertical-align:middle">📌 Mine</span>':''}</td>
           <td class="td-dim">${esc(l.contact||'—')}</td>
-          <td class="td-dim">${l.phone?`<a href="tel:${l.phone}">${l.phone}</a>`:'—'}</td>
+          <td class="td-dim">${l.phone?`<a href="tel:${esc(l.phone)}">${esc(l.phone)}</a>`:'—'}</td>
           ${role!=='agent'?`<td class="td-dim">${esc(byId[l.assignedTo]?.name||'—')}</td>`:''}
           <td>${stagePill(l.stage)}${submissionBadgeHtml(l)}</td>
           <td class="td-dim">${esc(l.city||'—')}</td>
@@ -463,21 +470,21 @@ export async function showLeadModal(lead, byId, agents){
     <div class="info-grid mb-12">
       <div class="info-item"><div class="lbl">Contact</div><div class="val">${esc(lead.contact||'—')}</div></div>
       <div class="info-item"><div class="lbl">Company</div><div class="val"><strong>${esc(lead.company||'—')}</strong></div></div>
-      <div class="info-item"><div class="lbl">Phone</div><div class="val">${lead.phone?`<a href="tel:${lead.phone}">${lead.phone}</a>`:'—'}</div></div>
-      <div class="info-item"><div class="lbl">Email</div><div class="val">${lead.email?`<a href="mailto:${lead.email}">${lead.email}</a>`:'—'}</div></div>
+      <div class="info-item"><div class="lbl">Phone</div><div class="val">${lead.phone?`<a href="tel:${esc(lead.phone)}">${esc(lead.phone)}</a>`:'—'}</div></div>
+      <div class="info-item"><div class="lbl">Email</div><div class="val">${lead.email?`<a href="mailto:${esc(lead.email)}">${esc(lead.email)}</a>`:'—'}</div></div>
       <div class="info-item"><div class="lbl">Industry</div><div class="val">${esc(lead.industry||'—')}</div></div>
       <div class="info-item"><div class="lbl">City</div><div class="val">${esc(lead.city||'—')}</div></div>
     </div>
-    ${showAssign ? `<div class="field mb-12"><label>Assigned To</label><select id="ls-assign">${!lead.assignedTo?`<option value="" selected>— Unassigned —</option>`:''}${agents.map(a=>`<option value="${a.id}"${a.id===lead.assignedTo?' selected':''}>${esc(a.name)}</option>`).join('')}${lead.assignedTo&&!agents.find(a=>a.id===lead.assignedTo)&&byId[lead.assignedTo]?`<option value="${lead.assignedTo}" selected>${esc(byId[lead.assignedTo].name)} (current)</option>`:''}</select></div>` : `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'— Unassigned —')}</div></div>`}
+    ${showAssign ? `<div class="field mb-12"><label>Assigned To</label><select id="ls-assign">${!lead.assignedTo?`<option value="" selected>— Unassigned —</option>`:''}${agents.map(a=>`<option value="${a.id}"${a.id===lead.assignedTo?' selected':''}>${esc(a.name)}</option>`).join('')}${lead.assignedTo&&!agents.find(a=>a.id===lead.assignedTo)&&byId[lead.assignedTo]?`<option value="${esc(lead.assignedTo)}" selected>${esc(byId[lead.assignedTo].name)} (current)</option>`:''}</select></div>` : `<div class="info-item mb-12"><div class="lbl">Assigned To</div><div class="val">${esc(byId[lead.assignedTo]?.name||'— Unassigned —')}</div></div>`}
     <div class="divider"></div>
     <div class="row2">
       <div class="field"><label>Stage</label>
         <select id="ls-stage">${STAGES.map(s=>`<option value="${s}"${s===lead.stage?' selected':''}>${s}</option>`).join('')}</select>
       </div>
-      <div class="field"><label>Follow-up Date</label><input type="date" id="ls-fu" value="${lead.followup||''}"></div>
+      <div class="field"><label>Follow-up Date</label><input type="date" id="ls-fu" value="${esc(lead.followup||'')}"></div>
     </div>
     <div id="ls-dv-wrap" style="${lead.stage==='Closed'?'':'display:none'}">
-      <div class="field"><label>Deal Value (AED)</label><input type="number" id="ls-dv" value="${lead.dealValue||0}" placeholder="0"></div>
+      <div class="field"><label>Deal Value (AED)</label><input type="number" id="ls-dv" value="${esc(lead.dealValue||0)}" placeholder="0"></div>
     </div>
     <div class="field"><label>Notes</label><textarea id="ls-notes" rows="3">${esc(lead.notes||'')}</textarea></div>
     ${isLocked && role!=='manager' ? `<div class="locked-note">⚠ Manager-created lead. Stage, notes and follow-up are editable. Reassignment is manager-only; deletion requires manager approval.</div>` : ''}
@@ -866,7 +873,7 @@ async function showSubmitModal(lead, byId){
   function docFilePreviewHtml(entry){
     if(!entry) return '<span class="text-dim text-xs">No file attached (optional)</span>';
     if(entry.error) return `<span class="err text-xs">${esc(entry.error)}</span>`;
-    const thumb = entry.thumbUrl ? `<img src="${entry.thumbUrl}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
+    const thumb = entry.thumbUrl ? `<img src="${esc(entry.thumbUrl)}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
     return `${thumb}<span class="text-xs">${esc(entry.fileName)} — ${entry.pages.length} page${entry.pages.length!==1?'s':''}${entry.truncated?` (capped at ${PDF_PAGE_CAP} — PDF has ${entry.totalPages})`:''}</span>`;
   }
   // Shared between render() (so a re-render triggered by something OTHER
@@ -950,7 +957,7 @@ async function showSubmitModal(lead, byId){
         <label>Documents ${req.length?`<span class="text-dim text-xs">(attest each with its expiry date; attaching a file is encouraged but not required)</span>`:''}</label>
         ${req.map(rd=>`<div class="row2 mt-8" style="align-items:center">
           <span class="text-xs">${esc(rd)}</span>
-          <input type="date" data-doc-expiry="${esc(rd)}" value="${docExpiryDates[rd]||''}">
+          <input type="date" data-doc-expiry="${esc(rd)}" value="${esc(docExpiryDates[rd]||'')}">
         </div>
         <div class="row2 mt-8" style="align-items:center">
           <input type="file" accept="image/*,application/pdf" data-doc-file="${esc(rd)}">
@@ -1136,7 +1143,7 @@ function showSubmissionTimelineModal(lead, submissions){
           <div class="flex gap-8" style="justify-content:space-between;align-items:center">
             <strong style="font-size:13px">${esc(l.productName)}</strong>
             <span>
-              <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${SUBMISSION_STATUS_LABELS[l.status]||l.status}</span>
+              <span class="text-xs" style="color:${SUBMISSION_STATUS_COLORS[l.status]||'var(--t2)'}">${esc(SUBMISSION_STATUS_LABELS[l.status]||l.status)}</span>
               ${l.transferStatus==='rejected' ? `<span class="text-xs" style="color:${TRANSFER_STATUS_COLORS.rejected};margin-left:6px">${esc(TRANSFER_STATUS_LABELS.rejected)}</span>` : ''}
             </span>
           </div>
@@ -1177,7 +1184,7 @@ function showSubmissionTimelineModal(lead, submissions){
         Array.from({length: rd.storageRef.pageCount}, (_,i) =>
           storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, version: rd.storageRef.version, pageIndex: i }))
       );
-      target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
+      target.innerHTML = pages.map((p,i) => p ? `<img src="${esc(p.dataURL)}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
     } catch(e){
       target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
     }
@@ -1214,7 +1221,7 @@ function showSubmissionTimelineModal(lead, submissions){
         if(!p) break;
         pages.push(p);
       }
-      target.innerHTML = pages.map((p,i) => `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
+      target.innerHTML = pages.map((p,i) => `<img src="${esc(p.dataURL)}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
     });
   });
 
@@ -1267,7 +1274,7 @@ function showFixResubmitModal(sub, onDone){
   function docFilePreviewHtml(entry){
     if(!entry) return '<span class="text-dim text-xs">No replacement file (optional)</span>';
     if(entry.error) return `<span class="err text-xs">${esc(entry.error)}</span>`;
-    const thumb = entry.thumbUrl ? `<img src="${entry.thumbUrl}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
+    const thumb = entry.thumbUrl ? `<img src="${esc(entry.thumbUrl)}" style="height:36px;border-radius:4px;vertical-align:middle;margin-right:8px">` : '';
     return `${thumb}<span class="text-xs">${esc(entry.fileName)} — ${entry.pages.length} page${entry.pages.length!==1?'s':''}${entry.truncated?` (capped at ${PDF_PAGE_CAP} — PDF has ${entry.totalPages})`:''}</span>`;
   }
 

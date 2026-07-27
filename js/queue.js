@@ -399,7 +399,7 @@ async function showActionPanel(sub, company, onChange){
           Array.from({length: rd.storageRef.pageCount}, (_,i) =>
             storage.get({ bundleId: rd.storageRef.bundleId, docType: rd.storageRef.docType, version: rd.storageRef.version, pageIndex: i }))
         );
-        target.innerHTML = pages.map((p,i) => p ? `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
+        target.innerHTML = pages.map((p,i) => p ? `<img src="${esc(p.dataURL)}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(docType)} page ${i+1}">` : '').join('');
       } catch(e){
         target.innerHTML = `<span class="err text-xs">${esc(e.message)}</span>`;
       }
@@ -432,7 +432,7 @@ async function showActionPanel(sub, company, onChange){
           if(!p) break;
           pages.push(p);
         }
-        target.innerHTML = pages.map((p,i) => `<img src="${p.dataURL}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
+        target.innerHTML = pages.map((p,i) => `<img src="${esc(p.dataURL)}" style="max-width:200px;border-radius:6px;margin:4px" alt="${esc(dType)} v${ver} page ${i+1}">`).join('') || '<span class="text-dim text-xs">No pages found.</span>';
       });
     });
 

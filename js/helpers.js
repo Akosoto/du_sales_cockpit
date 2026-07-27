@@ -4,7 +4,35 @@ import { SP } from './state.js';
 // GENERIC HELPERS
 // ════════════════════════════════════════════════════
 export function v(id){ const el=document.getElementById(id); return el?(el.value||'').trim():''; }
-export function esc(s){ const d=document.createElement('div'); d.textContent=String(s||''); return d.innerHTML; }
+// Session P0 (ARCHITECTURE.md §18). This used to round-trip through a
+// detached div — `d.textContent = s; return d.innerHTML` — which escapes
+// `&`, `<` and `>` but NOT quotes, because a text node has no need to
+// escape them. Every `value="${esc(...)}"` and `data-*="${esc(...)}"` site
+// in this codebase (there are dozens) was therefore attribute-breakable by
+// a single `"` in the data: `" onmouseover="…` closes the attribute and
+// opens a new one, with no `<` involved for the old esc() to catch.
+//
+// Quotes are now escaped explicitly. `&` must be replaced FIRST, or it
+// would re-escape the ampersands introduced by the later replacements.
+//
+// The `String(s||'')` coercion is deliberately preserved verbatim rather
+// than modernized to `??` — `esc(0)` returns '' today and several call
+// sites rely on that falsy-to-empty behaviour; changing it here would be
+// an unrelated rendering change riding a security fix.
+//
+// Output is HTML-context only. Do not feed esc() into CSV cells, clipboard
+// text, or anything else that is not parsed as HTML — the entities would
+// render literally. (Checked at the time of writing: nothing does. CSV
+// export uses reports.js's csvEscape() on raw values, and queue.js's copy
+// tools read `dataset.copy`, which the browser has already HTML-decoded.)
+export function esc(s){
+  return String(s||'')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
 export function now(){ return new Date().toISOString(); }
 export function fmtDate(iso){ try{ return new Date(iso).toLocaleDateString('en-AE',{day:'2-digit',month:'short',year:'numeric'}); }catch(e){return iso;} }
 export function disable(id,txt){ const b=document.getElementById(id); if(b){b.disabled=true;b.textContent=txt;} }
