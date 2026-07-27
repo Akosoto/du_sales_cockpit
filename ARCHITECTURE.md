@@ -1497,3 +1497,113 @@ concluded) deleted via direct parent+chunk removal; `sofTemplates`
 verified back to **0 documents** after each pass, and the Forms tab
 re-rendered the clean "No forms uploaded yet." empty state for both
 roles.
+
+## 18. Session P0 — Critical Security Fixes (IN PROGRESS — Step 1 stub)
+
+**Why this session exists:** a whole-codebase security sweep found one
+CRITICAL authentication hole plus a cluster of high-severity issues.
+Because this is a white-label product (§1) every one of these ships to
+every future partner deployment, so they are fixed BEFORE any further
+feature work. Security only — no features, no refactors, no generator
+work. This section is stubbed at Step 1 and finalized at Step 9 with
+what was actually fixed and how each fix was verified.
+
+### 18.1 The critical finding — `users` CREATE is effectively open
+
+```
+allow create: if isAuth() && (
+  request.auth.uid == uid ||                    // ← the hole
+  (role() == 'manager' && sameOrgWrite())
+);
+```
+
+`request.auth.uid == uid` with **no field validation at all** means
+anyone who self-registers through the public Firebase Auth REST API
+(`signUp`, which needs only the `apiKey` shipped in `config.js` — a
+public value by design, and readable from the deployed app) can then
+write their own `users/{uid}` document with **`role:'manager'` and any
+`orgId` they choose**. That single document is what every other rule in
+the file trusts: `role()`, `isActiveBackend()`, `sameOrg()` and
+`sameOrgWrite()` all resolve through `userDoc()`. One self-write
+therefore grants full manager authority over an entire tenant.
+
+The `SEED_EMAILS` gate in `js/auth.js ensureProfile()` does **not**
+mitigate this. It is client-side, and an attacker never runs the app —
+they call the Firestore REST/gRPC API directly. The comment in
+`rules/firestore.rules` claiming self-registration is "closed to the
+hardcoded SEED_EMAILS in state.js" is describing a client-side
+convention as if it were a server-side control; that is precisely the
+class of assumption this session exists to remove.
+
+Severity is not limited to self-promotion to `manager`. An attacker
+self-creating as a plain `role:'agent'` with the correct `orgId`
+already passes `sameOrg()` on the `leads`, `companies`, `channels`,
+`scripts`, `products`, `teams`, `orgs` and `rollups` read rules — all
+of which are `isAuth() && sameOrg()` with no further scoping — so it
+reads the entire lead book and company book of that tenant. Any fix
+that constrains only `role` is therefore insufficient.
+
+**Preferred fix (to be VERIFIED in Step 2, not assumed):** self-create
+is dead code. All 7 real users already have documents, and
+manager-provisioned users get their document written from the
+*manager's own session* — `js/org.js`'s Add User flow creates the Auth
+account on the secondary Firebase instance (`auth2`), takes the
+returned uid, and writes `users/{uid}` in the manager's batch. If that
+holds under a live test (create an agent as manager, then sign in as
+that agent for their first-ever login), the self-create branch is
+dropped entirely and create becomes manager-only. If some path
+genuinely still needs self-create, it is constrained server-side (an
+allowlist in the org config doc), never by role alone.
+
+### 18.2 The rest of this session's scope
+
+- **`users` self-write blocklist gains `name`.** An agent can currently
+  rename themselves to markup or to a spreadsheet formula; that name is
+  denormalized onto `submissions.agentName` and surfaces in exports and
+  on other users' screens.
+- **XSS cluster.** `js/helpers.js esc()` round-trips through
+  `textContent`/`innerHTML`, which escapes `<`, `>` and `&` but **not**
+  quotes — so every `value="${esc(...)}"` and `data-*="${esc(...)}"`
+  site is attribute-breakable. Sharpest at `js/queue.js`'s `copyField()`
+  (`data-copy="${esc(display)}"`), where agent-typed `categoryFields`
+  land on the backend reviewer's screen. Fix `esc()` itself, then sweep
+  the call sites that bypass it entirely: `js/leads.js` interpolates
+  `l.phone`/`lead.phone`/`lead.email` raw into both `href` and link
+  text, and `js/org.js` renders `${u.lastEditedBy||'—'}` unescaped.
+- **`pdf.js` is pinned to 4.0.379** (`js/documents.js`), which predates
+  the CVE-2024-4367 fix in 4.2.67 — arbitrary JS execution from a
+  crafted PDF. Backend staff open agent-uploaded PDFs. Upgrade to a
+  current 4.x/5.x and verify capture + viewing live; pdf.js has had
+  breaking API changes, so this is not a version-string edit.
+- **`.github/workflows/deploy.yml` publishes path `'.'`**, which serves
+  `rules/firestore.rules`, `ARCHITECTURE.md`, `PROJECT_SPEC.md`,
+  `PHASE5_SPEC_AND_HANDOFF.md` and every `tools/*.html` to the open web
+  — which is how an attacker would find §18.1 in the first place.
+  Restrict the published artifact to the app itself. `tools/` pages are
+  run from localhost and must NOT be published.
+- **Rollups client-trust** stays architecturally as-is (§15.5 — no
+  server, so counter writes must ride both agent creates and backend
+  activations). What changes is that the documented mitigation becomes
+  real: the recompute tool's drift report writes an `auditLog` entry
+  whenever drift is non-zero, so tampering leaves a trail instead of
+  being silently corrected.
+
+### 18.3 Conflicts with prior documentation, flagged at Step 1
+
+1. **`PROJECT_SPEC.md`'s "Hard-delete caveat"** documents the
+   `SEED_EMAILS` auto-recreate fallback as live, intended behavior for
+   4 literal demo addresses. Dropping self-create removes it. This is a
+   documentation update, not a blocker — but it is a real behavior
+   change and is recorded here rather than made silently. Step 2's live
+   test settles whether anything depends on it.
+2. **`PROJECT_SPEC.md`'s `users` rules row** enumerates the Session B4
+   self-write blocklist without `name`; adding `name` updates that row.
+3. **The `tools/rules-probe.html` re-run obligation** (§12, restated in
+   PROJECT_SPEC's rules notes) triggers on changes to `sameOrg()`/
+   `sameOrgWrite()` "or a similarly-shaped rule." This session changes
+   neither helper, and a CREATE rule is never list-queried, so the
+   obligation does not strictly fire — the probe is re-run in Step 8
+   regardless, since rules change at all.
+
+Nothing in ARCHITECTURE.md or PROJECT_SPEC.md contradicts this
+session's fixed decisions.
