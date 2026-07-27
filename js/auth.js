@@ -1,11 +1,10 @@
 import {
-  auth, db, CU, CP, SEED_EMAILS, setUser,
+  auth, db, CU, CP, setUser,
   signInWithEmailAndPassword, signOut, onAuthStateChanged,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider,
   doc, getDoc
 } from './state.js';
-import { dbSet } from './db.js';
-import { v, now, toast, modal, closeModal } from './helpers.js';
+import { v, toast, modal, closeModal } from './helpers.js';
 import { renderNav, switchTab } from './main.js';
 import { loadOrgConfig } from './orgConfig.js';
 
@@ -67,25 +66,37 @@ document.getElementById('li-pw-eye').onclick = function(){
 };
 
 // ════════════════════════════════════════════════════
-// ENSURE FIRESTORE USER PROFILE ON FIRST LOGIN
+// LOAD FIRESTORE USER PROFILE ON LOGIN
+//
+// Session P0: this function used to SELF-CREATE a users/{uid} document
+// when none existed, for any email matching the hardcoded SEED_EMAILS
+// allowlist in state.js. That branch is gone, along with the rule clause
+// (`request.auth.uid == uid`) that permitted it — see ARCHITECTURE.md §18.
+//
+// The allowlist was never a security control. It ran in the client, and
+// the rule behind it validated no fields at all, so anyone who registered
+// through the public Firebase Auth API could write their own user document
+// with role:'manager' and any orgId without ever loading this file. Users
+// are now provisioned exclusively from a manager's own session
+// (js/org.js's Add User flow: create the Auth account on the secondary
+// instance, then write users/{uid} in the manager's batch), which the
+// manager-only create rule covers.
+//
+// A user with an Auth login but no profile document is signed straight
+// back out by the caller below — the intended behaviour for a hard-deleted
+// account, and now also for anyone who self-registers.
+//
+// FIRST-MANAGER BOOTSTRAP (white-label onboarding, ARCHITECTURE.md §1):
+// a brand-new deployment has no manager to run Add User, and no rule can
+// safely grant that first write to an arbitrary caller. Create the first
+// manager's users/{uid} document by hand in the Firestore Console — Console
+// and Admin SDK writes bypass security rules entirely, so this needs no
+// rule hole and no temporary relaxation. See §18 for the exact document
+// shape and the onboarding-runbook step.
 // ════════════════════════════════════════════════════
-async function ensureProfile(fbUser){
+async function loadProfile(fbUser){
   const snap = await getDoc(doc(db, 'users', fbUser.uid));
-  if(snap.exists()) return { id: fbUser.uid, ...snap.data() };
-
-  const seed = SEED_EMAILS[(fbUser.email||'').toLowerCase()];
-  if(!seed) return null;
-
-  const data = {
-    name: seed.name, email: fbUser.email, role: seed.role,
-    teamId: null, monthlyTarget: 0, targetSource: 'manager',
-    active: true, createdBy: 'system', createdAt: now()
-  };
-  // skipAudit: this is a brand-new user's first-ever login — CU/CP are still
-  // null at this point (setUser() runs AFTER ensureProfile() returns), so
-  // db.js's default audit stamping (reads CU.uid/CP.name) would throw here.
-  await dbSet('users', fbUser.uid, data, {skipAudit:true});
-  return { id: fbUser.uid, ...data };
+  return snap.exists() ? { id: fbUser.uid, ...snap.data() } : null;
 }
 
 // ════════════════════════════════════════════════════
@@ -93,7 +104,7 @@ async function ensureProfile(fbUser){
 // ════════════════════════════════════════════════════
 onAuthStateChanged(auth, async fbUser => {
   if(fbUser){
-    const p = await ensureProfile(fbUser);
+    const p = await loadProfile(fbUser);
     if(!p){
       setUser(fbUser, null);
       await signOut(auth);

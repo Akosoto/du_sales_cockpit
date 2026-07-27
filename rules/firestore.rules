@@ -50,17 +50,51 @@ service cloud.firestore {
     // ── USERS ────────────────────────────────────────
     match /users/{uid} {
       allow read: if isAuth() && sameOrg();
-      allow create: if isAuth() && (
-        // Self-registration bootstrap (first-ever login, ensureProfile() in
-        // auth.js): deliberately NOT gated on sameOrgWrite() — userDoc()'s
-        // get() would fail since the caller's own doc doesn't exist yet to
-        // read an orgId from. Trusted because self-registration is closed
-        // to the hardcoded SEED_EMAILS in state.js, not open signup — every
-        // self-registering user gets their orgId from the same config.js
-        // as everyone else in this single-tenant deployment.
-        request.auth.uid == uid ||
-        (role() == 'manager' && sameOrgWrite())
-      );
+
+      // ── CRITICAL FIX (Session P0, ARCHITECTURE.md §18) ──
+      // This rule used to be:
+      //
+      //   allow create: if isAuth() && (
+      //     request.auth.uid == uid ||
+      //     (role() == 'manager' && sameOrgWrite())
+      //   );
+      //
+      // The first branch validated NO fields. Anyone who self-registered
+      // through the public Firebase Auth API — which needs only the apiKey
+      // shipped in config.js, a value that is public by design and readable
+      // off the deployed site — could then write their own users/{uid}
+      // document with role:'manager' and any orgId. Every rule in this file
+      // resolves trust through that document (role(), isActiveBackend(),
+      // sameOrg(), sameOrgWrite() all go through userDoc()), so one
+      // self-write was full authority over a tenant. The SEED_EMAILS
+      // allowlist the old comment here appealed to was client-side, in
+      // js/auth.js; an attacker never runs the app, so it gated nothing.
+      // Note also that narrowing only `role` would NOT have been enough:
+      // a self-created plain 'agent' with the right orgId already satisfies
+      // the `isAuth() && sameOrg()` read rules on leads, companies,
+      // channels, scripts, products, teams, orgs and rollups — i.e. the
+      // tenant's entire lead and company book. Both halves confirmed live
+      // against production before and after this change,
+      // tools/users-create-probe.html.
+      //
+      // Create is therefore manager-only, full stop. The self-create code
+      // path is gone from js/auth.js (loadProfile() only reads now), and
+      // the only remaining create path is js/org.js's Add User flow, which
+      // runs in a manager's own session: it creates the Auth account on the
+      // secondary Firebase instance and writes users/{uid} in the manager's
+      // batch, so role()=='manager' holds for that write.
+      //
+      // role() get()s the caller's own users doc, so a caller who has no
+      // document — every self-registering stranger — fails this rule on an
+      // evaluation error and is denied. Fail-closed is the intent.
+      //
+      // FIRST-MANAGER BOOTSTRAP: a brand-new white-label deployment
+      // (ARCHITECTURE.md §1's onboarding runbook) has no manager yet, and
+      // no rule can safely grant that first write to an arbitrary caller.
+      // Create it by hand in the Firestore Console — Console and Admin SDK
+      // writes bypass rules entirely, so this needs no hole here and no
+      // temporary relaxation during onboarding.
+      allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
       // Step 8 review fix: the old clause let a user update ANY field on
       // their own doc, including role/department/orgId/teamId — an agent
       // could self-write role:'manager' or department:'backend' and pass
@@ -71,13 +105,24 @@ service cloud.firestore {
       // (e.g. the run-rate preference, js/dashboard.js) also carries
       // lastEditedBy/lastEditedAt (auditUpdate(), not in this blocklist),
       // so ordinary self-writes still pass with this narrower rule.
+      //
+      // Session P0 adds 'name' to the blocklist. A user could otherwise
+      // rename themselves to markup or to a spreadsheet formula, and that
+      // name is denormalized onto submissions.agentName, so it lands in
+      // CSV exports and on other users' screens — a stored-injection
+      // vector reached through a field that looks purely cosmetic. No
+      // legitimate self-write touches it: the only UI that writes
+      // users.name is js/org.js's Edit User modal, which lives on the
+      // manager-only Org tab and takes the manager branch above. (The
+      // rendering side is hardened separately in §18's XSS work; this is
+      // the "don't let it be stored in the first place" half.)
       allow update: if isAuth() && sameOrg() && (
         role() == 'manager' ||
         (request.auth.uid == uid
           && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
                 'role','department','orgId','teamId','tlId','active',
                 'monthlyTarget','targetSource','autoTarget',
-                'permissions','specialties','available','email',
+                'permissions','specialties','available','email','name',
                 'createdBy','createdAt'
               ]))
       );

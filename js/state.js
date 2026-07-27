@@ -39,12 +39,15 @@ export const storage = getStorage(primaryApp);
 // ════════════════════════════════════════════════════
 // CONSTANTS
 // ════════════════════════════════════════════════════
-export const SEED_EMAILS = {
-  'manager@shauntech.app':  { role:'manager',   name:'Sales Manager'  },
-  'teamlead1@shauntech.app':{ role:'team_lead', name:'Team Lead 1'    },
-  'agent1@shauntech.app':   { role:'agent',     name:'Agent 1'        },
-  'agent2@shauntech.app':   { role:'agent',     name:'Agent 2'        },
-};
+// SEED_EMAILS (removed, Session P0 — ARCHITECTURE.md §18) used to live here:
+// a hardcoded allowlist of 4 demo addresses that js/auth.js's ensureProfile()
+// let self-create their own users/{uid} document on first login. It is gone
+// because it was never a control — it ran in the client, while the rule that
+// actually permitted the write (`request.auth.uid == uid`) validated no
+// fields at all. Users are provisioned from a manager's session only; the
+// first manager of a new deployment is created by hand in the Firestore
+// Console, which bypasses rules. Do not reintroduce a client-side allowlist
+// as a substitute for a server-side one.
 export const STAGES = ['New','Contacted','Interested','Proposal Sent','Closed','Lost'];
 export const SP = { 'New':'sp-new','Contacted':'sp-contacted','Interested':'sp-interested','Proposal Sent':'sp-proposal','Closed':'sp-won','Lost':'sp-lost' };
 

