@@ -12,7 +12,22 @@ export const PDF_PAGE_CAP = 10;
 
 // Pinned deliberately — never track "latest" for a CDN dependency loaded at
 // runtime with no build step to lock a version otherwise.
-const PDFJS_VERSION = '4.0.379';
+//
+// Session P0 (ARCHITECTURE.md §18): was 4.0.379, which predates the
+// CVE-2024-4367 fix in 4.2.67 — arbitrary JavaScript execution in the
+// hosting origin when a crafted PDF is opened with the default
+// isEvalSupported:true. Reachable by anyone who can attach a document to a
+// submission, since backend staff open agent-uploaded PDFs through
+// captureFile(). Upgraded and re-verified against tools/pdfjs-capture-test.html,
+// which asserts not just that capture resolves but that each produced JPEG
+// contains actual ink — a pdf.js major upgrade's real failure mode is a
+// silently blank page, not a thrown error.
+//
+// 6.x exists (6.1.200 at time of writing) but is deliberately not taken:
+// nothing in it is required to close this CVE, and a second major jump would
+// widen the API-break surface for no security gain. Revisit on the next
+// advisory.
+export const PDFJS_VERSION = '5.7.284';
 const PDFJS_URL = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.mjs`;
 const PDFJS_WORKER_URL = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 
@@ -79,7 +94,15 @@ async function captureImage(file){
 async function capturePdf(file){
   const pdfjsLib = await loadPdfJs();
   const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  // isEvalSupported:false is the mitigation the CVE-2024-4367 advisory names
+  // in its own right, independent of version — it is what actually stops a
+  // crafted font program from reaching eval() in this origin. Kept alongside
+  // the version bump rather than instead of it, so this code path is not
+  // relying on a single control: if a future pdf.js regression reopens the
+  // same class of bug, this flag still holds. The only thing it costs is an
+  // eval-based fast path for font rendering, which is irrelevant here —
+  // these pages are rasterized to JPEG once and never displayed as live PDF.
+  const pdf = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
   const pageCount = Math.min(pdf.numPages, PDF_PAGE_CAP);
   const truncated = pdf.numPages > PDF_PAGE_CAP;
 
