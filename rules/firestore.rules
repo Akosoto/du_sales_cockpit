@@ -23,8 +23,11 @@ service cloud.firestore {
     // (request.resource.data), since resource.data doesn't exist yet on a
     // create. Every collection below requires one of these on every clause,
     // per the audit's "a client cannot write into another org even with a
-    // modified client" requirement — with one deliberate exception, see the
-    // USERS self-registration comment below.
+    // modified client" requirement. (Session P0: this used to note "one
+    // deliberate exception, see the USERS self-registration comment below."
+    // That exception — the ungated `request.auth.uid == uid` create branch —
+    // is gone, and there is now no clause anywhere in this file that skips
+    // the org check.)
     //
     // Bootstrap safety: BEFORE the one-off orgId migration runs, NO document
     // has an orgId field at all. An earlier version of this function assumed
