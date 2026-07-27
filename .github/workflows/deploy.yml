@@ -27,6 +27,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Session P0 (ARCHITECTURE.md §18) ──
+      # This used to upload path '.', i.e. the entire repository. That served
+      # rules/firestore.rules, ARCHITECTURE.md, PROJECT_SPEC.md,
+      # PHASE5_SPEC_AND_HANDOFF.md and every tools/*.html page to the open web
+      # at the live URL — which is exactly how an attacker would have found
+      # §18.1's users-create hole: read the published rules file, then write
+      # the matching document. The tools/ pages are worse than documentation,
+      # since several are purpose-built adversarial probes against this very
+      # deployment; they are run from localhost and must never be published.
+      #
+      # The publish set is now assembled explicitly into _site/ rather than
+      # filtered out of the repo. An allowlist fails safe: a file added to the
+      # repo later is not published unless someone deliberately adds it here,
+      # whereas a denylist silently leaks anything nobody remembered to list.
+      #
+      # The app's complete runtime file set is index.html + js/ + config.js —
+      # index.html references exactly one local resource (js/main.js), and the
+      # only non-relative import anywhere in js/ is config.js. Everything else
+      # is loaded from a CDN at runtime.
+      - name: Assemble the publish set
+        run: |
+          mkdir -p _site
+          cp index.html _site/
+          cp -r js _site/js
+          echo "Publish set:"
+          find _site -type f | sort
+
       - name: Write config.js from repository secret
         env:
           CONFIG_JS: ${{ secrets.CONFIG_JS }}
@@ -35,7 +62,35 @@ jobs:
             echo "::error::CONFIG_JS repository secret is not set — see config.example.js for the template to paste as the secret's value."
             exit 1
           fi
-          printf '%s\n' "$CONFIG_JS" > config.js
+          # Written into _site, never the checkout root, so config.js cannot be
+          # picked up by anything that later globs the repository.
+          printf '%s\n' "$CONFIG_JS" > _site/config.js
+
+      # Makes the restriction self-enforcing instead of a one-time cleanup.
+      # A future edit that widens the copy step (a stray `cp -r . _site` or a
+      # new directory added without thought) fails the build here rather than
+      # quietly republishing the rules file.
+      - name: Verify nothing sensitive is in the publish set
+        run: |
+          fail=0
+          for path in rules tools .github .claude ARCHITECTURE.md PROJECT_SPEC.md PHASE5_SPEC_AND_HANDOFF.md config.example.js; do
+            if [ -e "_site/$path" ]; then
+              echo "::error::_site/$path must never be published"
+              fail=1
+            fi
+          done
+          # Catch categories, not just the paths that exist today.
+          leaked=$(find _site -type f \( -name '*.md' -o -name '*.rules' -o -name '*.yml' -o -name '*.yaml' \) | sort)
+          if [ -n "$leaked" ]; then
+            echo "::error::documentation/rules/workflow files found in the publish set:"
+            echo "$leaked"
+            fail=1
+          fi
+          if [ ! -f _site/index.html ] || [ ! -f _site/js/main.js ] || [ ! -f _site/config.js ]; then
+            echo "::error::publish set is missing one of index.html, js/main.js, config.js"
+            fail=1
+          fi
+          exit $fail
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -43,7 +98,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: '.'
+          path: '_site'
 
   deploy:
     environment:

@@ -3,3 +3,7 @@
 # Per-deployment config (ARCHITECTURE.md Section 2) — real Firebase keys and
 # org-specific values. See config.example.js for the committed template.
 config.js
+
+# Assembled by .github/workflows/deploy.yml (Session P0). Only ever built in
+# CI, but gitignored so a local run of those same steps can't be committed.
+_site/
