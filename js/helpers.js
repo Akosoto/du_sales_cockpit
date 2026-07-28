@@ -70,6 +70,22 @@ export function toast(msg, type='ok'){
 // ════════════════════════════════════════════════════
 // MODAL
 // ════════════════════════════════════════════════════
+// CONTRACT (Session P0, ARCHITECTURE.md §18):
+//   `title` is TEXT — it is assigned to textContent and must be passed RAW.
+//   `html` is HTML — it is assigned to innerHTML and every interpolated value
+//   in it must already be esc()'d by the caller.
+//
+// Twenty-three call sites used to pass esc(...) into `title`, which produced
+// visible double-escaping: a company called "O'Brien Trading" rendered as
+// "O&#39;Brien Trading" in the modal header. Harmless-looking, but it is the
+// tell for a real confusion about which sink is which, and it got worse the
+// moment esc() started escaping quotes — before that, esc() left apostrophes
+// alone and the bug only showed on the rarer < and >. Fixed at the call sites
+// rather than by unescaping here: a sink that quietly undoes escaping is how
+// you get an XSS hole the next time someone changes this function.
+//
+// If m-title is ever changed to innerHTML, every one of those call sites
+// becomes an injection point. Don't.
 export function modal(title, html, wide=false){
   document.getElementById('m-title').textContent = title;
   document.getElementById('m-body').innerHTML = html;
@@ -87,6 +103,8 @@ document.addEventListener('click', e => {
     document.querySelectorAll('.ms-dd.open').forEach(d=>d.classList.remove('open'));
 });
 
+// Same contract as modal(): `title` is raw TEXT (textContent), and `msg` is
+// raw TEXT too — it is esc()'d HERE, so callers must not pre-escape it either.
 export function confirmModal(title, msg, onYes, danger=true){
   modal(title, `<p class="text-dim" style="margin-bottom:16px">${esc(msg)}</p>
     <div class="flex gap-8">

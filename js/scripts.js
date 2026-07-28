@@ -181,7 +181,7 @@ export async function renderScriptsSection(){
       const sid=b.dataset.scDel;
       const s=scripts.find(x=>x.id===sid);
       if(!s) return;
-      b.addEventListener('click',()=>confirmModal(`Delete "${esc(s.title)}"?`,'Cannot be undone.',async()=>{
+      b.addEventListener('click',()=>confirmModal(`Delete "${s.title}"?`,'Cannot be undone.',async()=>{
         await dbDelete('scripts', sid);
         scripts.splice(scripts.findIndex(x=>x.id===sid),1);
         closeModal(); toast('Script deleted.','info');
@@ -297,7 +297,7 @@ function showAddScriptModal(channels, scripts, onUpdate){
 
 // ── EDIT SCRIPT (direct — manager always, TL on own) ──
 function showEditScriptModal(s, channels, onUpdate){
-  modal(`Edit: ${esc(s.title)}`,`
+  modal(`Edit: ${s.title}`,`
     <div class="field"><label>Title *</label><input type="text" id="es-title" value="${esc(s.title)}"></div>
     <div class="field"><label>Channel</label>
       <select id="es-ch">
@@ -325,7 +325,7 @@ function showEditScriptModal(s, channels, onUpdate){
 
 // ── SUGGEST EDIT (TL on manager scripts) ────────────
 function showSuggestEditModal(s, onUpdate){
-  modal(`Suggest Edit: ${esc(s.title)}`,`
+  modal(`Suggest Edit: ${s.title}`,`
     <div class="field" style="margin-bottom:6px">
       <label>Current Script (read-only)</label>
       <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;font-size:12.5px;white-space:pre-wrap;line-height:1.55;max-height:130px;overflow-y:auto;color:var(--t2)">${esc(s.body||'')}</div>
@@ -362,7 +362,7 @@ function showSuggestEditModal(s, onUpdate){
 function showApprovalModal(s, onUpdate){
   if(!s.pendingApproval) return;
   const pa=s.pendingApproval;
-  modal(`Review Edit: ${esc(s.title)}`,`
+  modal(`Review Edit: ${s.title}`,`
     <div class="row2" style="margin-bottom:14px">
       <div>
         <p class="text-dim text-xs mb-12" style="text-transform:uppercase;letter-spacing:.06em">Current (Live)</p>

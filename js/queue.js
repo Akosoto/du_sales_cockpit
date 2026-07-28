@@ -277,7 +277,7 @@ async function showActionPanel(sub, company, onChange){
 
   function render(){
     const s = current;
-    modal(`Submission — ${esc(company?.name || 'Unknown Company')}`, `
+    modal(`Submission — ${company?.name || 'Unknown Company'}`, `
       <div class="flex mb-12" style="justify-content:flex-end;gap:8px">
         <button type="button" class="btn btn-ghost btn-xs" id="ap-copy-all">📋 Copy All</button>
         <button type="button" class="btn btn-ghost btn-xs" id="ap-download-bundle">⬇️ Download bundle PDF</button>

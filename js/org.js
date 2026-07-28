@@ -377,7 +377,7 @@ export async function renderOrgTab(){
     const warnMsg = isTL
       ? 'This cannot be undone. Their agents will become unassigned (no TL) but stay in the team. The login will stop working immediately.'
       : 'This cannot be undone. Their leads will become unassigned. The login will stop working immediately.';
-    confirmModal(`Permanently delete "${esc(u.name)}"?`, warnMsg, async () => {
+    confirmModal(`Permanently delete "${u.name}"?`, warnMsg, async () => {
       const delId = u.id;
       const ops = [];
 
@@ -445,7 +445,7 @@ function showAddTeamModal(teams, tls){
 function showEditTeamModal(teamId, teams, tls, ags){
   const t = teams.find(x=>x.id===teamId); if(!t) return;
   const dept = t.department||'sales';
-  modal(`Edit Team: ${esc(t.name)}`, `
+  modal(`Edit Team: ${t.name}`, `
     <div class="field"><label>Team Name</label><input type="text" id="et-name" value="${esc(t.name)}"></div>
     <div class="row2">
       <div class="field"><label>Department</label>
@@ -605,7 +605,7 @@ function showEditUserModal(userId, users, teams){
   function teamDept(tid){ return teams.find(t=>t.id===tid)?.department || 'sales'; }
   const isBackendAg = isAg && !!u.teamId && teamDept(u.teamId)==='backend';
 
-  modal(`Edit: ${esc(u.name)}`, `
+  modal(`Edit: ${u.name}`, `
     ${u.active===false ? `<div class="locked-note" style="margin-bottom:14px">
       <div style="display:flex;align-items:center;gap:8px">
         <input type="checkbox" id="eu-reactivate-chk" checked style="width:auto;margin:0;cursor:pointer">
@@ -1311,7 +1311,7 @@ function showEditCompanyModal(companyId, companies, users){
   const exp = c.docExpiries || {};
   const billing = c.billing || {};
 
-  modal(`Edit Company: ${esc(c.name)}`, `
+  modal(`Edit Company: ${c.name}`, `
     <div class="row2">
       <div class="field"><label>Industry</label><input type="text" id="ec-ind" value="${esc(c.industry||'')}" placeholder="e.g. Construction"></div>
       <div class="field"><label>City</label><input type="text" id="ec-cy" value="${esc(c.city||'')}" placeholder="Dubai"></div>

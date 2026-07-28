@@ -354,7 +354,7 @@ export async function renderProductsSection(){
       // can reference a productId as a snapshot even after the catalog entry
       // is retired. The product fetch already scopes to active==true, so a
       // deactivated product disappears from view exactly as before.
-      b.addEventListener('click',()=>confirmModal(`Remove "${esc(p.name)}"?`,'It will no longer appear in the catalog. Existing submissions referencing it are unaffected.',async()=>{
+      b.addEventListener('click',()=>confirmModal(`Remove "${p.name}"?`,'It will no longer appear in the catalog. Existing submissions referencing it are unaffected.',async()=>{
         await dbUpdate('products', pid, {active:false});
         products = products.filter(x=>x.id!==pid);
         closeModal(); toast('Product removed.','info');
@@ -452,7 +452,7 @@ function showAddProductModal(onUpdate){
 // ── EDIT PRODUCT (manager) ──────────────────────────
 function showEditProductModal(p, onUpdate){
   const t1=(p.pricingOptions||[])[0], t2=(p.pricingOptions||[])[1];
-  modal(`Edit: ${esc(p.name)}`, `
+  modal(`Edit: ${p.name}`, `
     <div class="row2">
       <div class="field"><label>Category*</label>
         <select id="ep-cat">
@@ -529,7 +529,7 @@ function showManageDiscountsModal(product, onUpdate){
         </div>
       </div>`).join('') : '<p class="text-dim text-xs">No discounts on this product.</p>';
 
-    modal(`Discounts — ${esc(product.name)}`, `
+    modal(`Discounts — ${product.name}`, `
       <div id="disc-list">${rows}</div>
       <div class="divider"></div>
       <button class="btn btn-primary btn-sm" id="disc-add-btn">+ Add Discount</button>`, true);
@@ -623,7 +623,7 @@ function showManageWaiversModal(product, onUpdate){
         </div>
       </div>`).join('') : '<p class="text-dim text-xs">No monthly waivers defined yet.</p>';
 
-    modal(`Monthly Waivers — ${esc(product.name)}`, `
+    modal(`Monthly Waivers — ${product.name}`, `
       <p class="text-dim text-xs mb-12">Billing-level waivers — vary by SIM count, porting vs. new service, or (for fixed) contract term and product. Rules aren't formalised yet; capture what applies in Conditions for now.</p>
       <div id="wv-list">${rows}</div>
       <div class="divider"></div>
@@ -855,7 +855,7 @@ function showCategoryConfigModal(products, onSaved){
     document.querySelectorAll('[data-fam-del]:not([disabled])').forEach(b=>{
       b.addEventListener('click', ()=>{
         const id = b.dataset.famDel;
-        confirmModal(`Delete "${esc(families.find(f=>f.id===id)?.label||'')}"?`, 'This family is not referenced by any category and will be removed permanently.', async ()=>{
+        confirmModal(`Delete "${families.find(f=>f.id===id)?.label||''}"?`, 'This family is not referenced by any category and will be removed permanently.', async ()=>{
           const updated = families.filter(f=>f.id!==id);
           const ok = await withOrgConfigSave(()=>saveOrgConfig({families:updated}));
           if(ok){ toast('Family deleted.'); onSaved(); }
@@ -902,7 +902,7 @@ function showCategoryConfigModal(products, onSaved){
     document.querySelectorAll('[data-cat-del]:not([disabled])').forEach(b=>{
       b.addEventListener('click', ()=>{
         const id = b.dataset.catDel;
-        confirmModal(`Delete "${esc(categories.find(c=>c.id===id)?.label||'')}"?`, 'This category is not used by any product and will be removed permanently.', async ()=>{
+        confirmModal(`Delete "${categories.find(c=>c.id===id)?.label||''}"?`, 'This category is not used by any product and will be removed permanently.', async ()=>{
           const updated = categories.filter(c=>c.id!==id);
           const ok = await withOrgConfigSave(()=>saveOrgConfig({categories:updated}));
           if(ok){ toast('Category deleted.'); onSaved(); }

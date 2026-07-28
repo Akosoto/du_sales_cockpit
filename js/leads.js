@@ -404,7 +404,7 @@ export async function renderPipelineTab(){
 
   document.querySelectorAll('[data-approve-del]').forEach(b=>b.addEventListener('click',()=>{
     const l = pendingDeletes.find(x=>x.id===b.dataset.approveDel); if(!l) return;
-    confirmModal(`Approve deletion for ${esc(l.company)}?`, 'This cannot be undone.', async () => {
+    confirmModal(`Approve deletion for ${l.company}?`, 'This cannot be undone.', async () => {
       await dbDelete('leads', l.id);
       toast('Lead deleted.','info'); renderPipelineTab();
     });
@@ -466,7 +466,7 @@ export async function showLeadModal(lead, byId, agents){
   }
   const bundleCount = new Set(existingSubmissions.map(s=>s.bundleId)).size;
 
-  modal(`${esc(lead.company||'Lead')}`, `
+  modal(`${lead.company||'Lead'}`, `
     <div class="info-grid mb-12">
       <div class="info-item"><div class="lbl">Contact</div><div class="val">${esc(lead.contact||'—')}</div></div>
       <div class="info-item"><div class="lbl">Company</div><div class="val"><strong>${esc(lead.company||'—')}</strong></div></div>
@@ -571,7 +571,7 @@ export async function showLeadModal(lead, byId, agents){
     if(role==='agent' && (lead.ownerLocked || lead.createdBy!==CU.uid)){
       toast('You can only delete leads you created.','err'); return;
     }
-    confirmModal(`Delete lead for ${esc(lead.company)}?`,
+    confirmModal(`Delete lead for ${lead.company}?`,
       'This cannot be undone.',
       async () => {
         await dbDelete('leads', lead.id);
@@ -580,7 +580,7 @@ export async function showLeadModal(lead, byId, agents){
   });
 
   document.getElementById('lm-reqdel')?.addEventListener('click',()=>{
-    confirmModal(`Request deletion for ${esc(lead.company)}?`,
+    confirmModal(`Request deletion for ${lead.company}?`,
       'This lead was created by your manager. A deletion request will be sent for approval — the lead stays active until approved.',
       async () => {
         await dbUpdate('leads', lead.id, {
@@ -600,7 +600,7 @@ export async function showLeadModal(lead, byId, agents){
   });
 
   document.getElementById('lm-approve-del')?.addEventListener('click',()=>{
-    confirmModal(`Approve deletion for ${esc(lead.company)}?`,
+    confirmModal(`Approve deletion for ${lead.company}?`,
       'This cannot be undone.',
       async () => {
         await dbDelete('leads', lead.id);
@@ -899,7 +899,7 @@ async function showSubmitModal(lead, byId){
     const selectedProduct = productsById[selectedProductId] || null;
     const catFields = selectedProduct ? (ORG_DEFAULTS.itemFieldsByCategory[selectedProduct.category]||[]) : [];
 
-    modal(`Submit to Backend — ${esc(lead.company)}`, `
+    modal(`Submit to Backend — ${lead.company}`, `
       <div class="flex mb-12" style="justify-content:flex-end">
         <button type="button" class="btn btn-ghost btn-xs" id="sm-submit-later">Submit later</button>
       </div>
@@ -1167,7 +1167,7 @@ function showSubmissionTimelineModal(lead, submissions){
     </div>`;
   }).join('') || '<p class="text-dim text-sm">No submissions yet.</p>';
 
-  modal(`Submission Timeline — ${esc(lead.company)}`, html, true);
+  modal(`Submission Timeline — ${lead.company}`, html, true);
 
   // Fetch pages ON DEMAND (not eagerly for every doc when the modal opens) —
   // one storage.get() per page, exactly as many reads as pages actually
@@ -1280,7 +1280,7 @@ function showFixResubmitModal(sub, onDone){
 
   function render(){
     const rejEvent = [...(sub.events||[])].reverse().find(e=>e.type==='rejected');
-    modal(`Fix & Resubmit — ${esc(sub.productName)}`, `
+    modal(`Fix & Resubmit — ${sub.productName}`, `
       <p class="text-dim text-sm mb-12">This submission was rejected${sub.rejectedAt?` on ${fmtDate(sub.rejectedAt)}`:''}. Fix what's needed below, then resubmit.</p>
       ${rejEvent ? `<div class="locked-note mb-12">⚠ Rejected: <strong>${esc(rejEvent.payload?.reason||'—')}</strong>${rejEvent.payload?.note?` — ${esc(rejEvent.payload.note)}`:''}</div>` : ''}
       ${catFieldKeys.length ? `<div class="field mb-12"><label>Product Fields</label>
