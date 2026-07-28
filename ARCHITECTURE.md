@@ -1498,17 +1498,17 @@ verified back to **0 documents** after each pass, and the Forms tab
 re-rendered the clean "No forms uploaded yet." empty state for both
 roles.
 
-## 18. Session P0 — Critical Security Fixes (IN PROGRESS — Step 1 stub)
+## 18. Session P0 — Critical Security Fixes (shipped)
 
 **Why this session exists:** a whole-codebase security sweep found one
 CRITICAL authentication hole plus a cluster of high-severity issues.
-Because this is a white-label product (§1) every one of these ships to
-every future partner deployment, so they are fixed BEFORE any further
-feature work. Security only — no features, no refactors, no generator
-work. This section is stubbed at Step 1 and finalized at Step 9 with
-what was actually fixed and how each fix was verified.
+Because this is a white-label product (§1), every one of them ships to
+every future partner deployment, so they were fixed before any further
+feature work. Security only — no features, no refactors.
 
-### 18.1 The critical finding — `users` CREATE is effectively open
+### 18.1 CRITICAL — `users` CREATE allowed an unvalidated self-write
+
+The rule was:
 
 ```
 allow create: if isAuth() && (
@@ -1517,93 +1517,384 @@ allow create: if isAuth() && (
 );
 ```
 
-`request.auth.uid == uid` with **no field validation at all** means
-anyone who self-registers through the public Firebase Auth REST API
-(`signUp`, which needs only the `apiKey` shipped in `config.js` — a
-public value by design, and readable from the deployed app) can then
-write their own `users/{uid}` document with **`role:'manager'` and any
-`orgId` they choose**. That single document is what every other rule in
-the file trusts: `role()`, `isActiveBackend()`, `sameOrg()` and
-`sameOrgWrite()` all resolve through `userDoc()`. One self-write
-therefore grants full manager authority over an entire tenant.
+The first branch validated **no fields**. Anyone who self-registers
+through the public Firebase Auth API — which needs only the `apiKey`
+shipped in `config.js`, a value that is public by design and was
+readable straight off the deployed site — could then write their own
+`users/{uid}` document with **`role:'manager'` and any `orgId`**. Every
+rule in the file resolves trust through that document (`role()`,
+`isActiveBackend()`, `sameOrg()`, `sameOrgWrite()` all go through
+`userDoc()`), so one self-write was full authority over a tenant.
 
-The `SEED_EMAILS` gate in `js/auth.js ensureProfile()` does **not**
-mitigate this. It is client-side, and an attacker never runs the app —
-they call the Firestore REST/gRPC API directly. The comment in
-`rules/firestore.rules` claiming self-registration is "closed to the
-hardcoded SEED_EMAILS in state.js" is describing a client-side
-convention as if it were a server-side control; that is precisely the
-class of assumption this session exists to remove.
+The `SEED_EMAILS` allowlist the old rule comment appealed to was **not a
+mitigation**. It ran in `js/auth.js`, client-side, and an attacker never
+runs the app. A rule comment citing a client-side convention as if it
+were a server-side control is precisely the failure this session exists
+to remove.
 
-Severity is not limited to self-promotion to `manager`. An attacker
-self-creating as a plain `role:'agent'` with the correct `orgId`
-already passes `sameOrg()` on the `leads`, `companies`, `channels`,
-`scripts`, `products`, `teams`, `orgs` and `rollups` read rules — all
-of which are `isAuth() && sameOrg()` with no further scoping — so it
-reads the entire lead book and company book of that tenant. Any fix
-that constrains only `role` is therefore insufficient.
+**Narrowing only `role` would not have closed it.** A self-created plain
+`role:'agent'` carrying the right `orgId` already satisfies the
+`isAuth() && sameOrg()` read rules on `leads`, `companies`, `channels`,
+`scripts`, `products`, `teams`, `orgs` and `rollups` — the tenant's
+entire lead book and company book, with no role check anywhere in those
+clauses.
 
-**Preferred fix (to be VERIFIED in Step 2, not assumed):** self-create
-is dead code. All 7 real users already have documents, and
-manager-provisioned users get their document written from the
-*manager's own session* — `js/org.js`'s Add User flow creates the Auth
-account on the secondary Firebase instance (`auth2`), takes the
-returned uid, and writes `users/{uid}` in the manager's batch. If that
-holds under a live test (create an agent as manager, then sign in as
-that agent for their first-ever login), the self-create branch is
-dropped entirely and create becomes manager-only. If some path
-genuinely still needs self-create, it is constrained server-side (an
-allowlist in the org config doc), never by role alone.
+**Fix.** Create is manager-only, full stop:
 
-### 18.2 The rest of this session's scope
+```
+allow create: if isAuth() && role() == 'manager' && sameOrgWrite();
+```
 
-- **`users` self-write blocklist gains `name`.** An agent can currently
-  rename themselves to markup or to a spreadsheet formula; that name is
-  denormalized onto `submissions.agentName` and surfaces in exports and
-  on other users' screens.
-- **XSS cluster.** `js/helpers.js esc()` round-trips through
-  `textContent`/`innerHTML`, which escapes `<`, `>` and `&` but **not**
-  quotes — so every `value="${esc(...)}"` and `data-*="${esc(...)}"`
-  site is attribute-breakable. Sharpest at `js/queue.js`'s `copyField()`
-  (`data-copy="${esc(display)}"`), where agent-typed `categoryFields`
-  land on the backend reviewer's screen. Fix `esc()` itself, then sweep
-  the call sites that bypass it entirely: `js/leads.js` interpolates
-  `l.phone`/`lead.phone`/`lead.email` raw into both `href` and link
-  text, and `js/org.js` renders `${u.lastEditedBy||'—'}` unescaped.
-- **`pdf.js` is pinned to 4.0.379** (`js/documents.js`), which predates
-  the CVE-2024-4367 fix in 4.2.67 — arbitrary JS execution from a
-  crafted PDF. Backend staff open agent-uploaded PDFs. Upgrade to a
-  current 4.x/5.x and verify capture + viewing live; pdf.js has had
-  breaking API changes, so this is not a version-string edit.
-- **`.github/workflows/deploy.yml` publishes path `'.'`**, which serves
-  `rules/firestore.rules`, `ARCHITECTURE.md`, `PROJECT_SPEC.md`,
-  `PHASE5_SPEC_AND_HANDOFF.md` and every `tools/*.html` to the open web
-  — which is how an attacker would find §18.1 in the first place.
-  Restrict the published artifact to the app itself. `tools/` pages are
-  run from localhost and must NOT be published.
-- **Rollups client-trust** stays architecturally as-is (§15.5 — no
-  server, so counter writes must ride both agent creates and backend
-  activations). What changes is that the documented mitigation becomes
-  real: the recompute tool's drift report writes an `auditLog` entry
-  whenever drift is non-zero, so tampering leaves a trail instead of
-  being silently corrected.
+`role()` `get()`s the caller's own users doc, so a caller who has none —
+every self-registering stranger — fails on an evaluation error and is
+denied. Fail-closed by construction.
 
-### 18.3 Conflicts with prior documentation, flagged at Step 1
+The self-create code path is gone: `js/auth.js`'s `ensureProfile()` is
+now `loadProfile()`, which only reads. `SEED_EMAILS` was deleted from
+`js/state.js`, with a comment against reintroducing a client-side
+allowlist as a substitute for a server-side one. The only remaining
+create path is `js/org.js`'s Add User flow, which runs in a manager's
+own session (Auth account created on the secondary instance `auth2`,
+then `users/{uid}` written in the manager's batch), so
+`role()=='manager'` holds for that write.
 
-1. **`PROJECT_SPEC.md`'s "Hard-delete caveat"** documents the
-   `SEED_EMAILS` auto-recreate fallback as live, intended behavior for
-   4 literal demo addresses. Dropping self-create removes it. This is a
-   documentation update, not a blocker — but it is a real behavior
-   change and is recorded here rather than made silently. Step 2's live
-   test settles whether anything depends on it.
-2. **`PROJECT_SPEC.md`'s `users` rules row** enumerates the Session B4
-   self-write blocklist without `name`; adding `name` updates that row.
-3. **The `tools/rules-probe.html` re-run obligation** (§12, restated in
-   PROJECT_SPEC's rules notes) triggers on changes to `sameOrg()`/
-   `sameOrgWrite()` "or a similarly-shaped rule." This session changes
-   neither helper, and a CREATE rule is never list-queried, so the
-   obligation does not strictly fire — the probe is re-run in Step 8
-   regardless, since rules change at all.
+**FIRST-MANAGER BOOTSTRAP (new onboarding-runbook step, §1).** A
+brand-new deployment has no manager yet, and no rule can safely grant
+that first write to an arbitrary caller. Create the first manager's
+`users/{uid}` **by hand in the Firestore Console** — Console and Admin
+SDK writes bypass rules entirely, so this needs no hole in the rules and
+no temporary relaxation during onboarding. This replaces the
+`SEED_EMAILS` self-create that used to serve the purpose implicitly.
 
-Nothing in ARCHITECTURE.md or PROJECT_SPEC.md contradicts this
-session's fixed decisions.
+**Verification.** `tools/users-create-probe.html` — an adversarial probe
+that registers its own throwaway identities through the public Auth API
+(no credentials needed, exactly as an attacker would), attempts both the
+`role:'manager'` and the `role:'agent'` self-write, and deletes
+everything it created including the Auth accounts, ending with a
+verification pass that re-reads both documents.
+
+Run **five times against production** after the fix: self-registration
+succeeded every time (see 18.6), both creates were `permission-denied`
+every time, and cleanup reported "nothing was created, so nothing to
+verify — the create rule held."
+
+**The before-state was NOT observed live, and this is recorded honestly
+rather than overstated.** The probe was first run only after publishing.
+Reverting production to a known-critical hole to stage a demonstration
+was judged a worse trade than accepting a documented gap. The before-state
+therefore rests on the rule text (in git, and unambiguous — a
+declarative `allow create` with an ungated `request.auth.uid == uid`
+branch) plus two project-configuration-dependent links that WERE
+confirmed live:
+
+1. **Open self-registration** — `createUserWithEmailAndPassword`
+   succeeded for ten distinct throwaway addresses across the five runs.
+   This was the only step that depended on project configuration rather
+   than rule text.
+2. **Unpublished editor content does not affect enforcement** — one run
+   was performed with the *vulnerable clause pasted into the Console
+   rules editor but not published*, and the live attack was still
+   denied. That doubles as proof no accidental publish occurred.
+
+**Do NOT "harden" this by disabling sign-up.** Firebase Console →
+Authentication → Settings → User actions has an "Enable create
+(sign-up)" toggle, and turning it off looks like the obvious next step.
+It would break provisioning: `js/org.js`'s Add User calls
+`createUserWithEmailAndPassword` from the **client**, so managers would
+lose the ability to create agents and team leads. Post-fix, a
+self-registered account is inert anyway — with no `users` doc, `role()`
+and `sameOrg()` both fail on a nonexistent-document `get()` and every
+rule denies. It is an Auth-quota nuisance, not a data-access path.
+
+### 18.2 `users` self-write blocklist gains `name`
+
+An agent could rename themselves to markup or to a spreadsheet formula,
+and that name is denormalized onto `submissions.agentName` and stamped
+as `lastEditedBy` on every document they touch (`js/db.js`
+`auditUpdate()`), so it reaches CSV exports and other users' screens —
+a stored-injection vector through a field that looks purely cosmetic.
+`name` is now in the `hasAny([...])` blocklist alongside B4's
+privilege/compensation fields. No legitimate self-write touches it: the
+only UI that writes `users.name` is `js/org.js`'s Edit User modal, on
+the manager-only Org tab, which takes the manager branch.
+
+Verified live as an agent (console, since no self-rename UI exists):
+`name` → `permission-denied`; `role` → `permission-denied` (B4's entry
+still holds); `runRateVisible` → **succeeded**, proving the clause was
+not over-narrowed.
+
+### 18.3 XSS cluster
+
+**`esc()` did not escape quotes.** It round-tripped through a detached
+div (`textContent` → `innerHTML`), which escapes `&`, `<` and `>` but
+not `"` or `'` — a text node has no need to. Every
+`value="${esc(...)}"` and `data-*="${esc(...)}"` site in the codebase
+was therefore attribute-breakable **with no `<` involved**, so nothing
+in the old implementation could catch it. `esc()` now escapes all five
+characters, with `&` replaced first so it cannot double-encode the
+entities the later replacements introduce. `String(s||'')` is preserved
+verbatim — `esc(0)` still returns `''`, and changing that would be an
+unrelated rendering change riding a security fix.
+
+**Call sites that bypassed `esc()` entirely**, all fixed:
+`js/leads.js` interpolated `l.phone`/`lead.phone`/`lead.email` raw into
+both `href` and link text, plus `lead.followup`, `lead.dealValue`,
+`lead.assignedTo` and `docExpiryDates` into `value="…"`; `js/org.js`
+rendered `u.lastEditedBy` raw (the reported site), plus `u.role` in a
+class attribute, the target/override values, and company `docExpiries`
++ billing month in `value="…"`; the recompute drift report's `d.old`,
+which comes from the live rollup doc and is therefore client-writable
+under §15.5.
+
+**Found in the sweep, not in the original report:**
+
+- **Stored `mime` reached `<img src="data:${mime};base64,…">`** at four
+  sites (`js/leads.js`'s timeline viewer, `js/queue.js`'s action panel).
+  `submissionDocs` create is open to the uploading agent, so a crafted
+  `mime` closed the `src` attribute and injected an event handler onto
+  the backend reviewer's, TL's and manager's screens. Fixed at the render
+  sites **and at the source**: `js/storage/firestore-b64.js`'s `get()`
+  now allowlists the mime. That is sound because the capture pipeline
+  recompresses everything to JPEG (`canvas.toBlob('image/jpeg')` for
+  images, and pdf.js → canvas → the same path for PDF pages), so
+  `image/jpeg` is the only value this driver can legitimately have
+  written; the browser sniffs actual bytes for an `<img>` regardless.
+- **Two lookup-with-raw-fallback sites** the property-access sweep
+  missed, because neither starts with an identifier-dot:
+  `SUBMISSION_BADGE_LABELS[summary]||summary` (plus `summary` in a class
+  name) in the Pipeline badge, and
+  `SUBMISSION_STATUS_LABELS[l.status]||l.status` in the submission
+  timeline. Both fall back to a stored, agent-writable value.
+
+**Scope rule applied to the remainder:** fixed everywhere a
+lower-privileged actor's data renders to a higher-privileged one.
+`products.*` `value="…"` interpolations were deliberately left as-is —
+products are manager-write and all-role-read, so no privilege boundary
+is crossed.
+
+**Double-escaping regression, introduced by this session and fixed in
+Step 8.** `helpers.js`'s `modal()` assigns `title` to `textContent`, but
+23 call sites passed `esc(...)` into it. Escaped output in a text sink
+renders entities literally — the Edit User header showed
+`Edit: &lt;img src=x onerror=alert(1)&gt;`. The `<`/`>` half predated
+this session, but teaching `esc()` to escape quotes made it bite
+**ordinary data**: a company or person named `O'Brien` began rendering as
+`O&#39;Brien` in every modal header. Fixed at the 23 call sites (titles
+passed raw) rather than by unescaping inside `modal()` — a sink that
+quietly undoes escaping is how the next person reintroduces an XSS hole.
+`modal()` and `confirmModal()` now carry an explicit contract comment
+naming which parameter is a text sink and which is HTML, and warning that
+switching `m-title` to `innerHTML` would turn all 23 into injection
+points. `confirmModal`'s `msg` is `esc()`'d internally, so callers must
+not pre-escape that either; none do.
+
+### 18.4 `pdf.js` upgraded past CVE-2024-4367
+
+Pinned at 4.0.379, which predates the fix in 4.2.67 — arbitrary
+JavaScript execution in the hosting origin from a crafted PDF opened
+with the default `isEvalSupported:true`. Directly reachable: backend
+staff open agent-uploaded PDFs through `captureFile()`.
+
+Two independent controls rather than one: bumped to **5.7.284** (latest
+5.x), **and** `isEvalSupported:false` passed to `getDocument()` — the
+mitigation the advisory names in its own right, version-independent, so
+the path does not rely on a single control if a future pdf.js regression
+reopens the same class of bug. It costs only an eval-based font-rendering
+fast path, irrelevant here since pages are rasterized to JPEG once and
+never displayed as live PDF. 6.x exists (6.1.200) and was deliberately
+not taken: nothing in it is required to close this CVE, and a second
+major jump would widen the API-break surface for no security gain.
+
+**Verified live, because a pdf.js major upgrade's real failure mode is a
+silently BLANK page, not a thrown error** — capture would still resolve,
+still produce a correctly-sized JPEG, and still store it, with nothing
+downstream noticing. `tools/pdfjs-capture-test.html` drives the REAL
+`captureFile()` against jsPDF-generated fixtures and decodes every
+produced JPEG to count non-white pixels. Runs: 4.0.379 baseline (to
+prove the harness itself detects success) **25/25**, then 5.7.284
+**25/25**, then 5.7.284 + `isEvalSupported:false` **25/25** — output
+byte-identical across all three (12477/12683/12744 bytes,
+121949/122149/122147 ink px), i.e. rendering is unchanged. Confirmed the
+new library actually loaded rather than being served from cache:
+`lib.version` reported 5.7.284, build `7e5b36c2d`. Covers the 3-page
+case, the `PDF_PAGE_CAP` truncation path against a 12-page PDF
+(including that the LAST captured page rendered), the image branch, and
+`MAX_EDGE` downscaling with aspect ratio preserved.
+
+`PDFJS_VERSION` is now exported so the harness can report what it tested.
+
+### 18.5 Pages publish set restricted to the app
+
+`.github/workflows/deploy.yml` uploaded path `'.'` — the entire
+repository — so the live site served `rules/firestore.rules`,
+`ARCHITECTURE.md`, `PROJECT_SPEC.md`, `PHASE5_SPEC_AND_HANDOFF.md` and
+every `tools/*.html` to the open web. That is how an attacker would have
+found 18.1: read the published rules file, then write the matching
+document. The `tools/` pages are worse than the documentation — several
+are purpose-built adversarial probes against this exact deployment, meant
+to run from localhost only.
+
+The publish set is now assembled explicitly into `_site/` (`index.html` +
+`js/` + the secret-injected `config.js`) instead of being filtered out of
+the repo. **An allowlist fails safe**: a file added later is not
+published unless someone deliberately adds it, whereas a denylist leaks
+whatever nobody remembered to list. Confirmed the app's runtime file set
+is exactly those three — `index.html` references one local resource
+(`js/main.js`), and the only non-relative import anywhere under `js/` is
+`config.js`; everything else loads from a CDN. `config.js` is written
+into `_site/` rather than the checkout root, so it cannot be picked up by
+anything that later globs the repository.
+
+A verify step fails the build if `rules/`, `tools/`, `.github/`,
+`.claude/`, any `*.md`/`*.rules`/`*.yml`, or the spec files appear in
+`_site` — or if any of the three required files is missing. This makes
+the restriction self-enforcing rather than a one-time cleanup a future
+stray `cp -r .` could silently undo.
+
+**OPERATIONAL CONSEQUENCE:** `rules/firestore.rules` was publicly
+readable at the live URL for as long as this workflow existed. **Treat
+18.1 as potentially known to third parties**, and expect it to persist in
+search-engine and archive caches after the next deploy removes it.
+Recommended follow-up: review the Firebase Auth user list for
+unrecognized accounts, and `users/` for documents whose `createdBy` is
+not a real manager.
+
+### 18.6 Rollups client-trust — the mitigation made real
+
+The §15.5 tradeoff stands architecturally: increments must ride BOTH an
+agent's create batch and a backend user's activation transaction, and
+there is no server to move them to, so `rollups` create/update remains
+open to any same-org authed user.
+
+What changed is that "correctable via the recompute tool" was never
+actually a mitigation — correction silently **erases the evidence**. A
+tampered counter was overwritten and left no trace it had ever been
+wrong. Drift is now recorded before it is corrected: `js/org.js`'s
+`recomputeRollups()` writes an `auditLog` entry whenever drift is
+non-zero.
+
+Design points: logged on **detection, not on write**, so a manager who
+dry-runs, sees drift and walks away leaves the same trail as one who
+applies, and an attacker cannot suppress the record by hoping nobody
+clicks Apply — a `corrected` flag distinguishes the two. One entry per
+RUN, not per month, so a multi-month backfill stays a single record with
+the per-month breakdown inside it; details capped at 50 buckets with a
+`detailsTruncated` flag, while `bucketCount` always reports the true
+total so truncation can never understate a finding. Worded as an
+observation, not an accusation — non-zero drift is not proof of
+tampering, since §15.4's documented gap (post-activation `mrc` edits) and
+any out-of-band delete both produce it honestly; the signal is the
+pattern over time. A failed audit write is surfaced (console + toast) and
+does not block the drift report reaching the manager.
+
+### 18.7 Findings discovered during the session
+
+Beyond the six reported, in addition to the `mime`, lookup-fallback and
+double-escaping items already covered above:
+
+**`loadProfile()` assumed a missing users doc resolves as
+`exists()===false`. It does not — it is DENIED.** The read rule is
+`isAuth() && sameOrg()`, and `sameOrg()` calls `userDoc()`, which
+`get()`s that same missing document; the get errors, and an evaluation
+error denies the whole rule. This is the documented get-on-nonexistent-doc
+gotcha (§12; PROJECT_SPEC's rules notes) and the pattern
+`loadOrgConfig()` already uses. Before this session the path was reached
+only by a hard-deleted account; **with self-create gone it is reached by
+every stranger who self-registers**, which the probe runs exercised ten
+times. Unwrapped, the throw escaped into `onAuthStateChanged`'s async
+callback as an unhandled rejection and left the user on a stuck screen
+instead of being signed out with "Account not set up." Now wrapped,
+treating denied and absent identically.
+
+**jsPDF 2.5.2 assessed against CVE-2025-68428** (9.2, path traversal,
+fixed in 4.0.0) — **not applicable**: the advisory covers only the
+Node.js builds (`dist/jspdf.node*.js`) and filesystem access via
+`loadFile`. `js/pdfExport.js` loads the browser `+esm` build and there is
+no filesystem. Recorded rather than acted on — 2.5.2 is well behind
+current, which is worth a future session, but there is no exploitable
+finding and this session was security-only.
+
+### 18.8 Regression
+
+**Unit/harness suites, all green:** `tools/xss-escaping-test.html` 85
+assertions; `tools/pdfjs-capture-test.html` 25 assertions × 3 versions;
+plus an isolated 9-assertion check of the drift-payload assembly (cap
+behaviour, month/bucket accounting, and that `bucketCount` reports the
+true total when details are truncated).
+
+The XSS suite's method matters: each payload is injected through
+`innerHTML` in the three contexts the app renders into (element text,
+quoted attribute, `data-*` attribute) and the **parsed DOM** is then
+interrogated for injected elements and `on*` attributes — a string
+comparison would happily pass an encoding the parser still resolves into
+an attribute break. Section [4] is the control: the same payload injected
+UNESCAPED does produce `input[onmouseover]`, proving the suite can detect
+a breakout; without it, 85 passes would prove nothing. The 36 round-trip
+assertions prove the fix did not OVER-escape — `js/queue.js`'s copy tools
+read `dataset.copy` expecting the original text.
+
+**Live, across three real identities against production:**
+
+- **Agent** (`role:'agent'`): entered `x" onmouseover="alert(1)` in a lead
+  phone and `"><img src=x onerror=alert(1)>` in its email, and
+  `GAID-P0" onmouseover="alert(1)` in a submission's `categoryFields`.
+  All stored verbatim. Pipeline list row, lead modal, Pipeline badge and
+  the agent's own Submission Timeline: 0 injected elements, 0 `on*`
+  attributes.
+- **Backend** (`role:'agent'` + `department:'backend'` — deliberately not
+  a manager, so `submissions` reads resolve through `isActiveBackend()`
+  rather than `role()=='manager'`, and not through `agentId==self`
+  either): Queue action panel's `data-copy` held the payload as a parsed
+  VALUE, not a spawned `onmouseover`; 0 handlers; the copy icon
+  round-tripped byte-exact. A real write (`appendEvent 'docsVerified'`)
+  committed, and that transaction also stamped `submissionSummary` onto a
+  lead this user does not own — which only the narrow
+  `hasOnly(['submissionSummary']) + isActiveBackend()` exception permits,
+  so that rule survives too.
+- **Manager**: `users.name` set to `<img src=x onerror=alert(1)>` through
+  the real Edit User modal, plus the denormalized `lastEditedBy` on both
+  a lead and a user doc — Org list, Edit User modal and the `org.js:665`
+  line all clean. Cross-checked the same submission in Queue: both read
+  branches render identically. All 8 tabs render with no permission
+  banners.
+
+**`users` create confirmed end to end:** the agent used throughout was
+created by the manager on the day of the session (`createdBy` = manager
+uid) and completed a first login successfully. Dropping self-create did
+not break provisioning.
+
+**Rollup drift, driven live:** the fixture was deleted **out of band**
+via `dbDelete` rather than `deleteSubmission()` — mirroring §16.7's
+choice, so the recompute tool had to act as the safety net for a delete
+that bypassed counter reversal, which is what manufactured the drift. The
+report isolated EXACTLY the fixture's footprint
+(`totals.linesSubmitted: 3 → 2`). Dry-run wrote one `auditLog` entry with
+`corrected:false`; Apply wrote a second with `corrected:true` and restored
+the rollup to baseline; a final dry-run reporting "in sync" wrote **no**
+entry, exercising the no-drift branch.
+
+**Cleanup to baseline:** 0 fixture leads, companies or submissions
+remaining; the agent's user doc restored field-for-field including
+`runRateVisible:null`; `rollups/2026-07` back to its true
+`linesSubmitted:2`. The two `rollupDrift` audit entries remain by design —
+`auditLog` is append-only at the rule level (`allow update, delete: if
+false`) and they accurately record what happened. **Zero console errors
+across the entire session.**
+
+### 18.9 Standing obligations and residual items
+
+- **`tools/rules-probe.html` re-run obligation (§12) did not strictly
+  fire** — neither `sameOrg()` nor `sameOrgWrite()` changed, and a CREATE
+  rule is never list-queried, so the LIST-query provability property this
+  session touched nothing of. Recorded rather than assumed.
+- **Open self-registration is accepted, not fixed** — see 18.1's warning
+  against disabling sign-up, which would break manager provisioning.
+- **jsPDF 2.5.2** is well behind current (4.x). No exploitable finding
+  today (18.7); worth a future session.
+- **`products.*` attribute interpolations** remain un-`esc()`'d by
+  deliberate scope decision (18.3) — revisit if products ever become
+  writable by a non-manager.
+- **`js/helpers.js` has import-time DOM side effects** — it wires
+  `#m-close`/`#modal` at module top level, so any tools page importing it
+  needs the index.html shell stubs or the import throws. Documented in
+  `tools/xss-escaping-test.html`.

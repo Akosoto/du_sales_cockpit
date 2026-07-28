@@ -1,5 +1,13 @@
 # du Sales Cockpit — Project Spec
-**Last updated:** July 2026 | **Session C0 (Product Family Layer) shipped** — builds a product
+**Last updated:** July 2026 | **Session P0 (Critical Security Fixes) shipped** — closes a CRITICAL
+`users` CREATE hole (anyone self-registering through the public Firebase Auth API could write
+themselves a `role:'manager'` doc), hardens `esc()` and every call site that bypassed it, upgrades
+`pdf.js` past CVE-2024-4367, stops the Pages workflow publishing the rules file and tools pages to
+the open web, and makes rollup drift leave an audit trail. See the Session P0 entry below and
+`ARCHITECTURE.md` §18 — including §18.5's operational warning that the rules file was publicly
+readable for the whole life of the old deploy workflow.
+
+Previously — **Session C0 (Product Family Layer) shipped** — builds a product
 FAMILY layer (`orgs/{orgId}.families`, every category gets a permanent `familyId`) ahead of Phase
 C's rollup counters, so those counters are born keyed by family and never need re-bucketing.
 Manager UI extends the existing Categories & Contract Terms panel (families CRUD, a live-reparenting
@@ -32,10 +40,19 @@ switched to "GitHub Actions" (Settings → Pages) and the `CONFIG_JS` repo secre
 raw local `config.js` file — never paste it from a chat message, which may render/redact the API
 key as bullet characters (this caused a real production outage this session, see Phase A0/A below).
 
+**Publish set restricted (Session P0, ARCHITECTURE.md §18.5):** the workflow used to upload path
+`'.'` — the whole repository — so the live site served `rules/firestore.rules`, `ARCHITECTURE.md`,
+`PROJECT_SPEC.md`, `PHASE5_SPEC_AND_HANDOFF.md` and every `tools/*.html` (several of which are
+adversarial probes against this deployment) to the open web. It now assembles an explicit
+allowlist into `_site/` — `index.html` + `js/` + the secret-injected `config.js`, which is the
+app's complete runtime file set — plus a verify step that fails the build if anything else
+appears. An allowlist fails safe; a denylist leaks whatever nobody remembered to list.
+**Treat the rules file as having been publicly readable for the whole life of the old workflow.**
+
 ### File structure (as of the Phase 5 module split)
 ```
 index.html          — HTML shell + all CSS, loads js/main.js as the sole entry script
-js/state.js          — Firebase init (db/auth/auth2), SEED_EMAILS, STAGES, SP, mutable CU/CP/TAB
+js/state.js          — Firebase init (db/auth/auth2), STAGES, SP, mutable CU/CP/TAB
                         (exported as live bindings; only state.js's own setUser()/setTab() may
                         reassign them — every other module just imports and reads)
 js/db.js             — single Firestore mutation gateway: dbAdd/dbSet/dbUpdate/dbDelete/newBatch/
@@ -54,7 +71,11 @@ js/db.js             — single Firestore mutation gateway: dbAdd/dbSet/dbUpdate
                         entire bulk run in place of the per-op trail it can't afford.
 js/helpers.js         — v, esc, now, fmtDate, disable, enable, toast, modal, closeModal,
                         confirmModal, stagePill, calculateTLTarget, buildMsFilter, wireMsFilter
-js/auth.js            — login/logout, ensureProfile, onAuthStateChanged routing, change-password
+js/auth.js            — login/logout, loadProfile (READ-ONLY as of Session P0 — the
+                        self-create branch and its SEED_EMAILS allowlist are gone,
+                        ARCHITECTURE.md §18.1; wrapped in try/catch because a getDoc on a
+                        missing users doc is DENIED, not a clean miss), onAuthStateChanged
+                        routing, change-password
 js/org.js             — Org & Teams tab, team/user CRUD, seedLeads, repairLeadTeamData,
                         Companies card (list/edit/backfill), permission-checklist wiring,
                         runOrgIdMigration (one-off manager-triggered orgId backfill, banner+button
@@ -88,7 +109,11 @@ js/pdfExport.js       — downloadBundlePdf: compiles a bundle's latest-version 
                         one combined PDF via jsPDF (loaded from jsdelivr's `+esm` endpoint — the
                         package's own published ESM build has an unresolvable bare import)
 js/documents.js       — captureFile: client-side capture pipeline (image canvas-resize + JPEG
-                        recompression, PDF page-to-image via pdf.js) feeding the StorageAdapter
+                        recompression, PDF page-to-image via pdf.js) feeding the StorageAdapter.
+                        pdf.js pinned at 5.7.284 + isEvalSupported:false (Session P0 — 4.0.379
+                        predated the CVE-2024-4367 fix in 4.2.67). Verified by
+                        tools/pdfjs-capture-test.html, which counts non-white pixels in the
+                        produced JPEGs because a pdf.js upgrade fails SILENTLY BLANK, not loudly.
 js/storage/index.js   — StorageAdapter façade over a driver registry (config.storageDriver);
                         feature code never imports a driver directly
 js/storage/firestore-b64.js — the only driver today: one Firestore doc per PAGE in a top-level
@@ -773,7 +798,9 @@ Live `STAGES` constant: `New, Contacted, Interested, Proposal Sent, Closed, Lost
 | Backfill Companies | Manager-only button, shown whenever any lead has `company` set but no `companyId`. Groups those leads by `normalizedName`, creates one `companies` doc per unique group, writes `companyId` back onto each lead. Safe to re-run. |
 | Edit Company | Manager-only, from the Companies card. Edits `industry`/`city`/`hasDuAccount`. No merge tool yet. |
 
-**Hard-delete caveat:** this deletes the Firestore profile only, not the underlying Firebase Auth login (client SDK cannot delete other users' Auth accounts — needs Admin SDK/Cloud Functions, not part of this stack). In practice this is a full lockout: `ensureProfile()` returns null for a missing profile and the app immediately signs the user back out with "Account not set up. Contact your manager." **Exception:** the 4 seed demo accounts (`manager@`, `teamlead1@`, `agent1@`, `agent2@shauntech.app`) auto-recreate their profile on next login via `SEED_EMAILS` fallback — this only affects those 4 literal addresses, not real accounts created via "+ New Agent"/"+ New Team Lead".
+**Hard-delete caveat:** this deletes the Firestore profile only, not the underlying Firebase Auth login (client SDK cannot delete other users' Auth accounts — needs Admin SDK/Cloud Functions, not part of this stack). In practice this is a full lockout: `loadProfile()` returns null for a missing profile and the app immediately signs the user back out with "Account not set up. Contact your manager."
+
+> **The `SEED_EMAILS` exception is GONE (Session P0, ARCHITECTURE.md §18.1).** This used to read: the 4 seed demo accounts (`manager@`, `teamlead1@`, `agent1@`, `agent2@shauntech.app`) auto-recreate their profile on next login via a `SEED_EMAILS` fallback. That fallback was the client-side half of the session's critical finding — the rule behind it (`request.auth.uid == uid`, no field validation) let *anyone* who self-registered through the public Firebase Auth API write their own user doc with `role:'manager'`. Both the rule branch and the code are removed, so a hard-deleted account is now a full lockout with **no exceptions at all**, seed addresses included. Re-provision through "+ New Agent"/"+ New Team Lead" as manager. For a brand-new deployment with no manager yet, create the first manager's `users/{uid}` by hand in the Firestore Console (Console writes bypass rules).
 
 ---
 
@@ -890,7 +917,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 
 | Collection | Read | Write |
 |---|---|---|
-| `users` | Any auth | Create: self or manager. Update: manager unrestricted; **self-write narrowed (Session B4 — fixes a real privilege-escalation gap found during review, see below) to exclude `role`, `department`, `orgId`, `teamId`, `tlId`, `active`, `monthlyTarget`, `targetSource`, `autoTarget`, `permissions`, `specialties`, `available`, `email`, `createdBy`, `createdAt`** — a self-write touching any of those is denied outright, even bundled with an otherwise-fine field. Delete: manager-only. |
+| `users` | Any auth | **Create: MANAGER ONLY (Session P0 — was "self or manager", the session's CRITICAL finding; ARCHITECTURE.md §18.1).** The old `request.auth.uid == uid` branch validated no fields, so anyone self-registering through the public Firebase Auth API could write their own doc with `role:'manager'` and any `orgId` — and since every rule resolves trust through that doc, that was full authority over a tenant. Update: manager unrestricted; **self-write narrowed (Session B4 — a real privilege-escalation gap found during review) to exclude `role`, `department`, `orgId`, `teamId`, `tlId`, `active`, `monthlyTarget`, `targetSource`, `autoTarget`, `permissions`, `specialties`, `available`, `email`, `name` (added Session P0 — it denormalizes onto `submissions.agentName` and `lastEditedBy`), `createdBy`, `createdAt`** — a self-write touching any of those is denied outright, even bundled with an otherwise-fine field. Delete: manager-only. |
 | `orgs` (Session B4, ARCHITECTURE.md §12) | Any auth, same org (key match: `oid == userDoc().orgId`) | Manager unrestricted; team_lead narrowed to `runRateDefaultVisible` only (`hasOnly()`); create/delete: manager only. Authorized by KEY MATCH, not `sameOrg()`/`sameOrgWrite()` — the doc ID itself is the org identity. |
 | `teams` | Any auth | Manager only, **plus** any auth may update ONLY the `assignmentCursor` field (`affectedKeys().hasOnly(['assignmentCursor'])`) — needed so an agent's own submission-create call can advance the rotation cursor without being manager |
 | `companies` | Any auth | Create: any auth, must set `createdBy == request.auth.uid` (same pattern as `leads`/`scripts`); update/delete: manager only |
@@ -971,7 +998,7 @@ All rules changes have been treated with extra care after one earlier bug (a fra
 | Function | Purpose |
 |---|---|
 | `v(id)` | Get trimmed value of an input/select by element ID |
-| `esc(s)` | HTML-escape a string (XSS-safe output) |
+| `esc(s)` | HTML-escape a string for an **HTML context**. Escapes `& < > " '` (Session P0 added the two quote characters — it previously round-tripped through `textContent`/`innerHTML`, which does not escape quotes, leaving every `value="${esc(...)}"` and `data-*="${esc(...)}"` site attribute-breakable with no `<` involved). Do **not** feed it into a text sink — `modal()`'s title, `confirmModal()`'s message and `toast()` all take raw text and escape internally where needed; pre-escaping produces visible `&#39;` entities. |
 | `now()` | Returns current ISO timestamp string |
 | `fmtDate(iso)` | Format ISO string to `DD MMM YYYY` (en-AE locale) |
 | `disable(id, txt)` / `enable(id, txt)` | Disable/re-enable a button with loading text |
@@ -1663,6 +1690,39 @@ succeeded on a superseded version (parent + all chunks confirmed gone). Dashboar
 Queue all smoke-tested clean for both roles, zero console errors across the whole session. All test
 fixtures (Step 5's and Step 6's, in two separate passes) fully cleaned up — `sofTemplates` verified
 back to 0 documents each time. See `ARCHITECTURE.md` §17.7.
+
+---
+
+### Session P0 (shipped) — Critical Security Fixes
+
+Security only, no features. Full detail in `ARCHITECTURE.md` §18; the short version:
+
+- **CRITICAL — `users` CREATE.** `request.auth.uid == uid` with no field validation let anyone
+  who self-registers through the public Firebase Auth API write their own user doc with
+  `role:'manager'` and any `orgId`. Every rule resolves trust through that doc, so one
+  self-write was full authority over a tenant. Narrowing only `role` would not have closed it —
+  a self-created plain `agent` with the right `orgId` already reads the whole lead and company
+  book. Create is now manager-only; the self-create code path and its `SEED_EMAILS` allowlist
+  are deleted. **New onboarding step:** a brand-new deployment's first manager is created by
+  hand in the Firestore Console, which bypasses rules.
+- **`name` added to the self-write blocklist** — it denormalizes onto `submissions.agentName`
+  and `lastEditedBy`, so it reaches exports and other users' screens.
+- **XSS cluster.** `esc()` did not escape quotes, making every `value="${esc(...)}"` and
+  `data-*="${esc(...)}"` site attribute-breakable with no `<` involved. Fixed `esc()` plus every
+  call site that bypassed it. Two extra classes found in the sweep: stored `mime` reaching
+  `<img src="data:…">` (fixed at the render sites *and* by allowlisting mime in the storage
+  driver), and lookup-with-raw-fallback sites like `LABELS[x]||x`.
+- **`pdf.js` 4.0.379 → 5.7.284 + `isEvalSupported:false`** (CVE-2024-4367).
+- **Pages publish set restricted** to the app itself — the rules file and every tools page were
+  being served publicly.
+- **Rollup drift now writes an `auditLog` entry**, so tampering leaves a trail instead of being
+  silently corrected. Logged on detection, not on write.
+
+Three defects were found *during* the session, two of them introduced by its own changes: a
+double-escaping regression in 23 modal titles (`O'Brien` rendering as `O&#39;Brien`), a
+`loadProfile()` throw on the now-common missing-users-doc path, and the stored-`mime` XSS above.
+Regression was driven live across agent, backend and manager identities, plus 110 harness
+assertions. See §18.7 and §18.8.
 
 ---
 
