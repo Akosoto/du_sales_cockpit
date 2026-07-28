@@ -94,9 +94,29 @@ document.getElementById('li-pw-eye').onclick = function(){
 // rule hole and no temporary relaxation. See §18 for the exact document
 // shape and the onboarding-runbook step.
 // ════════════════════════════════════════════════════
+// The try/catch is load-bearing, not defensive padding. A getDoc() on a
+// users/{uid} that does NOT exist is DENIED rather than resolving with
+// exists()===false: the read rule is isAuth() && sameOrg(), and sameOrg()
+// calls userDoc(), which get()s that same missing document — the get errors,
+// and an evaluation error denies the whole rule. This is the documented
+// get-on-nonexistent-doc gotcha (PROJECT_SPEC.md, Firestore Security Rules;
+// ARCHITECTURE.md §12), and the same pattern loadOrgConfig() already uses.
+//
+// It matters more now than it did before Session P0. This path used to be
+// reached only by a hard-deleted account; with self-create gone it is also
+// reached by every stranger who self-registers through the public Auth API.
+// Without the catch, the throw escapes into onAuthStateChanged's async
+// callback as an unhandled rejection and the user is left staring at a stuck
+// screen instead of being signed out with a clear message.
 async function loadProfile(fbUser){
-  const snap = await getDoc(doc(db, 'users', fbUser.uid));
-  return snap.exists() ? { id: fbUser.uid, ...snap.data() } : null;
+  try {
+    const snap = await getDoc(doc(db, 'users', fbUser.uid));
+    return snap.exists() ? { id: fbUser.uid, ...snap.data() } : null;
+  } catch(e){
+    // Denied and absent are indistinguishable here, and both mean the same
+    // thing to the caller: this account has no usable profile.
+    return null;
+  }
 }
 
 // ════════════════════════════════════════════════════

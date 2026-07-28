@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>XSS Escaping Test (Session P0)</title>
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#111;color:#eee;padding:24px;max-width:1000px;margin:0 auto}
+  h2{color:#a78bfa}
+  button{padding:10px 18px;margin:4px 4px 4px 0;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
+  .ok{color:#4ade80} .err{color:#f87171} .dim{color:#888}
+  .hdr{color:#a78bfa;font-weight:700;margin-top:14px}
+  pre{background:#1a1a1a;padding:14px;border-radius:6px;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+  #summary{font-size:18px;font-weight:700;margin:12px 0}
+  #sandbox{position:absolute;left:-9999px;top:-9999px}
+</style>
+</head>
+<body>
+<!--
+  XSS escaping test. Session P0, Step 8.
+
+  Two things are checked here, and the second is the one that matters.
+
+  (1) esc() escapes what it now claims to. Before this session it round-tripped
+      through a detached div's textContent -> innerHTML, which escapes & < >
+      but NOT quotes, leaving every value="${esc(...)}" and data-*="${esc(...)}"
+      site attribute-breakable with no `<` involved.
+
+  (2) The escaped output, when actually parsed as HTML in the three contexts
+      this codebase uses it in — element text, a quoted attribute value, and a
+      quoted data-* attribute — produces NO new elements, NO event-handler
+      attributes, and round-trips back to the original string byte for byte.
+
+  Point (2) is why this asserts against a real parsed DOM rather than against
+  the escaped string. A string comparison would happily pass an encoding that
+  the parser still resolves into an attribute break; only parsing it and
+  counting the resulting nodes proves inertness. Each payload is injected into
+  a detached container via innerHTML — the same sink every render path in the
+  app uses — and the container is then interrogated.
+
+  The round-trip assertions are equally load-bearing in the other direction:
+  they prove the fix did not over-escape. queue.js's copy tools read
+  dataset.copy expecting the ORIGINAL text, so if escaping changed what comes
+  back out, the backend reviewer would be copying &quot; into du's ticket form.
+
+  Payloads are the ones the session's regression uses live in a lead phone,
+  a lead email, a user name, and a submission categoryField.
+
+  Needs no Firebase and no login — imports only js/helpers.js. Serve over the
+  local static server; file:// will not work.
+-->
+<h2>XSS Escaping Test</h2>
+<p class="dim">Session P0, Step 8. Imports the REAL <code>esc()</code> from <code>../js/helpers.js</code>, injects each payload through <code>innerHTML</code> in the three contexts the app renders into, then interrogates the parsed DOM — asserting no injected elements, no event-handler attributes, and a byte-exact round-trip back to the original string.</p>
+
+<button id="run">Run Tests</button>
+<div id="summary"></div>
+<pre id="out"></pre>
+<div id="sandbox"></div>
+
+<!--
+  js/helpers.js wires #m-close and #modal at MODULE TOP LEVEL, not inside a
+  function, so merely importing it throws "Cannot set properties of null" in
+  any page that isn't index.html. These are the minimum shell stubs that make
+  the import succeed; the modal/toast helpers are never exercised here, only
+  esc(). Any future tools page importing helpers.js needs the same stubs.
+-->
+<div id="app-shell-stubs" style="display:none">
+  <div id="modal"><div id="m-box"><div id="m-title"></div><div id="m-body"></div><button id="m-close"></button></div></div>
+  <div id="toast"></div>
+</div>
+
+<script type="module">
+  import { esc } from '../js/helpers.js';
+
+  const out = document.getElementById('out');
+  const summaryEl = document.getElementById('summary');
+  const sandbox = document.getElementById('sandbox');
+  let pass = 0, fail = 0;
+
+  function log(l, c){ const d=document.createElement('div'); if(c) d.className=c; d.textContent=l; out.appendChild(d); }
+  function section(t){ log(''); log(t,'hdr'); }
+  function assert(label, cond, detail){
+    if(cond){ pass++; log(`  PASS  ${label}${detail?` — ${detail}`:''}`,'ok'); }
+    else    { fail++; log(`  FAIL  ${label}${detail?` — ${detail}`:''}`,'err'); }
+  }
+
+  // Payloads chosen to hit distinct breakout mechanisms, not just variations
+  // of <script>. The quote-only ones are the whole point of this session's
+  // esc() fix — they carry no `<` at all, so the OLD esc() passed them
+  // through untouched and they broke straight out of any quoted attribute.
+  const PAYLOADS = [
+    // The backslash before the slash keeps the HTML parser from seeing a real
+    // closing script tag and terminating this inline script early. JS reads it
+    // as a plain slash, so the payload string is the ordinary tag pair with no
+    // backslash in it. (A literal closing tag must not appear ANYWHERE in this
+    // script element, comments included — the HTML tokenizer does not know
+    // what a JS comment is.)
+    { name: 'classic tag',            v: `<script>alert(1)<\/script>` },
+    { name: 'img onerror',            v: `<img src=x onerror=alert(1)>` },
+    { name: 'double-quote breakout',  v: `x" onmouseover="alert(1)` },
+    { name: 'single-quote breakout',  v: `x' onmouseover='alert(1)` },
+    { name: 'attr break + new tag',   v: `"><img src=x onerror=alert(1)>` },
+    { name: 'svg onload',             v: `<svg/onload=alert(1)>` },
+    { name: 'js: url',                v: `javascript:alert(1)` },
+    { name: 'entity-encoded quote',   v: `&quot; onmouseover=&quot;alert(1)` },
+    { name: 'ampersand + tag',        v: `A & B <b>bold</b>` },
+    { name: 'spreadsheet formula',    v: `=1+1+cmd|' /C calc'!A0` },
+    { name: 'backtick + brace',       v: '`${alert(1)}`' },
+    { name: 'mixed quotes',           v: `"'\`<>&` }
+  ];
+
+  // Renders `escaped` in one of the three real contexts and returns the
+  // container for interrogation.
+  function render(context, escaped){
+    sandbox.innerHTML = '';
+    const box = document.createElement('div');
+    if(context === 'text')      box.innerHTML = `<span class="v">${escaped}</span>`;
+    if(context === 'attr')      box.innerHTML = `<input class="v" value="${escaped}">`;
+    if(context === 'dataset')   box.innerHTML = `<button class="v" data-copy="${escaped}">c</button>`;
+    sandbox.appendChild(box);
+    return box;
+  }
+
+  // Any attribute whose name starts with "on" is an event handler the payload
+  // succeeded in creating. Checked across every element in the subtree, not
+  // just the target, since a breakout can spawn siblings.
+  function handlerAttrs(box){
+    const found = [];
+    box.querySelectorAll('*').forEach(el => {
+      for(const a of el.attributes) if(/^on/i.test(a.name)) found.push(`${el.tagName.toLowerCase()}[${a.name}]`);
+    });
+    return found;
+  }
+
+  document.getElementById('run').onclick = () => {
+    out.textContent = ''; summaryEl.textContent = ''; pass = 0; fail = 0;
+
+    section('[1] esc() escapes all five HTML-significant characters');
+    assert('& -> &amp;',  esc('&') === '&amp;',  esc('&'));
+    assert('< -> &lt;',   esc('<') === '&lt;',   esc('<'));
+    assert('> -> &gt;',   esc('>') === '&gt;',   esc('>'));
+    assert('" -> &quot;', esc('"') === '&quot;', esc('"'));
+    assert("' -> &#39;",  esc("'") === '&#39;',  esc("'"));
+    assert('& escaped FIRST (no double-encoding)', esc('<') === '&lt;' && esc('&lt;') === '&amp;lt;', `esc('&lt;') = ${esc('&lt;')}`);
+
+    section('[2] falsy coercion preserved verbatim (esc(0) must stay "")');
+    assert('esc(0) === ""',         esc(0) === '',  JSON.stringify(esc(0)));
+    assert('esc(null) === ""',      esc(null) === '');
+    assert('esc(undefined) === ""', esc(undefined) === '');
+    assert('esc(false) === ""',     esc(false) === '');
+    assert('esc(42) === "42"',      esc(42) === '42');
+
+    for(const ctx of ['text','attr','dataset']){
+      section(`[3.${ctx}] payloads are inert when parsed as HTML in a ${ctx} context`);
+      for(const p of PAYLOADS){
+        const box = render(ctx, esc(p.v));
+        const el = box.querySelector('.v');
+
+        // No element other than the single intended one may exist.
+        const extra = box.querySelectorAll('*').length - 1;
+        const handlers = handlerAttrs(box);
+        const inert = extra === 0 && handlers.length === 0;
+        assert(`${p.name}: no injected elements or handlers`, inert,
+               inert ? 'clean' : `+${extra} element(s), handlers: ${handlers.join(',')||'none'}`);
+
+        // Round-trip: the value the app reads back must equal what was stored.
+        // This is what proves the fix did not over-escape.
+        const readBack = ctx === 'text' ? el.textContent
+                       : ctx === 'attr' ? el.value
+                       : el.dataset.copy;
+        assert(`${p.name}: round-trips byte-exact`, readBack === p.v,
+               readBack === p.v ? 'exact' : `got ${JSON.stringify(readBack)} want ${JSON.stringify(p.v)}`);
+      }
+    }
+
+    section('[4] the specific pre-fix break: a bare quote in a value= attribute');
+    // Before this session esc('x" onmouseover="alert(1)') returned the string
+    // UNCHANGED (no < > &), so this exact markup produced a real onmouseover.
+    const boxOld = document.createElement('div');
+    boxOld.innerHTML = `<input class="v" value="${`x" onmouseover="alert(1)`}">`;
+    sandbox.appendChild(boxOld);
+    assert('unescaped control case DOES break out (proves the test detects it)',
+           handlerAttrs(boxOld).length > 0, `handlers: ${handlerAttrs(boxOld).join(',')||'none'}`);
+    const boxNew = render('attr', esc(`x" onmouseover="alert(1)`));
+    assert('escaped version does NOT break out',
+           handlerAttrs(boxNew).length === 0, `handlers: ${handlerAttrs(boxNew).join(',')||'none'}`);
+
+    sandbox.innerHTML = '';
+    summaryEl.textContent = fail === 0 ? `ALL ${pass} ASSERTIONS PASSED` : `${pass} passed, ${fail} FAILED`;
+    summaryEl.className = fail === 0 ? 'ok' : 'err';
+  };
+</script>
+</body>
+</html>
